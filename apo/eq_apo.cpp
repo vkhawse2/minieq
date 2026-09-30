@@ -15,6 +15,18 @@
 #include <cstring>
 
 //------------------------------------------------------------------------------
+// APO error-code compatibility. The APOERR_* names have shifted between SDK
+// generations; pin down the ones we rely on so the build works regardless of
+// which Windows SDK is installed.
+//------------------------------------------------------------------------------
+#ifndef APOERR_APO_LOCKED
+#define APOERR_APO_LOCKED E_UNEXPECTED
+#endif
+// No APOERR_* name exists for double-Initialize in every SDK; use the Win32
+// "already initialized" code wrapped as an HRESULT instead.
+#define MINIEQ_HR_ALREADY_INITIALIZED HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED)
+
+//------------------------------------------------------------------------------
 // IUnknown
 //------------------------------------------------------------------------------
 
@@ -91,7 +103,7 @@ bool CEqApo::IsFloat32Format(const WAVEFORMATEX* wfx) {
 
 STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
     if (m_initialized) {
-        return AEERR_ALREADY_INITIALIZED;
+        return MINIEQ_HR_ALREADY_INITIALIZED;
     }
     if (pbyData == nullptr || cbDataSize == 0) {
         return E_INVALIDARG;
@@ -145,13 +157,13 @@ STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/
     if (pRequestedInputFormat == nullptr) {
         return E_INVALIDARG;
     }
-    WAVEFORMATEX* wfx = nullptr;
-    HRESULT hr = pRequestedInputFormat->GetAudioFormat(&wfx);
-    if (FAILED(hr)) {
-        return hr;
+    // IAudioMediaType::GetAudioFormat returns the format owned by the media
+    // type (no out-param, no transfer of ownership -- do not free it).
+    const WAVEFORMATEX* wfx = pRequestedInputFormat->GetAudioFormat();
+    if (wfx == nullptr) {
+        return E_INVALIDARG;
     }
     bool ok = IsFloat32Format(wfx);
-    CoTaskMemFree(wfx);
     if (!ok) {
         return APOERR_FORMAT_NOT_SUPPORTED;
     }
@@ -230,7 +242,7 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
                                    UINT32 u32NumOutputConnections,
                                    APO_CONNECTION_DESCRIPTOR** ppOutputConnections) {
     if (m_locked) {
-        return APOERR_ALREADY_LOCKED;
+        return APOERR_APO_LOCKED;
     }
     if (u32NumInputConnections != 1 || u32NumOutputConnections != 1 ||
         ppInputConnections == nullptr || ppOutputConnections == nullptr ||
@@ -238,18 +250,15 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
         return E_INVALIDARG;
     }
 
-    WAVEFORMATEX* wfx = nullptr;
-    HRESULT hr = ppInputConnections[0]->pFormat->GetAudioFormat(&wfx);
-    if (FAILED(hr)) {
-        return hr;
+    const WAVEFORMATEX* wfx = ppInputConnections[0]->pFormat->GetAudioFormat();
+    if (wfx == nullptr) {
+        return E_INVALIDARG;
     }
     if (!IsFloat32Format(wfx)) {
-        CoTaskMemFree(wfx);
         return APOERR_FORMAT_NOT_SUPPORTED;
     }
     const float rate = static_cast<float>(wfx->nSamplesPerSec);
     const uint32_t channels = wfx->nChannels;
-    CoTaskMemFree(wfx);
 
     m_dsp.Configure(rate, channels);
     m_channels = channels;
@@ -354,8 +363,9 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
     if (u32NumOutputConnections > 0 && ppOutputConnections != nullptr &&
         ppOutputConnections[0] != nullptr) {
         APO_CONNECTION_PROPERTY* out = ppOutputConnections[0];
-        if (out->pBuffer != in->pBuffer && out->pBuffer != nullptr && frames != nullptr) {
-            memcpy(out->pBuffer, frames,
+        // APO_CONNECTION_PROPERTY::pBuffer is a UINT_PTR, not a pointer.
+        if (out->pBuffer != in->pBuffer && out->pBuffer != 0 && frames != nullptr) {
+            memcpy(reinterpret_cast<void*>(out->pBuffer), frames,
                    (size_t)validFrames * m_channels * sizeof(FLOAT32));
         }
         out->u32BufferFlags = in->u32BufferFlags;
