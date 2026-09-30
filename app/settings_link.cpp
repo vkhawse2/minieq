@@ -67,6 +67,7 @@ void SettingsLink::Push() {
     m_pView->masterGainDb = m_staging.masterGainDb;
     m_pView->bypass = m_staging.bypass;
     m_pView->numBands = m_staging.numBands;
+    m_pView->virtualization = m_staging.virtualization;
     MemoryBarrier();
     m_pView->sequence = ++m_seq;
     m_staging.sequence = m_seq;

@@ -1,8 +1,21 @@
 // eq_apo.h -- CEqApo: our system-effect APO (SFX).
 //
 // Implements IAudioProcessingObject + IAudioProcessingObjectRT +
-// IAudioProcessingObjectConfiguration with plain C++ COM (no ATL), so the DLL
-// builds with just the Windows SDK.
+// IAudioProcessingObjectConfiguration + IAudioSystemEffects3 with plain C++
+// COM (no ATL), so the DLL builds with just the Windows SDK.
+//
+// WHY AGGREGATION + IAudioSystemEffects3 (read before "simplifying" this):
+// The Windows audio engine creates system-effect APOs by COM *aggregation*:
+// IClassFactory::CreateInstance is called with a non-null controlling unknown
+// and IID_IUnknown. A factory that answers CLASS_E_NOAGGREGATION is skipped in
+// total silence -- no error, no event log, nothing in an ETW trace. It looks
+// exactly like "Windows refuses third-party APOs" and it is not.
+// The engine then queries IAudioSystemEffects3 (Windows 11) and, with
+// ThreadingModel "Both", expects no apartment affinity -- so the free-threaded
+// marshaler is aggregated and IAgileObject is answered. Refusing either sends
+// the engine into a fruitless round of marshalling probes and the APO never
+// starts. (Verified by instrumenting a probe APO against the real engine on
+// Windows 11 10.0.22631.)
 //
 // Audio path: the engine calls APOProcess() on its real-time thread with
 // interleaved IEEE-float32 frames. We process in place with the EqDsp biquad
@@ -11,18 +24,18 @@
 // plus a memcpy when settings change -- no locks, no syscalls, no COM on the
 // RT thread.
 //
-// NOTE on IAudioSystemEffects: Microsoft's docs list it among the interfaces
-// a *modern* APO exposes, but the legacy single-CLSID SFX-slot registration we
-// use (the exact form Equalizer APO ships with, working on Win10/11) does not
-// require it -- the engine CoCreates our CLSID from the endpoint's FxProperties
-// and talks to IAudioProcessingObject. If the engine ever refuses to load us,
-// implementing IAudioSystemEffects is the first thing to try.
+// A background worker thread (created in LockForProcess) retries opening the
+// settings mapping until the UI has created it, and services the crossfeed
+// (XFeed) allocation/free requests -- heap work must never happen on the RT
+// thread.
 
 #pragma once
 
 #include <windows.h>
 #include <audioenginebaseapo.h>
+#include <audioengineextensionapo.h> // IAudioSystemEffects3 (Win11 handshake)
 
+#include <atomic>
 #include <string>
 
 #include "dsp.h"
@@ -30,15 +43,34 @@
 
 class CEqApo : public IAudioProcessingObject,
                public IAudioProcessingObjectRT,
-               public IAudioProcessingObjectConfiguration {
+               public IAudioProcessingObjectConfiguration,
+               public IAudioSystemEffects3 {
 public:
-    CEqApo();
+    explicit CEqApo(IUnknown* pUnkOuter);
     virtual ~CEqApo();
 
-    // IUnknown
+    // The non-delegating IUnknown, handed to whoever aggregates us.
+    IUnknown* NonDelegatingUnknown() { return &m_inner; }
+    HRESULT NonDelegatingQueryInterface(REFIID riid, void** ppv);
+    ULONG NonDelegatingRelease() { return m_inner.Release(); }
+
+    // IUnknown -- delegating: forward to the controlling unknown (or to the
+    // inner one when not aggregated) so refcounts and QI identity hold.
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
     STDMETHODIMP_(ULONG) AddRef() override;
     STDMETHODIMP_(ULONG) Release() override;
+
+    // IAudioSystemEffects: our UI drives everything, so there is nothing to
+    // enumerate. An empty list is a valid answer; refusing the call is not.
+    STDMETHODIMP GetEffectsList(GUID** ppEffectsIds, UINT* pcEffects,
+                               HANDLE hEvent) override;
+    // IAudioSystemEffects2
+    STDMETHODIMP GetControllableSystemEffectsList(AUDIO_SYSTEMEFFECT** ppEffects,
+                                                 UINT* pcEffects,
+                                                 HANDLE hEvent) override;
+    // IAudioSystemEffects3
+    STDMETHODIMP SetAudioSystemEffectState(GUID effectId,
+                                          AUDIO_SYSTEMEFFECT_STATE state) override;
 
     // IAudioProcessingObject
     STDMETHODIMP Initialize(UINT32 cbDataSize, BYTE* pbyData) override;
@@ -69,10 +101,41 @@ public:
     STDMETHODIMP UnlockForProcess() override;
 
 private:
+    // Non-delegating IUnknown: the only thing that actually owns the object.
+    // Lives inside the owner; when its count hits zero the owner is deleted.
+    class CInnerUnknown : public IUnknown {
+    public:
+        explicit CInnerUnknown(CEqApo* pOwner) : m_pOwner(pOwner) {}
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+            return m_pOwner->NonDelegatingQueryInterface(riid, ppv);
+        }
+        STDMETHODIMP_(ULONG) AddRef() override { return ++m_cRef; }
+        STDMETHODIMP_(ULONG) Release() override {
+            const ULONG c = --m_cRef;
+            if (c == 0) {
+                delete m_pOwner;
+            }
+            return c;
+        }
+    private:
+        CEqApo* m_pOwner;
+        std::atomic<ULONG> m_cRef{1};
+    };
+
     // Returns true for the one format we process: interleaved IEEE float32.
     static bool IsFloat32Format(const WAVEFORMATEX* wfx);
 
-    volatile LONG  m_refCount = 1;
+    // Worker thread helpers (non-RT): retry the settings mapping, service the
+    // XFeed alloc/free requests.
+    static DWORD WINAPI WorkerThreadProc(LPVOID pParam);
+    void WorkerStep();
+    void OpenSettingsMapping(); // best-effort; worker retries on failure
+    void StopWorker();
+
+    CInnerUnknown  m_inner;      // constructed first; outer falls back to it
+    IUnknown*      m_pUnkOuter;  // controlling unknown (or &m_inner)
+    IUnknown*      m_pFTM = nullptr; // aggregated free-threaded marshaler
+
     bool           m_initialized = false;
     bool           m_locked = false;
 
@@ -83,7 +146,10 @@ private:
     uint32_t       m_channels = 0;
 
     HANDLE         m_hMap = nullptr;          // shared-memory handle (non-RT only)
-    const EqSettings* m_pSettings = nullptr;  // mapped view (read-only)
+    std::atomic<const EqSettings*> m_pSettings{nullptr}; // mapped view, read-only
     int64_t        m_lastSequence = 0;        // last applied settings version
     EqSettings     m_localCopy;               // RT-side working copy
+
+    HANDLE         m_hWorkerThread = nullptr; // background worker (non-RT)
+    HANDLE         m_hWorkerStop = nullptr;   // manual-reset stop event
 };

@@ -4,6 +4,7 @@
 #include "guids.h"
 
 #include <aclapi.h>
+#include <audioenginebaseapo.h> // APO_FLAG_INPLACE
 #include <strsafe.h>
 
 // IID_IAudioProcessingObject -- the APO interface we implement.
@@ -91,7 +92,10 @@ HRESULT MiniEQ_RegisterApoDeclaration() {
     if (FAILED(hr)) return hr;
     hr = SetDword(HKEY_LOCAL_MACHINE, key, L"MinorVersion", 0);
     if (FAILED(hr)) return hr;
-    hr = SetDword(HKEY_LOCAL_MACHINE, key, L"Flags", 14); // APO_FLAG_DEFAULT
+    // Must match what GetRegistrationProperties() reports at runtime
+    // (APO_FLAG_INPLACE): the engine cross-checks the two, and a mismatch
+    // can get the APO rejected.
+    hr = SetDword(HKEY_LOCAL_MACHINE, key, L"Flags", APO_FLAG_INPLACE);
     if (FAILED(hr)) return hr;
     hr = SetDword(HKEY_LOCAL_MACHINE, key, L"MinInputConnections", 1);
     if (FAILED(hr)) return hr;

@@ -15,12 +15,13 @@
 
 #include "../shared/settings_channel.h"
 #include <stdint.h>
+#include <atomic>
 #include <memory>
 
 class EqDsp {
 public:
     EqDsp();
-    ~EqDsp() = default;
+    ~EqDsp();
 
     EqDsp(const EqDsp&) = delete;
     EqDsp& operator=(const EqDsp&) = delete;
@@ -37,10 +38,21 @@ public:
     // `bypass` short-circuits to a plain copy-free pass-through.
     void Process(float* interleaved, uint32_t numFrames, bool bypass);
 
-    // Turn headphone virtualization on/off. Enabling allocates the tiny
-    // crossfeed state (a few dozen bytes); disabling frees it again, so an
-    // untouched toggle costs nothing. Safe to call any time.
+    // Turn headphone virtualization on/off. RT-safe: this only arms a
+    // request -- the actual heap allocation/free happens in
+    // ServiceVirtualizationWorker(), which must be called periodically from
+    // a NON-real-time thread. Until the worker publishes the state, audio
+    // flows without crossfeed (a few ms at most).
     void SetVirtualization(bool on);
+
+    // Background-thread service: performs the pending crossfeed allocation
+    // (with coefficient derivation) and frees retired states. Call every
+    // ~100 ms from a non-RT thread while the APO is locked for process.
+    void ServiceVirtualizationWorker();
+
+    // Synchronously drop any crossfeed state (live or retired). Call from a
+    // non-RT thread (stream teardown / destruction), never from Process().
+    void ShutdownVirtualization();
 
     // Drop filter state (call when the input goes silent).
     void Reset();
@@ -83,5 +95,14 @@ private:
         float hiL = 0, hiR = 0;          // highboost states
         float prevL = 0, prevR = 0;      // highboost x[n-1]
     };
-    std::unique_ptr<XFeed> m_xfeed;
+    // Lock-free handoff: the RT thread only ever *reads* m_xfeedLive and
+    // publishes retirements through m_xfeedOrphan; the worker thread owns
+    // every new/delete. Zero heap activity on the RT thread, zero RAM/CPU
+    // while the toggle is off.
+    static void DeriveXFeedCoeffs(XFeed* xf, float sampleRateHz);
+
+    std::atomic<XFeed*> m_xfeedLive{nullptr};   // RT-readable crossfeed state
+    std::atomic<XFeed*> m_xfeedOrphan{nullptr}; // retired; worker frees it
+    std::atomic<bool>   m_virtWanted{false};   // toggle state (RT-written)
+    std::atomic<bool>   m_allocReq{false};     // worker: allocation pending
 };

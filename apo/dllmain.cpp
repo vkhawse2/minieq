@@ -47,11 +47,16 @@ public:
     STDMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (ppv == nullptr) return E_POINTER;
         *ppv = nullptr;
-        if (pUnkOuter != nullptr) return CLASS_E_NOAGGREGATION;
-        CEqApo* apo = new (std::nothrow) CEqApo();
+        // The audio engine AGGREGATES system-effect APOs: CreateInstance
+        // arrives with a non-null controlling unknown and IID_IUnknown.
+        // Answering CLASS_E_NOAGGREGATION here makes the engine silently
+        // skip the effect -- no error, no event log, nothing in a trace.
+        // (COM rule: with a non-null outer, only IID_IUnknown may be asked.)
+        if (pUnkOuter != nullptr && riid != IID_IUnknown) return E_NOINTERFACE;
+        CEqApo* apo = new (std::nothrow) CEqApo(pUnkOuter);
         if (apo == nullptr) return E_OUTOFMEMORY;
-        HRESULT hr = apo->QueryInterface(riid, ppv);
-        apo->Release(); // QueryInterface took its own ref on success
+        HRESULT hr = apo->NonDelegatingQueryInterface(riid, ppv);
+        apo->NonDelegatingRelease(); // balance the initial inner ref
         return hr;
     }
     STDMETHODIMP LockServer(BOOL bLock) override {

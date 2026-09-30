@@ -3,6 +3,7 @@
 #include "dsp.h"
 
 #include <math.h>
+#include <new>
 #include <string.h>
 
 #ifndef M_PI
@@ -70,33 +71,81 @@ void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
     m_masterLinear = powf(10.0f, masterGainDb / 20.0f);
 }
 
+EqDsp::~EqDsp() {
+    ShutdownVirtualization();
+}
+
 void EqDsp::Reset() {
     memset(m_state, 0, sizeof(m_state));
-    if (m_xfeed) {
-        m_xfeed->loL = m_xfeed->loR = 0.0f;
-        m_xfeed->hiL = m_xfeed->hiR = 0.0f;
-        m_xfeed->prevL = m_xfeed->prevR = 0.0f;
+    XFeed* xf = m_xfeedLive.load(std::memory_order_acquire);
+    if (xf != nullptr) {
+        xf->loL = xf->loR = 0.0f;
+        xf->hiL = xf->hiR = 0.0f;
+        xf->prevL = xf->prevR = 0.0f;
     }
 }
 
+// RT-safe: only arms/frees via lock-free handoff. The worker thread owns
+// every new/delete (see ServiceVirtualizationWorker).
 void EqDsp::SetVirtualization(bool on) {
-    if (!on) {
-        m_xfeed.reset(); // free the state: zero RAM while the toggle is off
+    m_virtWanted.store(on, std::memory_order_release);
+    if (on) {
+        // Request the worker to allocate+derive if nothing is live yet.
+        // Until it publishes, Process() simply skips the crossfeed stage.
+        if (m_xfeedLive.load(std::memory_order_acquire) == nullptr) {
+            m_allocReq.store(true, std::memory_order_release);
+        }
         return;
     }
-    if (!m_xfeed) {
-        m_xfeed = std::make_unique<XFeed>(); // allocate only on first enable
+    m_allocReq.store(false, std::memory_order_release);
+    // Retire the live state: the RT thread stops using it from this point
+    // on, and the worker frees it.
+    XFeed* xf = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
+    if (xf != nullptr) {
+        m_xfeedOrphan.store(xf, std::memory_order_release);
     }
-    if (m_xfeed->sampleRate == m_sampleRate) {
-        return; // coefficients already derived for this rate
+}
+
+// Worker thread (non-RT): perform pending crossfeed alloc/free.
+void EqDsp::ServiceVirtualizationWorker() {
+    XFeed* orphan = m_xfeedOrphan.exchange(nullptr, std::memory_order_acq_rel);
+    delete orphan;
+
+    if (!m_allocReq.load(std::memory_order_acquire) ||
+        !m_virtWanted.load(std::memory_order_acquire)) {
+        return;
     }
+    XFeed* xf = new (std::nothrow) XFeed();
+    if (xf != nullptr) {
+        DeriveXFeedCoeffs(xf, m_sampleRate);
+    }
+    // Re-check: the toggle may have been flipped while we allocated.
+    if (xf != nullptr && m_allocReq.exchange(false, std::memory_order_acq_rel) &&
+        m_virtWanted.load(std::memory_order_acquire)) {
+        XFeed* old = m_xfeedLive.exchange(xf, std::memory_order_acq_rel);
+        delete old; // never expected; avoid a leak if it happens
+    } else {
+        delete xf;
+    }
+}
+
+void EqDsp::ShutdownVirtualization() {
+    m_virtWanted.store(false, std::memory_order_release);
+    m_allocReq.store(false, std::memory_order_release);
+    XFeed* orphan = m_xfeedOrphan.exchange(nullptr, std::memory_order_acq_rel);
+    delete orphan;
+    XFeed* live = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
+    delete live;
+}
+
+void EqDsp::DeriveXFeedCoeffs(XFeed* xf, float sampleRateHz) {
     // bs2b default preset ("700Hz, 4.5dB"): lowpass Fc = 700 Hz at
     // Gd = -6.75 dB; the highboost cutoff (~995 Hz) is derived for the
     // smoothest summed response. Coefficient derivation follows the bs2b
     // theory (bs2b.sourceforge.net): single-pole recursive filters
     //   lo[n] = a0*in[n] + b1*lo[n-1]
     //   hi[n] = a0h*in[n] + a1h*in[n-1] + b1h*hi[n-1]
-    const double s = (double)m_sampleRate;
+    const double s = (double)sampleRateHz;
     const double Fc = 700.0;
     const double Gd = -6.75;
     const double Adh = -2.25;
@@ -107,15 +156,15 @@ void EqDsp::SetVirtualization(bool on) {
     const double Fch = Fc * pow(2.0, (Gd - Gdh) / 12.0);
     const double x = exp(-2.0 * M_PI * Fc / s);
     const double xh = exp(-2.0 * M_PI * Fch / s);
-    m_xfeed->a0 = (float)(G * (1.0 - x));
-    m_xfeed->b1 = (float)x;
-    m_xfeed->a0h = (float)(1.0 - Gh * (1.0 - xh));
-    m_xfeed->a1h = (float)(-xh);
-    m_xfeed->b1h = (float)xh;
-    m_xfeed->sampleRate = m_sampleRate;
-    m_xfeed->loL = m_xfeed->loR = 0.0f;
-    m_xfeed->hiL = m_xfeed->hiR = 0.0f;
-    m_xfeed->prevL = m_xfeed->prevR = 0.0f;
+    xf->a0 = (float)(G * (1.0 - x));
+    xf->b1 = (float)x;
+    xf->a0h = (float)(1.0 - Gh * (1.0 - xh));
+    xf->a1h = (float)(-xh);
+    xf->b1h = (float)xh;
+    xf->sampleRate = sampleRateHz;
+    xf->loL = xf->loR = 0.0f;
+    xf->hiL = xf->hiR = 0.0f;
+    xf->prevL = xf->prevR = 0.0f;
 }
 
 void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
@@ -132,11 +181,27 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
     // Runs BEFORE the EQ bands -- crossfeed rebuilds a speaker-like stereo
     // image, the EQ then shapes the final tonality. Stereo only. The whole
     // stage is skipped (one branch) when the toggle is off.
-    if (m_xfeed && ch == 2) {
-        if (m_xfeed->sampleRate != m_sampleRate) {
-            SetVirtualization(true); // re-derive coeffs for the new rate
+    //
+    // RT-safe: only an atomic load; allocation/derivation happens on the
+    // worker thread (ServiceVirtualizationWorker).
+    XFeed* xf = m_xfeedLive.load(std::memory_order_acquire);
+    if (xf != nullptr && ch == 2) {
+        if (xf->sampleRate != m_sampleRate &&
+            m_virtWanted.load(std::memory_order_acquire)) {
+            // Rate changed under us: retire the stale state to the worker
+            // and request a fresh derivation. Audio passes through
+            // un-crossfed until the worker publishes the new state.
+            XFeed* stale = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
+            if (stale != nullptr) {
+                m_xfeedOrphan.store(stale, std::memory_order_release);
+            }
+            m_allocReq.store(true, std::memory_order_release);
+            xf = nullptr;
         }
-        XFeed* xf = m_xfeed.get();
+    } else {
+        xf = nullptr;
+    }
+    if (xf != nullptr) {
         const float a0 = xf->a0, b1 = xf->b1;
         const float a0h = xf->a0h, a1h = xf->a1h, b1h = xf->b1h;
         float loL = xf->loL, loR = xf->loR;

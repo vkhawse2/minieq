@@ -23,4 +23,9 @@ target_include_directories(MiniEQ_APO PRIVATE
 # ole32/uuid: COM. advapi32: registry (registration.cpp).
 target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32)
 
+# Static CRT: audiodg.exe loads this DLL with no guarantee that the VC++
+# redistributable is reachable from its context. A dynamic-CRT dependency
+# (VCRUNTIME140.dll) is a load failure waiting to happen.
+set_property(TARGET MiniEQ_APO PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 set_target_properties(MiniEQ_APO PROPERTIES OUTPUT_NAME "MiniEQ_APO")
