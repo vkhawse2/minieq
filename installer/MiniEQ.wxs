@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  MiniEQ.wxs -- WiX v3 installer source for MiniEQ.
+  MiniEQ.wxs: WiX v3 installer source for MiniEQ.
 
   Installs (per-machine, Program Files):
     MiniEQ.exe        the tiny Win32 UI
@@ -10,7 +10,7 @@
 
   Per-endpoint attach (FxProperties) is NOT done by the installer: it is a
   one-time, per-device, elevated step the app itself performs from its
-  "Attach" button. This keeps the MSI to files + COM registration.
+  "Attach" button. This keeps the MSI to files plus COM registration.
 
   Build (from repo root, WiX v3 on PATH):
     candle -arch x64 -dBinDir=build\Release installer\MiniEQ.wxs -out build\MiniEQ.wixobj
