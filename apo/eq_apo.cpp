@@ -13,10 +13,18 @@
 #include "guids.h"
 
 #include <mmdeviceapi.h>
-#include <functiondiscoverykeys_devpkey.h> // PKEY_AudioEndpoint_GUID
 #include <ks.h>          // must come before ksmedia.h
 #include <ksmedia.h>   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 #include <strsafe.h>
+
+// PKEY_AudioEndpoint_GUID = {[1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E}, 4}.
+// functiondiscoverykeys_devpkey.h only *declares* this key -- no import
+// lib provides the definition, so referencing it is a link error
+// (LNK2019). Define it TU-local instead.
+static const PROPERTYKEY kPkeyAudioEndpointGuid = {
+    { 0x1DA5D803, 0xD492, 0x4EDD, { 0x8C, 0x23, 0xE0, 0xC0, 0xFF, 0xEE, 0x7F, 0x0E } },
+    4
+};
 
 #include <cstring>
 
@@ -198,7 +206,7 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
     wchar_t epGuid[64] = {};
     PROPVARIANT var;
     PropVariantInit(&var);
-    HRESULT hr = head->pAPOEndpointProperties->GetValue(PKEY_AudioEndpoint_GUID, &var);
+    HRESULT hr = head->pAPOEndpointProperties->GetValue(kPkeyAudioEndpointGuid, &var);
     if (SUCCEEDED(hr) && var.vt == VT_LPWSTR && var.pwszVal != nullptr) {
         wcsncpy_s(epGuid, ARRAYSIZE(epGuid), var.pwszVal, _TRUNCATE);
     }
@@ -235,7 +243,7 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
         if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pStore)) && pStore != nullptr) {
             PROPVARIANT v2;
             PropVariantInit(&v2);
-            if (SUCCEEDED(pStore->GetValue(PKEY_AudioEndpoint_GUID, &v2)) &&
+            if (SUCCEEDED(pStore->GetValue(kPkeyAudioEndpointGuid, &v2)) &&
                 v2.vt == VT_LPWSTR && v2.pwszVal != nullptr &&
                 _wcsicmp(v2.pwszVal, epGuid) == 0) {
                 match = true;
