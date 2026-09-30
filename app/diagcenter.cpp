@@ -209,8 +209,7 @@ static std::vector<DiagSessionInfo> EnumEndpointSessions(const std::wstring& end
                             if (SUCCEEDED(pCtl2->GetProcessId(&pid))) {
                                 si.pid = pid;
                             }
-                            BOOL sys = FALSE;
-                            if (SUCCEEDED(pCtl2->IsSystemSoundsSession(&sys)) && sys) {
+                            if (pCtl2->IsSystemSoundsSession() == S_OK) {
                                 si.systemSounds = true;
                                 si.exe = L"System sounds";
                             }
@@ -649,13 +648,15 @@ static void UpdateSessionList(const DiagSnapshot& snap) {
         it.mask = LVIF_TEXT;
         it.iItem = row;
         it.pszText = const_cast<LPWSTR>(si.exe.c_str());
-        ListView_InsertItem(s_hSessions, &it);
+        // Explicit W variants: this project builds without UNICODE defined,
+        // so the generic ListView_* macros would resolve to the ANSI versions.
+        ListView_InsertItemW(s_hSessions, &it);
 
         wchar_t pid[32] = {};
         StringCchPrintfW(pid, ARRAYSIZE(pid), L"%lu", si.pid);
-        ListView_SetItemText(s_hSessions, row, 1, pid);
-        ListView_SetItemText(s_hSessions, row, 2,
-                             const_cast<LPWSTR>(si.active ? L"Active" : L"Idle"));
+        ListView_SetItemTextW(s_hSessions, row, 1, pid);
+        ListView_SetItemTextW(s_hSessions, row, 2,
+                              const_cast<LPWSTR>(si.active ? L"Active" : L"Idle"));
 
         std::wstring level;
         if (si.peak >= 0.0f) {
@@ -670,7 +671,7 @@ static void UpdateSessionList(const DiagSnapshot& snap) {
         } else {
             level = L"\u2014";
         }
-        ListView_SetItemText(s_hSessions, row, 3, const_cast<LPWSTR>(level.c_str()));
+        ListView_SetItemTextW(s_hSessions, row, 3, const_cast<LPWSTR>(level.c_str()));
         ++row;
     }
 }
@@ -881,7 +882,7 @@ static void DcOnCreate(HWND hwnd) {
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         col.pszText = const_cast<LPWSTR>(cols[i].text);
         col.cx = cols[i].cx;
-        ListView_InsertColumn(s_hSessions, i, &col);
+        ListView_InsertColumnW(s_hSessions, i, &col);
     }
 
     makeGroup(L"Recent log (categorized)", 12, 414, 596, 168);
