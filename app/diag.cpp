@@ -440,7 +440,7 @@ void MiniEQ_ShowLogViewer(HINSTANCE hInst, HWND hParent) {
         wc.lpfnWndProc = LogWndProc;
         wc.hInstance = hInst;
         wc.lpszClassName = kLogWndClass;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         if (RegisterClassW(&wc) != 0 ||
             GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
