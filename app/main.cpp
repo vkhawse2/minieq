@@ -109,6 +109,8 @@ static HWND                 g_bannerText, g_bannerBtn; // auto-attach banner
 static HWND                 g_preset[4];  // preset buttons (for power dimming)
 static HWND                 g_masterLabel, g_presetLabel, g_settingsLabel;
 static HWND                 g_bandsLabel, g_note; // fixed labels repositioned by LayoutContent
+
+static void LayoutContent(); // forward: called before its definition below
 static HWND                 g_btnChecklist; // "Checklist" button
 static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
@@ -679,7 +681,6 @@ static void ChainAudioRestartForBanner() {
 // Window
 //------------------------------------------------------------------------------
 
-static void LayoutContent(); // defined after BuildControls
 static void BuildControls(HWND hwnd) {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     auto applyFont = [font](HWND c) { SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE); };
