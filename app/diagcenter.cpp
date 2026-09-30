@@ -28,12 +28,13 @@
 #include <wchar.h>
 
 // PKEY_AudioEndpoint_Disable_SysFx -- the "Audio enhancements" switch.
-// {1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5 (VT_BOOL; TRUE = enhancements OFF,
-// i.e. the engine skips the whole SysFx chain, MiniEQ included). Same fmtid
-// as PKEY_AudioEndpoint_GUID (pid 4); this key is pid 5. Defined locally
-// rather than via the SDK header so the build doesn't depend on SDK header
-// version skew. If a future Windows changes this key, the read below simply
-// fails and the row reports "unknown" -- never a wrong value.
+// {1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5. The native storage is a
+// REG_DWORD (VT_UI4 through the property store): 1 = enhancements OFF
+// (the engine skips the whole SysFx chain, MiniEQ included), 0 = on.
+// Our own older one-click fix wrote VT_BOOL, so both are accepted.
+// Same fmtid as PKEY_AudioEndpoint_GUID (pid 4); this key is pid 5.
+// Defined locally rather than via the SDK header so the build doesn't
+// depend on SDK header version skew.
 static const PROPERTYKEY kPkeyDisableSysFx = {
     { 0x1DA5D803, 0xD492, 0x4EDD, { 0x8C, 0x23, 0xE0, 0xC0, 0xFF, 0xEE, 0x7F, 0x0E } },
     5
@@ -129,10 +130,46 @@ struct DeviceProps {
     bool             ok = false;
 };
 
+// Interprets one Disable_SysFx read for both enhancement-read sites below.
+// Native storage is REG_DWORD (VT_UI4): nonzero = enhancements off,
+// zero = on. VT_BOOL is accepted for values our own older one-click fix
+// wrote. Absent/empty/valueless = device defaults = on (the Settings UI
+// shows "Device Default Effects" in that state). A genuinely unrecognized
+// type stays Unknown -- and is logged so the next trace names it.
+static DiagEnhancements EnhancementsFromPropVariant(const PROPVARIANT& pv, HRESULT hr) {
+    if (FAILED(hr)) {
+        return DiagEnhancements::On;
+    }
+    switch (pv.vt) {
+    case VT_BOOL:
+        return pv.boolVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_UI4:
+        return pv.ulVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_I4:
+        return pv.lVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_UI2:
+        return pv.uiVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_I2:
+        return pv.iVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_UI1:
+        return pv.bVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_I1:
+        return pv.cVal ? DiagEnhancements::Off : DiagEnhancements::On;
+    case VT_EMPTY:
+    case VT_NULL:
+        return DiagEnhancements::On;
+    default:
+        MiniEQ_AppLogCat(L"DIAG",
+            L"enhancements read: unexpected variant type %u, treating as unknown",
+            static_cast<unsigned>(pv.vt));
+        return DiagEnhancements::Unknown;
+    }
+}
+
 // Single-key read of PKEY_AudioEndpoint_Disable_SysFx for one endpoint.
 // Exported for the main window's 500 ms status path: cheap enough to poll
-// every few seconds, and it degrades to Unknown (never a wrong value) when
-// the key is missing or unreadable.
+// every few seconds. Device enumeration failures stay Unknown; the key
+// itself is interpreted by EnhancementsFromPropVariant above.
 DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId) {
     if (endpointId.empty()) {
         return DiagEnhancements::Unknown;
@@ -151,18 +188,7 @@ DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId) {
             PROPVARIANT pv;
             PropVariantInit(&pv);
             const HRESULT hr = pProps->GetValue(kPkeyDisableSysFx, &pv);
-            if (SUCCEEDED(hr) && pv.vt == VT_BOOL) {
-                out = pv.boolVal ? DiagEnhancements::Off : DiagEnhancements::On;
-            } else if (FAILED(hr) || pv.vt == VT_EMPTY || pv.vt == VT_NULL) {
-                // Key absent -- or present but holding no value (seen on
-                // some Bluetooth endpoints, e.g. boAt Airdopes 411ANC on
-                // 2026-09-30, where the read succeeds with VT_EMPTY): the
-                // endpoint is on device defaults, i.e. enhancements are
-                // allowed. (The Settings UI shows "Device Default Effects"
-                // in this state.) Same pattern as the spatial read: an
-                // absent key means the default state.
-                out = DiagEnhancements::On;
-            }
+            out = EnhancementsFromPropVariant(pv, hr);
             PropVariantClear(&pv);
             pProps->Release();
         }
@@ -277,9 +303,11 @@ bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId) {
     return ok;
 }
 
-// Writes the "Audio enhancements" switch: on = FALSE (device default
-// effects, the SysFx chain runs), off = TRUE (the engine skips every
-// APO, MiniEQ included). Mirrors MiniEQ_SetSpatialSoundOff above.
+// Writes the "Audio enhancements" switch: on = 0 (device default
+// effects, the SysFx chain runs), off = 1 (the engine skips every
+// APO, MiniEQ included). Stored as REG_DWORD (VT_UI4) -- the native
+// format the Settings app itself uses, so both tools read each
+// other's writes. Mirrors MiniEQ_SetSpatialSoundOff above.
 bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on) {
     if (endpointId.empty()) {
         return false;
@@ -298,8 +326,8 @@ bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on) {
             pProps != nullptr) {
             PROPVARIANT pv;
             PropVariantInit(&pv);
-            pv.vt = VT_BOOL;
-            pv.boolVal = on ? VARIANT_FALSE : VARIANT_TRUE;
+            pv.vt = VT_UI4;
+            pv.ulVal = on ? 0 : 1;
             if (SUCCEEDED(pProps->SetValue(kPkeyDisableSysFx, pv)) &&
                 SUCCEEDED(pProps->Commit())) {
                 ok = true;
@@ -525,15 +553,7 @@ static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
             PropVariantInit(&pv);
             {
                 const HRESULT hrEnh = pProps->GetValue(kPkeyDisableSysFx, &pv);
-                if (SUCCEEDED(hrEnh) && pv.vt == VT_BOOL) {
-                    d.enhancements = pv.boolVal ? DiagEnhancements::Off
-                                                : DiagEnhancements::On;
-                } else if (FAILED(hrEnh) || pv.vt == VT_EMPTY || pv.vt == VT_NULL) {
-                    // Absent key, or key present but valueless (see
-                    // MiniEQ_ReadEnhancements) = device defaults =
-                    // enhancements allowed.
-                    d.enhancements = DiagEnhancements::On;
-                }
+                d.enhancements = EnhancementsFromPropVariant(pv, hrEnh);
             }
             PropVariantClear(&pv);
             pProps->Release();
