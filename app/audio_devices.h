@@ -11,3 +11,8 @@ struct AudioEndpoint {
 };
 
 std::vector<AudioEndpoint> MiniEQ_ListRenderEndpoints();
+
+// Endpoint ID of the system default render device (eConsole role), or empty
+// if there is none. Used to pre-select the device the user is actually
+// listening on when the app opens.
+std::wstring MiniEQ_GetDefaultRenderEndpointId();

@@ -56,3 +56,28 @@ std::vector<AudioEndpoint> MiniEQ_ListRenderEndpoints() {
     enumerator->Release();
     return out;
 }
+
+std::wstring MiniEQ_GetDefaultRenderEndpointId() {
+    std::wstring out;
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                 CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                 (void**)&enumerator);
+    if (FAILED(hr)) {
+        return out;
+    }
+
+    IMMDevice* device = nullptr;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (SUCCEEDED(hr)) {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(device->GetId(&id)) && id != nullptr) {
+            out = id;
+            CoTaskMemFree(id);
+        }
+        device->Release();
+    }
+    enumerator->Release();
+    return out;
+}

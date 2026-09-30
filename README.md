@@ -1,8 +1,13 @@
 # MiniEQ
 
 A minimal, lowest-RAM, standalone system-wide equalizer for Windows —
-built for Bluetooth devices (Sony WH-1000XM4, Tribit XSound Go, …) but works
-with any output. **One app, one install, no dependencies.**
+built for Bluetooth devices (Sony WH-1000XM4, Tribit XSound Go, …) and any
+earphone/headphone connected via aux, USB-C or Bluetooth. **One app, one
+install, no dependencies.**
+
+Open the app and the current output device's name is shown big at the top —
+it auto-selects the system default output, and the list refreshes live when
+devices are plugged in or unplugged.
 
 > **Status: scaffold.** The architecture, DSP, COM plumbing, registration,
 > and UI are all written, but this was authored on a Linux machine and has
@@ -81,9 +86,10 @@ This produces `build\apo\Release\MiniEQ_APO.dll` and `build\app\Release\MiniEQ.e
    regsvr32 MiniEQ_APO.dll
    ```
    This writes the COM class + APO declaration to HKLM.
-3. Run `MiniEQ.exe`, pick your Bluetooth device, click **Attach to this
-   device** (approves one admin prompt). This writes the SFX slot in that
-   endpoint's `FxProperties`.
+3. Run `MiniEQ.exe` — your current output device (aux / USB-C / Bluetooth)
+   is already selected with its name shown at the top. Click **Attach to
+   this device** (approves one admin prompt). This writes the SFX slot in
+   that endpoint's `FxProperties`.
 4. Restart audio playback (the engine loads the APO when the stream starts).
    Move sliders — EQ applies live.
 

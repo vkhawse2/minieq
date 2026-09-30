@@ -1,9 +1,11 @@
 // main.cpp -- MiniEQ UI: a tiny native Win32 window.
 //
-// One window: device picker, 5 EQ sliders, master gain, bypass, presets, and
-// a one-click (elevated) "attach to this device" action. No frameworks, no
-// runtime beyond the Windows SDK: the whole app is well under a megabyte and
-// a few MB of RAM.
+// One window: a prominent current-device header, device picker, 5 EQ sliders,
+// master gain, bypass, presets, and a one-click (elevated) "attach to this
+// device" action. On open it auto-selects the system default output (aux,
+// USB-C or Bluetooth -- whatever you're listening on) and re-lists endpoints
+// live when devices are plugged/unplugged. No frameworks, no runtime beyond
+// the Windows SDK: the whole app is well under a megabyte and a few MB of RAM.
 //
 // Usage: MiniEQ.exe [--attach <endpoint-id> | --detach <endpoint-id>]
 // The --attach/--detach forms are used for the elevated self-relaunch and
@@ -30,6 +32,7 @@
 //------------------------------------------------------------------------------
 
 enum {
+    IDC_DEVICENAME   = 100,
     IDC_DEVICE_COMBO = 101,
     IDC_REFRESH      = 102,
     IDC_ATTACH       = 103,
@@ -58,6 +61,7 @@ static const float kPresets[4][MINIEQ_NUM_BANDS] = {
 
 static HINSTANCE            g_hInst;
 static HWND                 g_hwnd;
+static HWND                 g_deviceName;
 static HWND                 g_combo, g_refresh, g_attach, g_status;
 static HWND                 g_band[MINIEQ_NUM_BANDS], g_bandVal[MINIEQ_NUM_BANDS];
 static HWND                 g_master, g_masterVal, g_bypass;
@@ -112,6 +116,9 @@ static void SelectDevice(int index) {
         return;
     }
     g_endpointId = g_devices[(size_t)index].id;
+    // The device name is the first thing the user sees: keep it prominent and
+    // always in sync with the selection, even if the channel open fails.
+    SetWindowTextW(g_deviceName, g_devices[(size_t)index].name.c_str());
     g_link.Close();
     if (!g_link.Open(g_endpointId)) {
         MessageBoxW(g_hwnd, L"Could not open the settings channel.", L"MiniEQ", MB_ICONWARNING);
@@ -131,6 +138,11 @@ static void RefreshDeviceList() {
     int keep = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0);
     std::wstring keepId = (keep >= 0 && keep < (int)g_devices.size())
                           ? g_devices[(size_t)keep].id : L"";
+    if (keepId.empty()) {
+        // Fresh open (or the list was empty): pre-select the system default
+        // output -- the device the user is actually listening on.
+        keepId = MiniEQ_GetDefaultRenderEndpointId();
+    }
 
     g_devices = MiniEQ_ListRenderEndpoints();
     SendMessageW(g_combo, CB_RESETCONTENT, 0, 0);
@@ -142,11 +154,13 @@ static void RefreshDeviceList() {
         }
     }
     if (sel < 0 && !g_devices.empty()) {
-        sel = 0; // default device first is usually index 0; fine for v1
+        sel = 0;
     }
     if (sel >= 0) {
         SendMessageW(g_combo, CB_SETCURSEL, (WPARAM)sel, 0);
         SelectDevice(sel);
+    } else {
+        SetWindowTextW(g_deviceName, L"No output device");
     }
 }
 
@@ -178,30 +192,42 @@ static void BuildControls(HWND hwnd) {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     auto applyFont = [font](HWND c) { SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE); };
 
-    CreateWindowW(L"STATIC", L"Output device:", WS_CHILD | WS_VISIBLE,
-                  12, 14, 90, 18, hwnd, nullptr, g_hInst, nullptr);
+    // Prominent current-device header: the device name is the first thing the
+    // user sees when the app opens.
+    HFONT nameFont = CreateFontW(-22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                 CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                 DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_deviceName = CreateWindowW(L"STATIC", L"No output device",
+                                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                                 12, 10, 396, 30, hwnd, (HMENU)IDC_DEVICENAME,
+                                 g_hInst, nullptr);
+    SendMessageW(g_deviceName, WM_SETFONT, (WPARAM)nameFont, TRUE);
+
+    CreateWindowW(L"STATIC", L"Device:", WS_CHILD | WS_VISIBLE,
+                  12, 52, 52, 18, hwnd, nullptr, g_hInst, nullptr);
     g_combo = CreateWindowW(L"COMBOBOX", nullptr,
                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                            104, 10, 220, 200, hwnd, (HMENU)IDC_DEVICE_COMBO,
+                            66, 48, 258, 200, hwnd, (HMENU)IDC_DEVICE_COMBO,
                             g_hInst, nullptr);
     applyFont(g_combo);
     g_refresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                              330, 9, 58, 24, hwnd, (HMENU)IDC_REFRESH, g_hInst, nullptr);
+                              330, 47, 78, 24, hwnd, (HMENU)IDC_REFRESH, g_hInst, nullptr);
     applyFont(g_refresh);
 
     g_attach = CreateWindowW(L"BUTTON", L"Attach to this device",
                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                             12, 42, 170, 26, hwnd, (HMENU)IDC_ATTACH, g_hInst, nullptr);
+                             12, 80, 170, 26, hwnd, (HMENU)IDC_ATTACH, g_hInst, nullptr);
     applyFont(g_attach);
     g_status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                             190, 47, 198, 18, hwnd, (HMENU)IDC_STATUS, g_hInst, nullptr);
+                             190, 85, 218, 18, hwnd, (HMENU)IDC_STATUS, g_hInst, nullptr);
     applyFont(g_status);
 
     for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
         const int x = 14 + i * 76;
         g_band[i] = CreateWindowW(TRACKBAR_CLASSW, nullptr,
                                   WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_AUTOTICKS,
-                                  x + 12, 84, 40, 170, hwnd, (HMENU)(IDC_BAND0 + i),
+                                  x + 12, 112, 40, 170, hwnd, (HMENU)(IDC_BAND0 + i),
                                   g_hInst, nullptr);
         SendMessageW(g_band[i], TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
         SendMessageW(g_band[i], TBM_SETPAGESIZE, 0, 20);
@@ -209,45 +235,45 @@ static void BuildControls(HWND hwnd) {
 
         HWND name = CreateWindowW(L"STATIC", kBandNames[i],
                                   WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                  x, 258, 64, 18, hwnd, nullptr, g_hInst, nullptr);
+                                  x, 286, 64, 18, hwnd, nullptr, g_hInst, nullptr);
         applyFont(name);
         g_bandVal[i] = CreateWindowW(L"STATIC", L"+0.0 dB", WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                     x, 276, 64, 18, hwnd, (HMENU)(IDC_BANDVAL0 + i),
+                                     x, 304, 64, 18, hwnd, (HMENU)(IDC_BANDVAL0 + i),
                                      g_hInst, nullptr);
         applyFont(g_bandVal[i]);
     }
 
     HWND masterLabel = CreateWindowW(L"STATIC", L"Master", WS_CHILD | WS_VISIBLE,
-                                     12, 312, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+                                     12, 340, 60, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(masterLabel);
     g_master = CreateWindowW(TRACKBAR_CLASSW, nullptr,
                              WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
-                             70, 306, 230, 34, hwnd, (HMENU)IDC_MASTER, g_hInst, nullptr);
+                             70, 334, 230, 34, hwnd, (HMENU)IDC_MASTER, g_hInst, nullptr);
     SendMessageW(g_master, TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
     SendMessageW(g_master, TBM_SETPAGESIZE, 0, 20);
     g_masterVal = CreateWindowW(L"STATIC", L"+0.0 dB", WS_CHILD | WS_VISIBLE,
-                                308, 312, 70, 18, hwnd, (HMENU)IDC_MASTERVAL,
+                                308, 340, 70, 18, hwnd, (HMENU)IDC_MASTERVAL,
                                 g_hInst, nullptr);
     applyFont(g_masterVal);
 
     g_bypass = CreateWindowW(L"BUTTON", L"Bypass (EQ off)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                             12, 344, 140, 20, hwnd, (HMENU)IDC_BYPASS, g_hInst, nullptr);
+                             12, 372, 140, 20, hwnd, (HMENU)IDC_BYPASS, g_hInst, nullptr);
     applyFont(g_bypass);
 
     HWND presetLabel = CreateWindowW(L"STATIC", L"Presets:", WS_CHILD | WS_VISIBLE,
-                                     12, 378, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+                                     12, 406, 60, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(presetLabel);
     const wchar_t* presetNames[4] = { L"Flat", L"Bass", L"Vocal", L"Bright" };
     for (int i = 0; i < 4; ++i) {
         HWND b = CreateWindowW(L"BUTTON", presetNames[i], WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               76 + i * 78, 374, 70, 26, hwnd,
+                               76 + i * 78, 402, 70, 26, hwnd,
                                (HMENU)(IDC_PRESET_FLAT + i), g_hInst, nullptr);
         applyFont(b);
     }
 
     HWND note = CreateWindowW(L"STATIC",
         L"Attach once per device (asks for admin). Sliders apply live.",
-        WS_CHILD | WS_VISIBLE, 12, 416, 376, 30, hwnd, nullptr, g_hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 12, 444, 396, 30, hwnd, nullptr, g_hInst, nullptr);
     applyFont(note);
 }
 
@@ -312,6 +338,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     }
+
+    case WM_DEVICECHANGE:
+        // Aux / USB-C / Bluetooth (un)plugged while the app is open: re-list
+        // endpoints and keep the current selection when it is still present.
+        RefreshDeviceList();
+        return 0;
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -382,7 +414,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
 
     HWND hwnd = CreateWindowExW(0, L"MiniEQWnd", L"MiniEQ",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 404, 480,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 516,
                                 nullptr, nullptr, hInst, nullptr);
     if (hwnd == nullptr) {
         CoUninitialize();
