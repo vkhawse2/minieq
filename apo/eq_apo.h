@@ -74,7 +74,7 @@ public:
                                           AUDIO_SYSTEMEFFECT_STATE state) override;
 
     // IAudioProcessingObject
-    STDMETHODIMP Initialize(UINT32 cbDataSize, BYTE* pbyData) override;
+    STDMETHODIMP Initialize(UINT32 cbDataSize, BYTE* pbyData) noexcept override;
     STDMETHODIMP IsInputFormatSupported(IAudioMediaType* pOppositeFormat,
                                        IAudioMediaType* pRequestedInputFormat,
                                        IAudioMediaType** ppSupportedInputFormat) override;
@@ -90,7 +90,7 @@ public:
     STDMETHODIMP_(void) APOProcess(UINT32 u32NumInputConnections,
                                   APO_CONNECTION_PROPERTY** ppInputConnections,
                                   UINT32 u32NumOutputConnections,
-                                  APO_CONNECTION_PROPERTY** ppOutputConnections) override;
+                                  APO_CONNECTION_PROPERTY** ppOutputConnections) noexcept override;
     STDMETHODIMP_(UINT32) CalcInputFrames(UINT32 u32OutputFrameCount) override;
     STDMETHODIMP_(UINT32) CalcOutputFrames(UINT32 u32InputFrameCount) override;
 
@@ -98,7 +98,7 @@ public:
     STDMETHODIMP LockForProcess(UINT32 u32NumInputConnections,
                                APO_CONNECTION_DESCRIPTOR** ppInputConnections,
                                UINT32 u32NumOutputConnections,
-                               APO_CONNECTION_DESCRIPTOR** ppOutputConnections) override;
+                               APO_CONNECTION_DESCRIPTOR** ppOutputConnections) noexcept override;
     STDMETHODIMP UnlockForProcess() override;
 
 private:

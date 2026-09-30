@@ -18,6 +18,7 @@
 #include <ksmedia.h>   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 #include <strsafe.h>
 #include <sddl.h>      // ConvertStringSecurityDescriptorToSecurityDescriptorW
+#include <xmmintrin.h> // _mm_getcsr/_mm_setcsr: FTZ|DAZ denormal safety on RT threads
 
 // PKEY_AudioEndpoint_GUID = {[1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E}, 4}.
 // functiondiscoverykeys_devpkey.h only *declares* this key -- no import
@@ -182,7 +183,8 @@ bool CEqApo::IsFloat32Format(const WAVEFORMATEX* wfx) {
 // IAudioProcessingObject
 //------------------------------------------------------------------------------
 
-STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
+STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) noexcept
+try {
     MiniEQ_Trace(L"MiniEQ_APO: Initialize cbDataSize=%lu pbyData=%s", cbDataSize,
                  pbyData != nullptr ? L"ok" : L"null");
     if (m_initialized) {
@@ -302,6 +304,12 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
 
     m_initialized = true;
     return S_OK;
+} catch (...) {
+    // Never let a C++ exception cross the COM boundary: the audio engine
+    // (audiodg.exe) hosts this DLL in-process, and an escaping exception
+    // would terminate the whole engine. Fail the init loudly instead.
+    MiniEQ_Trace(L"MiniEQ_APO: Initialize swallowed C++ exception -> E_FAIL");
+    return E_FAIL;
 }
 
 STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/,
@@ -331,6 +339,13 @@ STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/
     if (wfx->nChannels == 0 || wfx->nChannels > MINIEQ_MAX_CHANNELS) {
         return APOERR_FORMAT_NOT_SUPPORTED;
     }
+    // Negotiation policy: accept-and-adapt. Any engine-proposed sample rate
+    // is accepted -- EqDsp::Configure derives its smoothing constants from
+    // the real rate (absurd rates are clamped there, never here) -- and any
+    // channel count our fixed RT-safe state supports (1..MINIEQ_MAX_CHANNELS,
+    // covering stereo / 5.1 / 7.1 spatial layouts). Rejecting a format makes
+    // the engine silently drop the APO, so we only decline what we genuinely
+    // cannot process: non-float32, zero channels, or wider than our state.
     // In-place SFX: we accept the requested format as-is.
     *ppSupportedInputFormat = pRequestedInputFormat;
     (*ppSupportedInputFormat)->AddRef();
@@ -404,22 +419,37 @@ STDMETHODIMP CEqApo::Reset() {
 STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
                                    APO_CONNECTION_DESCRIPTOR** ppInputConnections,
                                    UINT32 u32NumOutputConnections,
-                                   APO_CONNECTION_DESCRIPTOR** ppOutputConnections) {
+                                   APO_CONNECTION_DESCRIPTOR** ppOutputConnections) noexcept
+try {
     if (m_locked) {
         return APOERR_APO_LOCKED;
     }
     if (u32NumInputConnections != 1 || u32NumOutputConnections != 1 ||
         ppInputConnections == nullptr || ppOutputConnections == nullptr ||
-        ppInputConnections[0] == nullptr || ppInputConnections[0]->pFormat == nullptr) {
+        ppInputConnections[0] == nullptr || ppOutputConnections[0] == nullptr ||
+        ppInputConnections[0]->pFormat == nullptr ||
+        ppOutputConnections[0]->pFormat == nullptr) {
         return E_INVALIDARG;
     }
 
     const WAVEFORMATEX* wfx = ppInputConnections[0]->pFormat->GetAudioFormat();
-    if (wfx == nullptr) {
+    const WAVEFORMATEX* wfxOut = ppOutputConnections[0]->pFormat->GetAudioFormat();
+    if (wfx == nullptr || wfxOut == nullptr) {
         return E_INVALIDARG;
     }
-    if (!IsFloat32Format(wfx)) {
+    if (!IsFloat32Format(wfx) || !IsFloat32Format(wfxOut)) {
         return APOERR_FORMAT_NOT_SUPPORTED;
+    }
+    // In-place SFX contract: both sides must carry the identical format. A
+    // mismatch (e.g. the engine rewiring around a spatial-audio switch)
+    // means the graph is miswired for an in-place APO -- fail the lock
+    // loudly instead of misprocessing buffers.
+    if (wfx->nChannels != wfxOut->nChannels ||
+        wfx->nSamplesPerSec != wfxOut->nSamplesPerSec) {
+        MiniEQ_Trace(L"MiniEQ_APO: LockForProcess -> E_INVALIDARG (in/out mismatch: %u ch @ %lu Hz vs %u ch @ %lu Hz)",
+                     wfx->nChannels, wfx->nSamplesPerSec,
+                     wfxOut->nChannels, wfxOut->nSamplesPerSec);
+        return E_INVALIDARG;
     }
     const float rate = static_cast<float>(wfx->nSamplesPerSec);
     const uint32_t channels = wfx->nChannels;
@@ -427,6 +457,17 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
         return APOERR_FORMAT_NOT_SUPPORTED;
     }
 
+    // Denormal safety, part 1: biquad feedback loops are classic denormal
+    // producers, and one denormal operand can stall the FPU ~100x -- fatal
+    // inside a real-time budget. Arm FTZ|DAZ here; MXCSR is per-thread and
+    // LockForProcess runs on an engine setup thread, so the RT thread gets
+    // its own one-time arming in APOProcess (part 2).
+    _mm_setcsr(_mm_getcsr() | 0x8000u /* FTZ */ | 0x0040u /* DAZ */);
+
+    // (Re)initialize the DSP for the negotiated layout: per-channel biquad
+    // state is resized to nChannels and coefficients recomputed for the new
+    // rate, so a spatial-audio switch (stereo -> 5.1/7.1/object layouts)
+    // can never index past the filter state.
     m_dsp.Configure(rate, channels);
     m_channels = channels;
     m_sampleRate = wfx->nSamplesPerSec;
@@ -475,6 +516,10 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
 
     m_locked = true;
     return S_OK;
+} catch (...) {
+    // Never let a C++ exception cross the COM boundary into audiodg.exe.
+    MiniEQ_Trace(L"MiniEQ_APO: LockForProcess swallowed C++ exception -> E_FAIL");
+    return E_FAIL;
 }
 
 STDMETHODIMP CEqApo::UnlockForProcess() {
@@ -765,7 +810,8 @@ STDMETHODIMP_(UINT32) CEqApo::CalcOutputFrames(UINT32 u32InputFrameCount) {
 STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
                                       APO_CONNECTION_PROPERTY** ppInputConnections,
                                       UINT32 u32NumOutputConnections,
-                                      APO_CONNECTION_PROPERTY** ppOutputConnections) {
+                                      APO_CONNECTION_PROPERTY** ppOutputConnections) noexcept
+try {
     if (ppInputConnections == nullptr || ppInputConnections[0] == nullptr) {
         return;
     }
@@ -777,6 +823,16 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
         break;
     default:
         return; // BUFFER_INVALID: never happens; do nothing
+    }
+
+    // Denormal safety, part 2 (see LockForProcess): MXCSR is per-thread, and
+    // APOProcess runs on the engine's real-time thread -- not the thread
+    // that ran LockForProcess. Arm FTZ|DAZ once per processing thread; the
+    // mode persists, so this is a single branch after the first block.
+    static thread_local bool s_ftzArmed = false;
+    if (!s_ftzArmed) {
+        _mm_setcsr(_mm_getcsr() | 0x8000u /* FTZ */ | 0x0040u /* DAZ */);
+        s_ftzArmed = true;
     }
 
     FLOAT32* frames = reinterpret_cast<FLOAT32*>(in->pBuffer);
@@ -869,4 +925,8 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
         out->u32BufferFlags = in->u32BufferFlags;
         out->u32ValidFrameCount = validFrames;
     }
+} catch (...) {
+    // Fail open: leave the buffer untouched so unprocessed audio keeps
+    // flowing instead of taking the engine down with us.
+    MiniEQ_Trace(L"MiniEQ_APO: APOProcess swallowed C++ exception (fail-open bypass)");
 }

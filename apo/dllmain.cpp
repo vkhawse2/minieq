@@ -94,7 +94,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
     return TRUE;
 }
 
-STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
+STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) noexcept
+try {
     // Not under the loader lock: safe to resolve the log file here.
     MiniEQ_TraceInit();
     if (ppv == nullptr) return E_POINTER;
@@ -107,6 +108,10 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     HRESULT hr = factory.QueryInterface(riid, ppv);
     MiniEQ_Trace(L"MiniEQ_APO: DllGetClassObject (our CLSID) -> hr=0x%08lx", hr);
     return hr;
+} catch (...) {
+    // The engine loads this DLL in-process; never let an exception escape
+    // into it from the class factory entry point.
+    return E_FAIL;
 }
 
 STDAPI DllCanUnloadNow() {
