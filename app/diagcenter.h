@@ -47,6 +47,11 @@ DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId);
 // caller should then fall back to the manual Settings path.
 bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId);
 
+// Writes the "Audio enhancements" switch for one endpoint (on = device
+// default effects, off = the engine skips every APO). Same fallback
+// contract as MiniEQ_SetSpatialSoundOff.
+bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on);
+
 // Full COM-registration path of MiniEQ_APO.dll
 // (HKCR\CLSID\{...}\InprocServer32). Empty when not registered.
 std::wstring MiniEQ_ApoDllPath();

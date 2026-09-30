@@ -147,9 +147,15 @@ DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId) {
         if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps != nullptr) {
             PROPVARIANT pv;
             PropVariantInit(&pv);
-            if (SUCCEEDED(pProps->GetValue(kPkeyDisableSysFx, &pv)) &&
-                pv.vt == VT_BOOL) {
+            const HRESULT hr = pProps->GetValue(kPkeyDisableSysFx, &pv);
+            if (SUCCEEDED(hr) && pv.vt == VT_BOOL) {
                 out = pv.boolVal ? DiagEnhancements::Off : DiagEnhancements::On;
+            } else if (FAILED(hr)) {
+                // Key absent: the endpoint is on device defaults, i.e.
+                // enhancements are allowed. (The Settings UI shows "Device
+                // Default Effects" in this state.) Same pattern as the
+                // spatial read: an absent key means the default state.
+                out = DiagEnhancements::On;
             }
             PropVariantClear(&pv);
             pProps->Release();
@@ -265,6 +271,42 @@ bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId) {
     return ok;
 }
 
+// Writes the "Audio enhancements" switch: on = FALSE (device default
+// effects, the SysFx chain runs), off = TRUE (the engine skips every
+// APO, MiniEQ included). Mirrors MiniEQ_SetSpatialSoundOff above.
+bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on) {
+    if (endpointId.empty()) {
+        return false;
+    }
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId.c_str(), &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READWRITE, &pProps)) &&
+            pProps != nullptr) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            pv.vt = VT_BOOL;
+            pv.boolVal = on ? VARIANT_FALSE : VARIANT_TRUE;
+            if (SUCCEEDED(pProps->SetValue(kPkeyDisableSysFx, pv)) &&
+                SUCCEEDED(pProps->Commit())) {
+                ok = true;
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return ok;
+}
+
 static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
     DeviceProps d;
     if (endpointId.empty()) {
@@ -290,10 +332,15 @@ static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
             PropVariantClear(&pv);
 
             PropVariantInit(&pv);
-            if (SUCCEEDED(pProps->GetValue(kPkeyDisableSysFx, &pv)) &&
-                pv.vt == VT_BOOL) {
-                d.enhancements = pv.boolVal ? DiagEnhancements::Off
-                                            : DiagEnhancements::On;
+            {
+                const HRESULT hrEnh = pProps->GetValue(kPkeyDisableSysFx, &pv);
+                if (SUCCEEDED(hrEnh) && pv.vt == VT_BOOL) {
+                    d.enhancements = pv.boolVal ? DiagEnhancements::Off
+                                                : DiagEnhancements::On;
+                } else if (FAILED(hrEnh)) {
+                    // Absent key = device defaults = enhancements allowed.
+                    d.enhancements = DiagEnhancements::On;
+                }
             }
             PropVariantClear(&pv);
             pProps->Release();

@@ -40,6 +40,7 @@ enum {
     IDC_CL_REFRESH,
     IDC_CL_CLOSE,
     IDC_CL_SPATIALFIX,
+    IDC_CL_ENHFIX,
 };
 
 constexpr int kRows = 8;
@@ -68,6 +69,8 @@ HWND      s_hFix[kRows] = {};
 HWND      s_hLegend = nullptr;
 HWND      s_hSpatialFix = nullptr; // one-click "Turn off" on the spatial row
 bool      s_spatialFixFailed = false;
+HWND      s_hEnhFix = nullptr; // one-click "Turn on" on the enhancements row
+bool      s_enhFixFailed = false;
 HFONT     s_font = nullptr;
 HFONT     s_fontBold = nullptr;
 HFONT     s_fontName = nullptr; // larger device header; freed on destroy
@@ -180,12 +183,18 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
     } else if (snap.enhancements == DiagEnhancements::Off) {
         s_rows[3].state = CheckState::Error;
         s_rows[3].detail = L"Off \u2014 Windows skips every APO, MiniEQ included.";
-        wchar_t fix[256] = {};
-        StringCchPrintfW(fix, ARRAYSIZE(fix),
-            L"Fix: Settings \u2192 System \u2192 Sound \u2192 %s \u2192 "
-            L"Audio enhancements \u2192 \u201CDevice Default Effects\u201D",
-            dev.c_str());
-        s_rows[3].fix = fix;
+        if (s_enhFixFailed) {
+            s_rows[3].fix = L"Couldn't switch it automatically \u2014 turn it on "
+                            L"manually: Settings \u2192 System \u2192 Sound \u2192 "
+                            L"Audio enhancements \u2192 \u201CDevice Default Effects\u201D";
+        } else {
+            wchar_t fix[256] = {};
+            StringCchPrintfW(fix, ARRAYSIZE(fix),
+                L"Fix: Settings \u2192 System \u2192 Sound \u2192 %s \u2192 "
+                L"Audio enhancements \u2192 \u201CDevice Default Effects\u201D",
+                dev.c_str());
+            s_rows[3].fix = fix;
+        }
     } else {
         s_rows[3].state = CheckState::Idle;
         wchar_t detail[256] = {};
@@ -364,11 +373,16 @@ void LayoutRows() {
     place(s_hSect[1], 14, 472, sectH); y += sectH + 4;
     for (int i = 3; i < 5; ++i) {
         int rh = RowHeight(s_rows[i]);
-        // The spatial row (index 4) gets a one-click "Turn off" button
-        // under its fix line while spatial is On.
-        const bool showSpatialBtn =
-            (i == 4 && s_rows[i].state == CheckState::Error);
-        if (showSpatialBtn) {
+        // One-click fix buttons under the fix line, while the row is red:
+        // "Turn on" for audio enhancements (index 3), "Turn off" for
+        // spatial sound (index 4).
+        HWND hFixBtn = nullptr;
+        if (i == 3 && s_rows[i].state == CheckState::Error) {
+            hFixBtn = s_hEnhFix;
+        } else if (i == 4 && s_rows[i].state == CheckState::Error) {
+            hFixBtn = s_hSpatialFix;
+        }
+        if (hFixBtn != nullptr) {
             rh += 34;
         }
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
@@ -384,10 +398,14 @@ void LayoutRows() {
                               !s_rows[i].fix.empty());
         MoveWindow(s_hFix[i], 38, dy, 448, 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
-        if (showSpatialBtn) {
-            MoveWindow(s_hSpatialFix, 38, dy + 16 + 6, 110, 26, TRUE);
-            ShowWindow(s_hSpatialFix, SW_SHOW);
-        } else if (i == 4) {
+        if (hFixBtn != nullptr) {
+            MoveWindow(hFixBtn, 38, dy + 16 + 6, 110, 26, TRUE);
+            ShowWindow(hFixBtn, SW_SHOW);
+        }
+        if (i == 3 && hFixBtn != s_hEnhFix) {
+            ShowWindow(s_hEnhFix, SW_HIDE);
+        }
+        if (i == 4 && hFixBtn != s_hSpatialFix) {
             ShowWindow(s_hSpatialFix, SW_HIDE);
         }
         y += rh;
@@ -413,6 +431,10 @@ void LayoutRows() {
     MoveWindow(s_hLegend, 14, y + 6, 300, 18, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_REFRESH), 316, y + 2, 80, 26, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_CLOSE), 404, y + 2, 80, 26, TRUE);
+
+    // Rows move between refreshes: repaint the whole client area so a
+    // shrunken row leaves no ghost text behind.
+    InvalidateRect(s_hDlg, nullptr, TRUE);
 
     // Grow the window if the content needs more room (long device names,
     // two-line details); never shrink below the designed size.
@@ -549,6 +571,10 @@ void ClOnCreate(HWND hwnd) {
     // is On (row 4 in Error). LayoutRows positions it.
     s_hSpatialFix = makeButton(IDC_CL_SPATIALFIX, L"Turn off");
     ShowWindow(s_hSpatialFix, SW_HIDE);
+    // One-click fix for the audio-enhancements row: visible only while
+    // enhancements are Off (row 3 in Error). LayoutRows positions it.
+    s_hEnhFix = makeButton(IDC_CL_ENHFIX, L"Turn on");
+    ShowWindow(s_hEnhFix, SW_HIDE);
 
     SetTimer(hwnd, 1, 1500, nullptr);
     RefreshChecklist();
@@ -585,6 +611,16 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s_spatialFixFailed = !ok;
             MiniEQ_AppLogCat(L"UI", ok ? L"spatial sound turned off from checklist"
                                        : L"checklist spatial turn-off failed");
+            RefreshChecklist();
+            return 0;
+        }
+        case IDC_CL_ENHFIX: {
+            // One-click fix: switch enhancements back to device defaults
+            // so the SysFx chain (MiniEQ's SFX APO) runs again.
+            const bool ok = MiniEQ_SetAudioEnhancements(s_endpoint, true);
+            s_enhFixFailed = !ok;
+            MiniEQ_AppLogCat(L"UI", ok ? L"audio enhancements turned on from checklist"
+                                       : L"checklist enhancements turn-on failed");
             RefreshChecklist();
             return 0;
         }
@@ -631,6 +667,7 @@ void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
     s_endpoint = endpointId;
     s_deviceName = deviceName;
     s_spatialFixFailed = false;
+    s_enhFixFailed = false;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
