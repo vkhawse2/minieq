@@ -72,6 +72,50 @@ void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
 
 void EqDsp::Reset() {
     memset(m_state, 0, sizeof(m_state));
+    if (m_xfeed) {
+        m_xfeed->loL = m_xfeed->loR = 0.0f;
+        m_xfeed->hiL = m_xfeed->hiR = 0.0f;
+        m_xfeed->prevL = m_xfeed->prevR = 0.0f;
+    }
+}
+
+void EqDsp::SetVirtualization(bool on) {
+    if (!on) {
+        m_xfeed.reset(); // free the state: zero RAM while the toggle is off
+        return;
+    }
+    if (!m_xfeed) {
+        m_xfeed = std::make_unique<XFeed>(); // allocate only on first enable
+    }
+    if (m_xfeed->sampleRate == m_sampleRate) {
+        return; // coefficients already derived for this rate
+    }
+    // bs2b default preset ("700Hz, 4.5dB"): lowpass Fc = 700 Hz at
+    // Gd = -6.75 dB; the highboost cutoff (~995 Hz) is derived for the
+    // smoothest summed response. Coefficient derivation follows the bs2b
+    // theory (bs2b.sourceforge.net): single-pole recursive filters
+    //   lo[n] = a0*in[n] + b1*lo[n-1]
+    //   hi[n] = a0h*in[n] + a1h*in[n-1] + b1h*hi[n-1]
+    const double s = (double)m_sampleRate;
+    const double Fc = 700.0;
+    const double Gd = -6.75;
+    const double Adh = -2.25;
+    const double G = pow(10.0, Gd / 20.0);
+    const double Ah = pow(10.0, Adh / 20.0);
+    const double Gh = 1.0 - Ah;
+    const double Gdh = 20.0 * log10(Gh);
+    const double Fch = Fc * pow(2.0, (Gd - Gdh) / 12.0);
+    const double x = exp(-2.0 * M_PI * Fc / s);
+    const double xh = exp(-2.0 * M_PI * Fch / s);
+    m_xfeed->a0 = (float)(G * (1.0 - x));
+    m_xfeed->b1 = (float)x;
+    m_xfeed->a0h = (float)(1.0 - Gh * (1.0 - xh));
+    m_xfeed->a1h = (float)(-xh);
+    m_xfeed->b1h = (float)xh;
+    m_xfeed->sampleRate = m_sampleRate;
+    m_xfeed->loL = m_xfeed->loR = 0.0f;
+    m_xfeed->hiL = m_xfeed->hiR = 0.0f;
+    m_xfeed->prevL = m_xfeed->prevR = 0.0f;
 }
 
 void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
@@ -83,6 +127,44 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
     }
 
     const uint32_t ch = m_channels;
+
+    // (1) Optional headphone virtualization: bs2b-style Bauer crossfeed.
+    // Runs BEFORE the EQ bands -- crossfeed rebuilds a speaker-like stereo
+    // image, the EQ then shapes the final tonality. Stereo only. The whole
+    // stage is skipped (one branch) when the toggle is off.
+    if (m_xfeed && ch == 2) {
+        if (m_xfeed->sampleRate != m_sampleRate) {
+            SetVirtualization(true); // re-derive coeffs for the new rate
+        }
+        XFeed* xf = m_xfeed.get();
+        const float a0 = xf->a0, b1 = xf->b1;
+        const float a0h = xf->a0h, a1h = xf->a1h, b1h = xf->b1h;
+        float loL = xf->loL, loR = xf->loR;
+        float hiL = xf->hiL, hiR = xf->hiR;
+        float prevL = xf->prevL, prevR = xf->prevR;
+        for (uint32_t f = 0; f < numFrames; ++f) {
+            float* frame = interleaved + (size_t)f * 2;
+            const float inL = frame[0];
+            const float inR = frame[1];
+            loL = a0 * inL + b1 * loL;
+            loR = a0 * inR + b1 * loR;
+            hiL = a0h * inL + a1h * prevL + b1h * hiL;
+            hiR = a0h * inR + a1h * prevR + b1h * hiR;
+            prevL = inL;
+            prevR = inR;
+            frame[0] = hiL + loR; // each ear also hears the other's lows
+            frame[1] = hiR + loL;
+        }
+        // Park state; flush denormals once per buffer, not per sample.
+        xf->loL = (fabsf(loL) < 1e-30f) ? 0.0f : loL;
+        xf->loR = (fabsf(loR) < 1e-30f) ? 0.0f : loR;
+        xf->hiL = (fabsf(hiL) < 1e-30f) ? 0.0f : hiL;
+        xf->hiR = (fabsf(hiR) < 1e-30f) ? 0.0f : hiR;
+        xf->prevL = prevL;
+        xf->prevR = prevR;
+    }
+
+    // (2) EQ bands + master gain.
     const float master = m_masterLinear;
     const int nb = m_numBands;
 

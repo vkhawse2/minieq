@@ -32,5 +32,6 @@ void MiniEQ_SettingsInitFlat(EqSettings* s) {
     s->masterGainDb = 0.0f;
     s->bypass = 0;
     s->numBands = MINIEQ_NUM_BANDS; // default: 5-band
+    s->virtualization = 0; // default: crossfeed off (zero DSP cost)
     s->sequence = 1;
 }

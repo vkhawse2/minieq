@@ -44,6 +44,7 @@ enum {
     IDC_BYPASS       = 140,
     IDC_PRESET_FLAT  = 150, IDC_PRESET_BASS, IDC_PRESET_VOCAL, IDC_PRESET_BRIGHT,
     IDC_BANDS5       = 160, IDC_BANDS10,
+    IDC_VIRTUALIZATION = 170,
 };
 
 static const wchar_t* kBandNames5[MINIEQ_NUM_BANDS] = {
@@ -77,7 +78,7 @@ static HWND                 g_combo, g_refresh, g_attach, g_status;
 static HWND                 g_band[MINIEQ_MAX_BANDS], g_bandVal[MINIEQ_MAX_BANDS];
 static HWND                 g_bandName[MINIEQ_MAX_BANDS];
 static HWND                 g_master, g_masterVal, g_bypass;
-static HWND                 g_bands5, g_bands10;
+static HWND                 g_bands5, g_bands10, g_virtCheck;
 static int                  g_numBandsShown = 0; // band sliders currently built
 static std::vector<AudioEndpoint> g_devices;
 static std::wstring         g_endpointId;
@@ -174,6 +175,8 @@ static void ApplyStagingToUI() {
                   ? MINIEQ_MAX_BANDS : MINIEQ_NUM_BANDS;
     Button_SetCheck(g_bands5, n == MINIEQ_NUM_BANDS ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_bands10, n == MINIEQ_MAX_BANDS ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_virtCheck, g_link.Staging().virtualization ? BST_CHECKED
+                                                                 : BST_UNCHECKED);
     if (g_numBandsShown != n) {
         BuildBandControls(n);
     }
@@ -359,6 +362,13 @@ static void BuildControls(HWND hwnd) {
                               160, 438, 40, 20, hwnd, (HMENU)IDC_BANDS10,
                               g_hInst, nullptr);
     applyFont(g_bands10);
+    // Optional headphone virtualization (bs2b-style crossfeed). Costs nothing
+    // until turned on: the APO allocates its tiny state lazily.
+    g_virtCheck = CreateWindowW(L"BUTTON", L"Virtualization",
+                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                210, 438, 150, 20, hwnd,
+                                (HMENU)IDC_VIRTUALIZATION, g_hInst, nullptr);
+    applyFont(g_virtCheck);
 
     HWND note = CreateWindowW(L"STATIC",
         L"Attach once per device (asks for admin). Sliders apply live.",
@@ -421,6 +431,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             PushAndSave();
         } else if (id == IDC_BANDS5 || id == IDC_BANDS10) {
             SetBandCount(id == IDC_BANDS5 ? MINIEQ_NUM_BANDS : MINIEQ_MAX_BANDS);
+        } else if (id == IDC_VIRTUALIZATION) {
+            g_link.Staging().virtualization =
+                (Button_GetCheck(g_virtCheck) == BST_CHECKED) ? 1 : 0;
+            PushAndSave(); // live to the APO + remembered per device
         } else if (id >= IDC_PRESET_FLAT && id <= IDC_PRESET_BRIGHT) {
             const int p = id - IDC_PRESET_FLAT;
             const int n = (g_numBandsShown > 0) ? g_numBandsShown : MINIEQ_NUM_BANDS;

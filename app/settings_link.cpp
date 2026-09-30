@@ -107,6 +107,8 @@ void MiniEQ_SaveDeviceSettings(const std::wstring& endpointId, const EqSettings&
     wchar_t nb[8] = {};
     StringCchPrintfW(nb, ARRAYSIZE(nb), L"%d", s.numBands);
     WritePrivateProfileStringW(endpointId.c_str(), L"NumBands", nb, ini.c_str());
+    WritePrivateProfileStringW(endpointId.c_str(), L"Virtualization",
+                               s.virtualization ? L"1" : L"0", ini.c_str());
 }
 
 bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out) {
@@ -135,5 +137,7 @@ bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out) 
     const int nb = GetPrivateProfileIntW(endpointId.c_str(), L"NumBands",
                                          MINIEQ_NUM_BANDS, ini.c_str());
     out->numBands = (nb == MINIEQ_MAX_BANDS) ? MINIEQ_MAX_BANDS : MINIEQ_NUM_BANDS;
+    out->virtualization =
+        GetPrivateProfileIntW(endpointId.c_str(), L"Virtualization", 0, ini.c_str()) ? 1 : 0;
     return true;
 }

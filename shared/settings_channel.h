@@ -57,7 +57,8 @@ typedef struct EqSettings {
     float            masterGainDb;                 // master trim, dB
     int32_t          bypass;                       // 0 = process, 1 = bypass
     int32_t          numBands;                     // 5 or 10 (settings toggle)
-    int32_t          _reserved[6];
+    int32_t          virtualization;               // 0 = off, 1 = headphone crossfeed on
+    int32_t          _reserved[5];
 } EqSettings;
 
 // "MiniEQ_{sanitized-endpoint-id}" -- caller supplies a buffer.

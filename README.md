@@ -97,9 +97,15 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 
 ## Design notes
 
-- **Bands:** 60 / 230 / 910 / 3600 / 14000 Hz, Q = 1.0, ±12 dB, plus master
-  trim ±12 dB and a bypass switch. Change in `shared/settings_channel.h`
-  + `apo/dsp.cpp`.
+- **Bands:** settings toggle for 5 bands (60 / 230 / 910 / 3.6k / 14k Hz) or
+  10 bands (31 Hz – 16 kHz), Q = 1.0, ±12 dB, plus master trim ±12 dB and a
+  bypass switch. Change in `shared/settings_channel.h` + `apo/dsp.cpp`.
+- **Virtualization (optional, off by default):** bs2b-style Bauer crossfeed
+  for headphone listening (default 700 Hz / 4.5 dB setting, derived per the
+  bs2b theory). It runs before the EQ bands and only on stereo streams.
+  Implemented with lazy allocation — the APO keeps zero extra state and
+  skips the stage entirely until the toggle is turned on, so an untouched
+  toggle costs no RAM and no CPU.
 - **Format support:** IEEE float32 only (what the engine feeds SFX APOs in
   shared mode). Other formats are rejected at negotiation time.
 - **Real-time safety:** `APOProcess` never blocks, allocates, or touches COM;
@@ -114,7 +120,6 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 - [ ] Consider auto-attach for newly seen devices (opt-in)
 - [ ] UI polish pass (custom-drawn sliders, dark mode) — structure is ready
 - [ ] Simple installer (one elevated setup instead of manual `regsvr32`)
-- [ ] 10-band option
 
 ## License
 

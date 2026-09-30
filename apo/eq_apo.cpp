@@ -323,6 +323,9 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
                 if (m_localCopy.sequence == seq) {
                     m_dsp.UpdateGains(m_localCopy.bandGainDb, m_localCopy.numBands,
                                       m_localCopy.masterGainDb);
+                    // Idempotent: allocates the crossfeed state on first
+                    // enable, frees it on disable -- zero cost when off.
+                    m_dsp.SetVirtualization(m_localCopy.virtualization != 0);
                     m_lastSequence = seq;
                 }
             }
