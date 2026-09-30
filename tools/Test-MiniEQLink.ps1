@@ -33,6 +33,33 @@ $elevated = Is-Elevated
 Write-Host ("Elevated: " + $elevated)
 Write-Host ''
 
+# 0. Is the COM class registered? (This is what the audio engine actually
+#    CoCreates when it builds the APO graph. A missing/wrong InprocServer32
+#    entry means the DLL is never even loaded -- check this before anything
+#    else when the trace log stays empty.)
+Write-Host '--- 0. COM class (CLSID\InprocServer32) ---'
+$ClsidPath = "HKLM:\SOFTWARE\Classes\CLSID\$MiniEqClsid\InprocServer32"
+$cls = Get-ItemProperty -Path $ClsidPath -ErrorAction SilentlyContinue
+if ($cls) {
+    $dllPath = $cls.'(default)'
+    Write-Host ("FOUND  " + $ClsidPath) -ForegroundColor Green
+    Write-Host ("  DLL path: " + $dllPath)
+    if ($dllPath -and (Test-Path $dllPath)) {
+        Write-Host '  DLL file exists' -ForegroundColor Green
+    } else {
+        Write-Host '  !! DLL file MISSING at the registered path' -ForegroundColor Red
+    }
+    $tm = $cls.ThreadingModel
+    Write-Host ("  ThreadingModel: " + $tm)
+    if ($tm -ne 'Both') {
+        Write-Host '  !! expected ThreadingModel=Both' -ForegroundColor Yellow
+    }
+} else {
+    Write-Host ("MISSING " + $ClsidPath) -ForegroundColor Red
+    Write-Host '  The audio engine cannot CoCreate the APO at all.' -ForegroundColor Red
+}
+Write-Host ''
+
 # 1. Is the APO itself registered with the audio engine?
 Write-Host '--- 1. APO registration (AudioEngine\AudioProcessingObjects) ---'
 $apo = Get-ItemProperty -Path $ApoRegPath -ErrorAction SilentlyContinue

@@ -120,7 +120,14 @@ STDAPI DllRegisterServer() {
     }
     HRESULT hr = MiniEQ_RegisterComClass(dllPath);
     if (FAILED(hr)) return hr;
-    return MiniEQ_RegisterApoDeclaration();
+    hr = MiniEQ_RegisterApoDeclaration();
+    if (FAILED(hr)) return hr;
+    // The trace log directory must be writable by the audio engine
+    // (service identity), not just the installing user -- otherwise the
+    // APO's diagnostic trace silently fails. Best-effort: a log-dir
+    // problem must not fail the install itself.
+    MiniEQ_EnsureLogDir();
+    return S_OK;
 }
 
 STDAPI DllUnregisterServer() {

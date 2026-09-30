@@ -31,6 +31,10 @@ HRESULT MiniEQ_UnregisterComClass();
 HRESULT MiniEQ_RegisterApoDeclaration();
 HRESULT MiniEQ_UnregisterApoDeclaration();
 
+// Creates %PROGRAMDATA%\MiniEQ with a DACL that lets the audio engine
+// append to the diagnostic trace log. Requires elevation; best-effort.
+HRESULT MiniEQ_EnsureLogDir();
+
 // Attaches/detaches our SFX APO to one render endpoint. Requires elevation.
 // NOTE: even elevated, administrators cannot CREATE subkeys under FxProperties;
 // the key already exists, so we open it and set the value in place.

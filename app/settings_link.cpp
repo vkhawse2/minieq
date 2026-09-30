@@ -21,28 +21,26 @@ bool SettingsLink::Open(const std::wstring& endpointId) {
     wchar_t name[128] = {};
     MiniEQ_MappingNameForEndpoint(endpointId.c_str(), name, ARRAYSIZE(name));
 
-    m_hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                0, sizeof(EqSettings), name);
+    // OPEN only -- the APO (audio engine, session 0) is the creator of the
+    // Global\ channel. The UI (user session) cannot create Global\ objects
+    // (no SeCreateGlobalPrivilege), and creating a same-named mapping here
+    // would shadow the APO's real one instead of connecting to it.
+    m_hMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
     if (m_hMap == nullptr) {
         return false;
     }
-    const bool existed = (GetLastError() == ERROR_ALREADY_EXISTS);
     m_pView = static_cast<EqSettings*>(
-        MapViewOfFile(m_hMap, FILE_MAP_WRITE, 0, 0, sizeof(EqSettings)));
+        MapViewOfFile(m_hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(EqSettings)));
     if (m_pView == nullptr) {
         CloseHandle(m_hMap);
         m_hMap = nullptr;
         return false;
     }
-    if (existed) {
-        // Adopt whatever is live (another UI instance may have set it).
-        memcpy(&m_staging, m_pView, sizeof(EqSettings));
-        m_seq = m_staging.sequence;
-    } else {
-        MiniEQ_SettingsInitFlat(&m_staging);
-        m_seq = m_staging.sequence;
-        Push(); // publish the flat defaults
-    }
+    // Adopt whatever is live (the APO published flat defaults at creation,
+    // or another UI instance set it). The sequence adopt keeps the UI and
+    // APO in sync; the saved-EQ restore happens in TryOpenChannels.
+    memcpy(&m_staging, m_pView, sizeof(EqSettings));
+    m_seq = m_staging.sequence;
     return true;
 }
 
@@ -86,8 +84,9 @@ bool StatusLink::Open(const std::wstring& endpointId) {
     wchar_t name[160] = {};
     MiniEQ_StatusNameForEndpoint(endpointId.c_str(), name, ARRAYSIZE(name));
 
-    m_hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                0, sizeof(MiniEQApoStatus), name);
+    // OPEN only -- the APO is the creator of the Global\ status channel;
+    // see SettingsLink::Open. The APO initializes the header at Lock time.
+    m_hMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
     if (m_hMap == nullptr) {
         return false;
     }
@@ -98,11 +97,6 @@ bool StatusLink::Open(const std::wstring& endpointId) {
         CloseHandle(m_hMap);
         m_hMap = nullptr;
         return false;
-    }
-    if (m_pView->structSize == 0) {
-        // We created it: publish the header so the APO can validate.
-        m_pView->structSize = sizeof(MiniEQApoStatus);
-        m_pView->version = MINIEQ_STATUS_VERSION;
     }
     return true;
 }

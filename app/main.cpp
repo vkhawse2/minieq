@@ -92,6 +92,7 @@ static int                  g_numBandsShown = 0; // band sliders currently built
 static std::vector<AudioEndpoint> g_devices;
 static std::wstring         g_endpointId;
 static SettingsLink         g_link;
+static bool                 g_linkSynced = false; // saved EQ pushed to the live channel
 static bool                 g_attached = false;
 static StatusLink           g_statusLink;    // APO heartbeat (APO -> UI)
 static HWND                 g_pill, g_btnLog, g_btnRestart, g_btnDiagCenter;
@@ -220,6 +221,34 @@ static void UpdateAttachStatus() {
                                       : L"Not attached: attach once (admin).");
 }
 
+// The APO (running in the audio engine, session 0) creates the Global\
+// channels when it locks a stream; the UI (user session) can only open
+// them. Keep retrying until they appear, then restore this device's saved
+// EQ exactly once. Called from the 500 ms status timer and on device
+// selection, so no MessageBox nagging when the APO isn't up yet.
+static void TryOpenChannels() {
+    if (g_endpointId.empty()) {
+        return;
+    }
+    if (!g_link.IsOpen() && g_link.Open(g_endpointId)) {
+        // The channel just appeared: the APO published flat defaults (or
+        // older live values). This device's saved EQ wins -- the INI is the
+        // source of truth for what the sliders show, so a reconnect never
+        // snaps the user's sliders back to flat.
+        EqSettings saved;
+        if (MiniEQ_LoadDeviceSettings(g_endpointId, &saved)) {
+            g_link.Staging() = saved;
+        }
+        g_link.Push();
+        g_linkSynced = true;
+        ApplyStagingToUI();
+        MiniEQ_AppLog(L"settings channel open; saved EQ restored");
+    }
+    if (!g_statusLink.IsOpen()) {
+        g_statusLink.Open(g_endpointId);
+    }
+}
+
 // Path states for the diagnostics pill.
 enum { DIAG_IDLE = 0, DIAG_LIVE = 1, DIAG_WAITING = 2, DIAG_ERROR = 3 };
 
@@ -232,6 +261,9 @@ static void UpdateDiagStatus() {
     int state = DIAG_IDLE;
     wchar_t text[160] = {};
     if (g_attached && !g_endpointId.empty()) {
+        // The APO creates the channels when it locks a stream; the UI can
+        // only open them, so keep retrying until the APO is up.
+        TryOpenChannels();
         MiniEQApoStatus st = {};
         const ULONGLONG now = GetTickCount64();
         if (g_statusLink.Read(&st) && st.processCalls > 0) {
@@ -302,16 +334,10 @@ static void SelectDevice(int index) {
     // always in sync with the selection, even if the channel open fails.
     SetWindowTextW(g_deviceName, g_devices[(size_t)index].name.c_str());
     g_link.Close();
-    if (!g_link.Open(g_endpointId)) {
-        MessageBoxW(g_hwnd, L"Could not open the settings channel.", L"MiniEQ", MB_ICONWARNING);
-        return;
-    }
-    // Per-device memory: restore this device's last EQ if we saved one.
-    EqSettings saved;
-    if (MiniEQ_LoadDeviceSettings(g_endpointId, &saved)) {
-        g_link.Staging() = saved;
-        g_link.Push();
-    }
+    g_linkSynced = false;
+    // The APO creates the channel when it locks the stream; the UI only
+    // opens it and keeps retrying on the status timer -- no error popup.
+    TryOpenChannels();
     // The heartbeat channel follows the selected device.
     g_statusLink.Close();
     g_statusLink.Open(g_endpointId);

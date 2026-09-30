@@ -25,13 +25,20 @@ static void BuildMappingName(const wchar_t* prefix, const wchar_t* endpointId,
 
 void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars) {
-    static const wchar_t prefix[] = L"Local\\MiniEQ_";
+    // Global\ namespace: the APO runs inside the audio engine (session 0,
+    // service identity) while the UI runs in the user's session. Local\
+    // objects can never cross that boundary, so the APO -- which holds
+    // SeCreateGlobalPrivilege -- creates both channels and the UI opens
+    // them. (A user-session process cannot create Global\ objects.)
+    static const wchar_t prefix[] = L"Global\\MiniEQ_";
     BuildMappingName(prefix, endpointId, outName, outNameChars);
 }
 
 void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars) {
-    static const wchar_t prefix[] = L"Local\\MiniEQ_Status_";
+    // See above: Global\ is required for the APO (session 0) <-> UI
+    // (user session) channel.
+    static const wchar_t prefix[] = L"Global\\MiniEQ_Status_";
     BuildMappingName(prefix, endpointId, outName, outNameChars);
 }
 

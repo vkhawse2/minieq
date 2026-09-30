@@ -641,6 +641,20 @@ static void LogTransitions(const DiagSnapshot& snap, const DiagVerdict& v, bool 
     s_haveLogged = true;
 }
 
+// Sets one wide-text cell in the sessions list. The ListView_*W helper
+// macros are not available in this build configuration (C3861), so this
+// talks to the control directly with SendMessageW -- LVITEMW and the
+// LVM_*W message constants come from the same <commctrl.h> that already
+// compiles, so there is no new dependency.
+static void SetListCellW(HWND lv, int row, int col, LPWSTR text) {
+    LVITEMW it = {};
+    it.mask = LVIF_TEXT;
+    it.iItem = row;
+    it.iSubItem = col;
+    it.pszText = text;
+    (void)SendMessageW(lv, LVM_SETITEMTEXTW, (WPARAM)row, (LPARAM)&it);
+}
+
 static void UpdateSessionList(const DiagSnapshot& snap) {
     ListView_DeleteAllItems(s_hSessions);
     int row = 0;
@@ -649,15 +663,15 @@ static void UpdateSessionList(const DiagSnapshot& snap) {
         it.mask = LVIF_TEXT;
         it.iItem = row;
         it.pszText = const_cast<LPWSTR>(si.exe.c_str());
-        // Explicit W variants: this project builds without UNICODE defined,
-        // so the generic ListView_* macros would resolve to the ANSI versions.
-        ListView_InsertItemW(s_hSessions, &it);
+        // NOTE: the ListView_*W helper macros are unavailable in this build
+        // configuration (C3861), so this sends LVM_INSERTITEMW directly.
+        (void)SendMessageW(s_hSessions, LVM_INSERTITEMW, 0, (LPARAM)&it);
 
         wchar_t pid[32] = {};
         StringCchPrintfW(pid, ARRAYSIZE(pid), L"%lu", si.pid);
-        ListView_SetItemTextW(s_hSessions, row, 1, pid);
-        ListView_SetItemTextW(s_hSessions, row, 2,
-                              const_cast<LPWSTR>(si.active ? L"Active" : L"Idle"));
+        SetListCellW(s_hSessions, row, 1, pid);
+        SetListCellW(s_hSessions, row, 2,
+                     const_cast<LPWSTR>(si.active ? L"Active" : L"Idle"));
 
         std::wstring level;
         if (si.peak >= 0.0f) {
@@ -672,7 +686,7 @@ static void UpdateSessionList(const DiagSnapshot& snap) {
         } else {
             level = L"\u2014";
         }
-        ListView_SetItemTextW(s_hSessions, row, 3, const_cast<LPWSTR>(level.c_str()));
+        SetListCellW(s_hSessions, row, 3, const_cast<LPWSTR>(level.c_str()));
         ++row;
     }
 }
@@ -883,7 +897,9 @@ static void DcOnCreate(HWND hwnd) {
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         col.pszText = const_cast<LPWSTR>(cols[i].text);
         col.cx = cols[i].cx;
-        ListView_InsertColumnW(s_hSessions, i, &col);
+        // NOTE: ListView_InsertColumnW is unavailable (see above); direct.
+        (void)SendMessageW(s_hSessions, LVM_INSERTCOLUMNW, (WPARAM)i,
+                           (LPARAM)&col);
     }
 
     makeGroup(L"Recent log (categorized)", 12, 414, 596, 168);

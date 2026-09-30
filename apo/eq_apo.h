@@ -24,10 +24,11 @@
 // plus a memcpy when settings change -- no locks, no syscalls, no COM on the
 // RT thread.
 //
-// A background worker thread (created in LockForProcess) retries opening the
-// settings mapping until the UI has created it, and services the crossfeed
-// (XFeed) allocation/free requests -- heap work must never happen on the RT
-// thread.
+// A background worker thread (created in LockForProcess) services the
+// crossfeed (XFeed) allocation/free requests -- heap work must never happen
+// on the RT thread -- and publishes the heartbeat. The APO itself creates
+// both shared-memory channels (it must: it runs in the audio engine,
+// session 0, while the UI runs in the user's session).
 
 #pragma once
 
@@ -125,12 +126,12 @@ private:
     // Returns true for the one format we process: interleaved IEEE float32.
     static bool IsFloat32Format(const WAVEFORMATEX* wfx);
 
-    // Worker thread helpers (non-RT): retry the settings mapping, service the
-    // XFeed alloc/free requests.
+    // Worker thread helpers (non-RT): (re)create the channel mappings if the
+    // initial creation in LockForProcess failed, service XFeed requests.
     static DWORD WINAPI WorkerThreadProc(LPVOID pParam);
     void WorkerStep();
-    void OpenSettingsMapping(); // best-effort; worker retries on failure
-    void OpenStatusMapping();   // worker thread, best-effort with retry
+    void CreateSettingsMapping(); // idempotent; worker retries on failure
+    void CreateStatusMapping();   // worker thread, best-effort with retry
     void PublishStatus();       // worker thread: heartbeat -> UI
     void CloseStatusMapping();  // UnlockForProcess / destructor
     void StopWorker();
@@ -154,7 +155,7 @@ private:
     EqSettings     m_localCopy;               // RT-side working copy
 
     // Heartbeat (APO -> UI): the RT thread only bumps counters; the worker
-    // publishes them into the status mapping the UI created.
+    // publishes them into the status mapping the APO created.
     wchar_t        m_statusName[160] = {};    // MMF name for the status block
     HANDLE         m_hStatusMap = nullptr;    // status mapping (worker only)
     MiniEQApoStatus* m_pStatus = nullptr;     // mapped view (worker only)

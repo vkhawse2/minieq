@@ -5,6 +5,7 @@
 
 #include <aclapi.h>
 #include <audioenginebaseapo.h> // APO_FLAG_INPLACE
+#include <sddl.h> // ConvertStringSecurityDescriptorToSecurityDescriptorW
 #include <strsafe.h>
 
 // IID_IAudioProcessingObject -- the APO interface we implement.
@@ -120,6 +121,62 @@ HRESULT MiniEQ_UnregisterApoDeclaration() {
                      L"SOFTWARE\\Classes\\AudioEngine\\AudioProcessingObjects\\%s", clsid);
     LONG rc = RegDeleteKeyW(HKEY_LOCAL_MACHINE, key);
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
+}
+
+// Creates %PROGRAMDATA%\MiniEQ and grants Everyone read/write (inherited by
+// the trace log file), so the audio engine -- which runs as a service
+// identity, not as the installing user -- can append to the diagnostic log
+// the UI tails. Without this, the log file (if created first by the UI)
+// carries a user-only DACL and the APO's trace writes silently fail, which
+// is exactly the "empty log, APO apparently dead" symptom. Called from
+// DllRegisterServer, which always runs elevated (installer / regsvr32).
+HRESULT MiniEQ_EnsureLogDir() {
+    wchar_t dir[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", dir, ARRAYSIZE(dir));
+    if (n == 0 || n >= ARRAYSIZE(dir)) {
+        return E_FAIL;
+    }
+    if (FAILED(StringCchCatW(dir, ARRAYSIZE(dir), L"\\MiniEQ"))) {
+        return E_FAIL;
+    }
+    CreateDirectoryW(dir, nullptr); // ERROR_ALREADY_EXISTS is fine
+
+    // D: SY/BA full; Everyone read+write, inherited by children (OICI).
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;WD)",
+            SDDL_REVISION_1, &pSD, nullptr)) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    PACL pDacl = nullptr;
+    BOOL present = FALSE, defaulted = FALSE;
+    HRESULT hr = S_OK;
+    if (GetSecurityDescriptorDacl(pSD, &present, &pDacl, &defaulted) && present) {
+        DWORD rc = SetNamedSecurityInfoW(dir, SE_FILE_OBJECT,
+                                         DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, pDacl, nullptr);
+        if (rc != ERROR_SUCCESS) {
+            hr = HRESULT_FROM_WIN32(rc);
+        } else {
+            // Also repair a pre-existing log file: it may have been created
+            // by the UI (user-only DACL) before this ran.
+            wchar_t log[MAX_PATH] = {};
+            if (SUCCEEDED(StringCchPrintfW(log, ARRAYSIZE(log),
+                                           L"%s\\apo-trace.log", dir))) {
+                rc = SetNamedSecurityInfoW(log, SE_FILE_OBJECT,
+                                           DACL_SECURITY_INFORMATION,
+                                           nullptr, nullptr, pDacl, nullptr);
+                // ERROR_FILE_NOT_FOUND just means no log yet; not a failure.
+                if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+                    hr = HRESULT_FROM_WIN32(rc);
+                }
+            }
+        }
+    } else {
+        hr = E_FAIL;
+    }
+    LocalFree(pSD);
+    return hr;
 }
 
 static HRESULT EndpointGuid(const wchar_t* endpointId, wchar_t* out, size_t cch) {

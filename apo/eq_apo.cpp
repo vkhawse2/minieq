@@ -17,6 +17,7 @@
 #include <ks.h>          // must come before ksmedia.h
 #include <ksmedia.h>   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 #include <strsafe.h>
+#include <sddl.h>      // ConvertStringSecurityDescriptorToSecurityDescriptorW
 
 // PKEY_AudioEndpoint_GUID = {[1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E}, 4}.
 // functiondiscoverykeys_devpkey.h only *declares* this key -- no import
@@ -224,59 +225,65 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
     }
     PropVariantClear(&var);
     MiniEQ_Trace(L"MiniEQ_APO: Initialize endpoint GUID from props = \"%s\"", epGuid);
-    if (epGuid[0] == L'\0') {
-        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> E_INVALIDARG (empty endpoint GUID)");
-        return E_INVALIDARG;
-    }
-
-    // Find the IMMDevice carrying that GUID. (The old code assumed "our
-    // endpoint is the last device in the collection" -- wrong on any machine
-    // with more than one audio endpoint: the mapping name would be built
-    // from the wrong device and the UI's settings would never arrive.)
-    IMMDeviceEnumerator* pEnum = nullptr;
-    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
-                          __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
-    if (FAILED(hr) || pEnum == nullptr) {
-        return FAILED(hr) ? hr : E_UNEXPECTED;
-    }
-    IMMDeviceCollection* pColl = nullptr;
-    hr = pEnum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pColl);
-    pEnum->Release();
-    if (FAILED(hr) || pColl == nullptr) {
-        return FAILED(hr) ? hr : E_UNEXPECTED;
-    }
-    UINT32 count = 0;
-    pColl->GetCount(&count);
-    for (UINT32 i = 0; i < count; ++i) {
-        IMMDevice* pDev = nullptr;
-        if (FAILED(pColl->Item(i, &pDev)) || pDev == nullptr) {
-            continue;
-        }
-        bool match = false;
-        IPropertyStore* pStore = nullptr;
-        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pStore)) && pStore != nullptr) {
-            PROPVARIANT v2;
-            PropVariantInit(&v2);
-            if (SUCCEEDED(pStore->GetValue(kPkeyAudioEndpointGuid, &v2)) &&
-                v2.vt == VT_LPWSTR && v2.pwszVal != nullptr &&
-                _wcsicmp(v2.pwszVal, epGuid) == 0) {
-                match = true;
+    // Never fail the user's audio stream over endpoint identification: if we
+    // cannot resolve the endpoint, the APO still loads and processes audio
+    // (with flat EQ) -- only the UI's live channel stays unavailable.
+    if (epGuid[0] != L'\0') {
+        // Find the IMMDevice carrying that GUID. (The old code assumed "our
+        // endpoint is the last device in the collection" -- wrong on any machine
+        // with more than one audio endpoint: the mapping name would be built
+        // from the wrong device and the UI's settings would never arrive.)
+        IMMDeviceEnumerator* pEnum = nullptr;
+        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
+                              __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
+        if (FAILED(hr) || pEnum == nullptr) {
+            MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: MMDeviceEnumerator failed hr=0x%08X; no channels",
+                         FAILED(hr) ? hr : (HRESULT)E_UNEXPECTED);
+        } else {
+            IMMDeviceCollection* pColl = nullptr;
+            hr = pEnum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pColl);
+            pEnum->Release();
+            if (FAILED(hr) || pColl == nullptr) {
+                MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: EnumAudioEndpoints failed hr=0x%08X; no channels",
+                             FAILED(hr) ? hr : (HRESULT)E_UNEXPECTED);
+            } else {
+                UINT32 count = 0;
+                pColl->GetCount(&count);
+                for (UINT32 i = 0; i < count; ++i) {
+                    IMMDevice* pDev = nullptr;
+                    if (FAILED(pColl->Item(i, &pDev)) || pDev == nullptr) {
+                        continue;
+                    }
+                    bool match = false;
+                    IPropertyStore* pStore = nullptr;
+                    if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pStore)) && pStore != nullptr) {
+                        PROPVARIANT v2;
+                        PropVariantInit(&v2);
+                        if (SUCCEEDED(pStore->GetValue(kPkeyAudioEndpointGuid, &v2)) &&
+                            v2.vt == VT_LPWSTR && v2.pwszVal != nullptr &&
+                            _wcsicmp(v2.pwszVal, epGuid) == 0) {
+                            match = true;
+                        }
+                        PropVariantClear(&v2);
+                        pStore->Release();
+                    }
+                    if (match) {
+                        LPWSTR id = nullptr;
+                        if (SUCCEEDED(pDev->GetId(&id)) && id != nullptr) {
+                            m_endpointId = id;
+                            CoTaskMemFree(id);
+                        }
+                        pDev->Release();
+                        break;
+                    }
+                    pDev->Release();
+                }
+                pColl->Release();
             }
-            PropVariantClear(&v2);
-            pStore->Release();
         }
-        if (match) {
-            LPWSTR id = nullptr;
-            if (SUCCEEDED(pDev->GetId(&id)) && id != nullptr) {
-                m_endpointId = id;
-                CoTaskMemFree(id);
-            }
-            pDev->Release();
-            break;
-        }
-        pDev->Release();
+    } else {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: empty endpoint GUID; no channels");
     }
-    pColl->Release();
 
     if (!m_endpointId.empty()) {
         MiniEQ_MappingNameForEndpoint(m_endpointId.c_str(), m_mappingName,
@@ -434,21 +441,23 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
         }
     }
 
-    // Open the live settings channel. If the UI isn't running there is no
-    // mapping yet -- the worker keeps retrying, so sliders start working as
-    // soon as the UI appears (no stream restart needed).
-    OpenSettingsMapping();
+    // Create the live settings channel. The APO must be the creator: it runs
+    // in the audio engine (session 0, with SeCreateGlobalPrivilege) while
+    // the UI runs in the user's session -- Local\ objects can never cross
+    // that boundary, and the UI cannot create Global\ objects.
+    CreateSettingsMapping();
     MiniEQ_Trace(L"MiniEQ_APO: LockForProcess mapping=\"%s\" settings=%s",
                  m_mappingName[0] ? m_mappingName : L"<none>",
                  m_pSettings.load(std::memory_order_acquire) != nullptr
-                     ? L"OPEN" : L"not yet");
+                     ? L"CREATED" : L"not yet");
 
-    // The heartbeat channel is opened by the worker (single-threaded there,
-    // so no open race); publish once here in case it is already present.
+    // Create the heartbeat channel too (single creation point, no race);
+    // publish once here so the UI sees the header immediately.
+    CreateStatusMapping();
     PublishStatus();
     MiniEQ_Trace(L"MiniEQ_APO: LockForProcess status=\"%s\" heartbeat=%s",
                  m_statusName[0] ? m_statusName : L"<none>",
-                 m_pStatus != nullptr ? L"OPEN" : L"not yet");
+                 m_pStatus != nullptr ? L"CREATED" : L"not yet");
 
     m_locked = true;
     return S_OK;
@@ -487,79 +496,108 @@ DWORD WINAPI CEqApo::WorkerThreadProc(LPVOID pParam) {
 
 void CEqApo::WorkerStep() {
     if (m_pSettings.load(std::memory_order_acquire) == nullptr) {
-        OpenSettingsMapping();
+        CreateSettingsMapping();
     }
     if (m_pStatus == nullptr) {
-        OpenStatusMapping();
+        CreateStatusMapping();
     }
     PublishStatus();
     m_dsp.ServiceVirtualizationWorker();
 }
 
-void CEqApo::OpenSettingsMapping() {
+// Creates (or adopts, if a previous stream already created it) a named file
+// mapping in the Global\ namespace with a DACL that lets the UI open it
+// from the user's session. The APO is the only side that can create these:
+// it runs inside the audio engine (session 0) as a service identity, which
+// holds SeCreateGlobalPrivilege; the UI runs in the user's session, where
+// creating Global\ objects is denied and Local\ objects are invisible here.
+static HANDLE CreateGlobalChannel(const wchar_t* name, DWORD byteSize) {
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    // D: Everyone read+write. (EQ gains and a heartbeat are not sensitive;
+    // the UI must be able to open this from another session.)
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GRGW;;;WD)", SDDL_REVISION_1, &pSD, nullptr)) {
+        return nullptr;
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), pSD, FALSE };
+    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+                                  0, byteSize, name);
+    LocalFree(pSD);
+    return h;
+}
+
+void CEqApo::CreateSettingsMapping() {
     if (m_mappingName[0] == L'\0') {
+        // Endpoint not identified at Initialize -- nothing to name the
+        // channel with, and retrying would be pointless.
         return;
     }
-    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, m_mappingName);
+    HANDLE h = CreateGlobalChannel(m_mappingName, (DWORD)sizeof(EqSettings));
     if (h == nullptr) {
-        static LONG s_waitLogged = 0;
-        if (InterlockedCompareExchange(&s_waitLogged, 1, 0) == 0) {
-            MiniEQ_Trace(L"MiniEQ_APO: settings channel not yet present, waiting for UI: \"%s\"",
-                         m_mappingName);
+        static LONG s_failLogged = 0;
+        if (InterlockedCompareExchange(&s_failLogged, 1, 0) == 0) {
+            MiniEQ_Trace(L"MiniEQ_APO: settings channel CREATE failed gle=%lu name=\"%s\"",
+                         GetLastError(), m_mappingName);
         }
         return;
     }
-    void* v = MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(EqSettings));
+    const bool fresh = (GetLastError() != ERROR_ALREADY_EXISTS);
+    void* v = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                            sizeof(EqSettings));
     if (v == nullptr) {
         CloseHandle(h);
         return;
+    }
+    EqSettings* s = static_cast<EqSettings*>(v);
+    if (fresh) {
+        // We created it: publish flat defaults so a UI opening later sees a
+        // valid channel immediately. (LockForProcess runs before the first
+        // APOProcess call, so the RT thread cannot race this write.)
+        EqSettings flat;
+        MiniEQ_SettingsInitFlat(&flat);
+        memcpy(s, &flat, sizeof(flat));
     }
     const EqSettings* expected = nullptr;
     if (m_pSettings.compare_exchange_strong(expected,
                                             static_cast<const EqSettings*>(v))) {
         m_hMap = h;
         m_lastSequence = 0; // force a settings pickup on the next RT block
-        MiniEQ_Trace(L"MiniEQ_APO: settings channel OPEN \"%s\"", m_mappingName);
+        MiniEQ_Trace(L"MiniEQ_APO: settings channel %s \"%s\"",
+                     fresh ? L"CREATED" : L"adopted", m_mappingName);
     } else {
         UnmapViewOfFile(v);
         CloseHandle(h);
     }
 }
 
-void CEqApo::OpenStatusMapping() {
+void CEqApo::CreateStatusMapping() {
     if (m_statusName[0] == L'\0') {
         return;
     }
-    HANDLE h = OpenFileMappingW(FILE_MAP_WRITE, FALSE, m_statusName);
+    HANDLE h = CreateGlobalChannel(m_statusName, (DWORD)sizeof(MiniEQApoStatus));
     if (h == nullptr) {
-        return; // UI hasn't created it yet (or isn't running); retry later
+        return; // worker retries; see CreateSettingsMapping for the why
     }
-    void* v = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, sizeof(MiniEQApoStatus));
+    void* v = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                            sizeof(MiniEQApoStatus));
     if (v == nullptr) {
         CloseHandle(h);
         return;
     }
     MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(v);
-    if (st->structSize == 0) {
-        // First writer initializes the header (the UI does this too at
-        // creation; writing the same values twice is benign).
-        st->structSize = sizeof(MiniEQApoStatus);
-        st->version = MINIEQ_STATUS_VERSION;
-        LARGE_INTEGER freq;
-        if (QueryPerformanceFrequency(&freq)) {
-            m_qpcFreq = freq.QuadPart;
-        }
-        st->qpcFrequency = m_qpcFreq;
-        MiniEQ_Trace(L"MiniEQ_APO: status channel OPEN \"%s\"", m_statusName);
-    } else if (st->structSize != sizeof(MiniEQApoStatus) ||
-               st->version != MINIEQ_STATUS_VERSION) {
-        UnmapViewOfFile(v);
-        CloseHandle(h);
-        MiniEQ_Trace(L"MiniEQ_APO: status channel version mismatch, ignoring");
-        return;
+    // (Re)initialize the header on every lock: a fresh stream means fresh
+    // counters, and the UI tolerates the reset (it watches for advancement).
+    memset(st, 0, sizeof(*st));
+    st->structSize = sizeof(MiniEQApoStatus);
+    st->version = MINIEQ_STATUS_VERSION;
+    LARGE_INTEGER freq;
+    if (QueryPerformanceFrequency(&freq)) {
+        m_qpcFreq = freq.QuadPart;
     }
+    st->qpcFrequency = m_qpcFreq;
     m_pStatus = st;
     m_hStatusMap = h;
+    MiniEQ_Trace(L"MiniEQ_APO: status channel CREATED \"%s\"", m_statusName);
 }
 
 void CEqApo::PublishStatus() {
