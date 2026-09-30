@@ -484,10 +484,16 @@ static int RunElevatedHelper(LPWSTR* argv, int argc) {
                     L"MiniEQ", MB_ICONINFORMATION);
         return 0;
     }
-    wchar_t msg[256] = {};
+    wchar_t msg[384] = {};
+    const wchar_t* hint = L"";
+    if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
+        hint = L"\nAccess denied: make sure you approved the admin prompt.";
+    } else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+        hint = L"\nThe device's audio settings key was not found.";
+    }
     StringCchPrintfW(msg, ARRAYSIZE(msg),
-                     L"Operation failed (0x%08X).\nMake sure you approved the admin prompt.",
-                     (unsigned)hr);
+                     L"Operation failed (0x%08X).%s",
+                     (unsigned)hr, hint);
     MessageBoxW(nullptr, msg, L"MiniEQ", MB_ICONERROR);
     return 1;
 }

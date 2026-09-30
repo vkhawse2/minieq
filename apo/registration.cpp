@@ -133,10 +133,11 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
     if (FAILED(hr)) return hr;
 
-    // The FxProperties key already exists; open it and set the value in place.
-    // (Admins cannot create subkeys here, only set values.)
+    // The FxProperties subkey often does not exist yet (fresh endpoint);
+    // create it if needed, then set the SFX slot value in place.
     HKEY h = nullptr;
-    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_SET_VALUE, &h);
+    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0,
+                              KEY_SET_VALUE, nullptr, &h, nullptr);
     if (rc != ERROR_SUCCESS) {
         return HRESULT_FROM_WIN32(rc);
     }
@@ -154,6 +155,9 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
 
     HKEY h = nullptr;
     LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_SET_VALUE, &h);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        return S_OK; // FxProperties never created: nothing to detach.
+    }
     if (rc != ERROR_SUCCESS) {
         return HRESULT_FROM_WIN32(rc);
     }
@@ -179,6 +183,10 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
 
     HKEY h = nullptr;
     LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        *attached = false; // FxProperties never created: not attached.
+        return S_OK;
+    }
     if (rc != ERROR_SUCCESS) {
         return HRESULT_FROM_WIN32(rc);
     }
