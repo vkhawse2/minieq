@@ -122,17 +122,37 @@ HRESULT MiniEQ_UnregisterApoDeclaration() {
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
+static HRESULT EndpointGuid(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    // The MMDevice ID looks like "{0.0.0.00000000}.{endpoint-guid}", but the
+    // MMDevices registry key is named with the bare endpoint GUID only --
+    // the part after the last dot. This is also what PKEY_AudioEndpoint_GUID
+    // returns, and what Equalizer APO enumerates under
+    // ...\MMDevices\Audio\Render. Using the full ID builds a path Windows
+    // never reads; the DACL repair then targets a nonexistent parent key
+    // and surfaces as ERROR_FILE_NOT_FOUND (0x80070002).
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    const wchar_t* dot = wcsrchr(endpointId, L'.');
+    const wchar_t* guid = (dot != nullptr) ? dot + 1 : endpointId;
+    return StringCchCopyW(out, cch, guid);
+}
+
 static HRESULT EndpointKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
     // MMDevices path of the endpoint itself (no FxProperties suffix).
+    wchar_t guid[64] = {};
+    HRESULT hr = EndpointGuid(endpointId, guid, ARRAYSIZE(guid));
+    if (FAILED(hr)) return hr;
     return StringCchPrintfW(out, cch,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\%s",
-        endpointId);
+        guid);
 }
 
 static HRESULT FxPropertiesKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    wchar_t guid[64] = {};
+    HRESULT hr = EndpointGuid(endpointId, guid, ARRAYSIZE(guid));
+    if (FAILED(hr)) return hr;
     return StringCchPrintfW(out, cch,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\%s\\FxProperties",
-        endpointId);
+        guid);
 }
 
 static bool EnablePrivilege(const wchar_t* privilegeName) {
