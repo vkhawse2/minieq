@@ -20,6 +20,7 @@
 #include <strsafe.h>
 #include <sddl.h>      // ConvertStringSecurityDescriptorToSecurityDescriptorW
 #include <xmmintrin.h> // _mm_getcsr/_mm_setcsr: FTZ|DAZ denormal safety on RT threads
+#include <new>         // std::nothrow (R1 media-type suggestion)
 
 // Build id stamped into the APO status channel so the UI can tell a stale
 // loaded DLL apart from the installed one. CI passes the short commit SHA
@@ -397,6 +398,97 @@ try {
     return E_FAIL;
 }
 
+// R1: minimal IAudioMediaType implementation for our S_FALSE format
+// suggestions. Built in-house instead of calling the SDK's
+// CreateAudioMediaTypeFromUncompressedAudioFormat: that symbol does not
+// resolve against AudioEng.lib on current SDKs (LNK2019 on CI), while a
+// hand-rolled type has zero link dependencies. The engine only ever calls
+// GetAudioFormat (and occasionally IsEqual) on the object returned with
+// S_FALSE, then re-proposes the format it read back.
+class CMiniEQMediaType : public IAudioMediaType {
+public:
+    explicit CMiniEQMediaType(const WAVEFORMATEXTENSIBLE& format)
+        : m_ref(1), m_format(format) {}
+
+    // IUnknown
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) {
+            return E_POINTER;
+        }
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(IAudioMediaType)) {
+            *ppv = static_cast<IAudioMediaType*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG refs =
+            static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (refs == 0) {
+            delete this;
+        }
+        return refs;
+    }
+
+    // IAudioMediaType
+    STDMETHODIMP_(BOOL) IsCompressedFormat(GUID subFormat) override {
+        // Our suggested format is always IEEE float: only that subtype
+        // counts as uncompressed.
+        return (subFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? FALSE : TRUE;
+    }
+    STDMETHODIMP_(BOOL) IsEqual(IAudioMediaType* pOther,
+                                IAudioMediaType** ppOut) override {
+        if (ppOut != nullptr) {
+            *ppOut = nullptr;
+        }
+        if (pOther == nullptr) {
+            return FALSE;
+        }
+        WAVEFORMATEXTENSIBLE other = {};
+        if (FAILED(pOther->GetAudioFormat(
+                reinterpret_cast<WAVEFORMATEX*>(&other)))) {
+            return FALSE;
+        }
+        const WAVEFORMATEX& a = m_format.Format;
+        const WAVEFORMATEX& b = other.Format;
+        if (a.wFormatTag != b.wFormatTag ||
+            a.nChannels != b.nChannels ||
+            a.nSamplesPerSec != b.nSamplesPerSec ||
+            a.wBitsPerSample != b.wBitsPerSample) {
+            return FALSE;
+        }
+        if (a.wFormatTag == WAVE_FORMAT_EXTENSIBLE ||
+            b.wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            if (m_format.dwChannelMask != other.dwChannelMask) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+    STDMETHODIMP GetAudioFormat(WAVEFORMATEX* pFormat) override {
+        if (pFormat == nullptr) {
+            return E_POINTER;
+        }
+        // The engine always passes a WAVEFORMATEXTENSIBLE-sized buffer here:
+        // engine media types are built from UNCOMPRESSEDAUDIOFORMAT, which
+        // carries a channel mask that can only round-trip through the
+        // extensible tail -- so the engine's own consumer code must already
+        // provide room for it.
+        memcpy(pFormat, &m_format, sizeof(m_format));
+        return S_OK;
+    }
+
+private:
+    LONG m_ref;
+    WAVEFORMATEXTENSIBLE m_format;
+};
+
 // R1: build a float32 IAudioMediaType twin of a non-float32 format (same
 // channels/rate). Returned with S_FALSE ("not the requested format, but this
 // one") so the engine inserts conversion and KEEPS the APO in the graph.
@@ -423,20 +515,25 @@ HRESULT CEqApo::SuggestFloat32MediaType(const WAVEFORMATEX* wfx,
         channelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
     }
 
-    UNCOMPRESSEDAUDIOFORMAT uaf = {};
-    uaf.guidFormatType = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-    uaf.dwSamplesPerFrame = wfx->nChannels;
-    uaf.dwBytesPerSampleContainer = 4;
-    uaf.dwValidBitsPerSample = 32;
-    uaf.fFramesPerSecond = static_cast<FLOAT32>(wfx->nSamplesPerSec);
-    uaf.dwChannelMask = channelMask;
+    WAVEFORMATEXTENSIBLE wfxe = {};
+    wfxe.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    wfxe.Format.nChannels = wfx->nChannels;
+    wfxe.Format.nSamplesPerSec = wfx->nSamplesPerSec;
+    wfxe.Format.wBitsPerSample = 32;
+    wfxe.Format.nBlockAlign = static_cast<WORD>(wfx->nChannels * 4);
+    wfxe.Format.nAvgBytesPerSec =
+        wfx->nSamplesPerSec * wfxe.Format.nBlockAlign;
+    wfxe.Format.cbSize = 22;
+    wfxe.dwChannelMask = channelMask;
+    wfxe.Samples.wValidBitsPerSample = 32;
+    wfxe.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
-    const HRESULT hr =
-        CreateAudioMediaTypeFromUncompressedAudioFormat(&uaf, ppOut);
-    if (FAILED(hr)) {
-        *ppOut = nullptr;
-        return hr;
+    CMiniEQMediaType* mt =
+        new (std::nothrow) CMiniEQMediaType(wfxe);
+    if (mt == nullptr) {
+        return E_OUTOFMEMORY;
     }
+    *ppOut = mt; // refcount starts at 1 for the caller
     return S_FALSE;
 }
 
