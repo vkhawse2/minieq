@@ -12,6 +12,7 @@
 #include "../shared/settings_channel.h"
 
 #include <audiopolicy.h>
+#include <commctrl.h>
 #include <endpointvolume.h>
 #include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
 #include <functiondiscoverykeys_devpkey.h>
