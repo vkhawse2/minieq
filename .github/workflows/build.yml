@@ -24,8 +24,9 @@ jobs:
           copy build\app\Release\MiniEQ.exe build\stage\
           copy build\apo\Release\MiniEQ_APO.dll build\stage\
 
+      # WiX v3 ships preinstalled on windows-latest; this is a no-op then.
       - name: Install WiX Toolset v3
-        run: choco install wixtoolset --version=3.14.1 -y --no-progress
+        run: choco install wixtoolset -y --no-progress
 
       - name: Build MSI installer
         run: |
