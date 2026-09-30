@@ -10,6 +10,8 @@ add_executable(MiniEQ WIN32
     diag.h
     diagcenter.cpp
     diagcenter.h
+    checklist.cpp
+    checklist.h
     # Reused as-is: endpoint attach/detach registry writes.
     ../apo/registration.cpp
     ../apo/registration.h

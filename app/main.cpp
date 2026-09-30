@@ -27,6 +27,7 @@
 #include "settings_link.h"
 #include "diag.h"
 #include "diagcenter.h"
+#include "checklist.h"
 #include "../apo/registration.h"
 
 //------------------------------------------------------------------------------
@@ -53,6 +54,7 @@ enum {
     IDC_DIAG_CENTER  = 183,
     IDC_DIAG_SOUND   = 184, // "Open Sound settings" (enhancements-off state)
     IDC_DIAG_HINT    = 185, // one-line contextual fix guidance under the pill
+    IDC_CHECKLIST    = 186, // "Checklist" button next to Virtualization
 };
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
@@ -600,9 +602,16 @@ static void BuildControls(HWND hwnd) {
     // until turned on: the APO allocates its tiny state lazily.
     g_virtCheck = CreateWindowW(L"BUTTON", L"Virtualization",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                210, 526, 150, 20, hwnd,
+                                210, 526, 120, 20, hwnd,
                                 (HMENU)IDC_VIRTUALIZATION, g_hInst, nullptr);
     applyFont(g_virtCheck);
+    // Audio-path checklist: every prerequisite for "audio goes through
+    // MiniEQ", green/yellow/red with the fix on red rows.
+    HWND btnChecklist = CreateWindowW(L"BUTTON", L"Checklist",
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                      336, 524, 72, 24, hwnd,
+                                      (HMENU)IDC_CHECKLIST, g_hInst, nullptr);
+    applyFont(btnChecklist);
 
     HWND note = CreateWindowW(L"STATIC",
         L"Attach once per device (asks for admin). Sliders apply live.",
@@ -721,6 +730,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (id == IDC_DIAG_CENTER) {
             MiniEQ_DiagCenterSetDevice(g_endpointId);
             MiniEQ_ShowDiagCenter(g_hInst, g_hwnd);
+        } else if (id == IDC_CHECKLIST) {
+            wchar_t dev[128] = {};
+            GetWindowTextW(g_deviceName, dev, ARRAYSIZE(dev));
+            MiniEQ_ShowChecklist(g_hInst, g_hwnd, g_endpointId, dev);
         } else if (id == IDC_BYPASS) {
             g_link.Staging().bypass = (Button_GetCheck(g_bypass) == BST_CHECKED) ? 1 : 0;
             PushAndSave();

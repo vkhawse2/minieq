@@ -106,7 +106,7 @@ static std::wstring ExeNameFromPid(DWORD pid) {
     return name;
 }
 
-static std::wstring ReadApoDllPath() {
+std::wstring MiniEQ_ApoDllPath() {
     wchar_t path[MAX_PATH] = {};
     DWORD size = sizeof(path);
     std::wstring sub = L"CLSID\\";
@@ -150,6 +150,72 @@ DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId) {
             if (SUCCEEDED(pProps->GetValue(kPkeyDisableSysFx, &pv)) &&
                 pv.vt == VT_BOOL) {
                 out = pv.boolVal ? DiagEnhancements::Off : DiagEnhancements::On;
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return out;
+}
+
+// PKEY for the active spatial-sound mode: {9637B4B9-11EE-4C35-B43C-7B2452C993CC},1
+// (REG_SZ = spatial APO CLSID; absent/empty = spatial sound Off). Same pattern
+// as the enhancements key above: defined locally, degrades to Unknown rather
+// than a wrong value.
+static const PROPERTYKEY kPkeySpatialClsid = {
+    { 0x9637B4B9, 0x11EE, 0x4C35, { 0xB4, 0x3C, 0x7B, 0x24, 0x52, 0xC9, 0x93, 0xCC } },
+    1
+};
+
+// Best-effort friendly name for a spatial APO CLSID, from its COM
+// registration. Falls back to the raw CLSID string.
+static std::wstring SpatialClsidDisplayName(const std::wstring& clsid) {
+    if (clsid.empty()) {
+        return std::wstring();
+    }
+    std::wstring sub = L"CLSID\\";
+    sub += clsid;
+    wchar_t name[256] = {};
+    DWORD size = sizeof(name);
+    if (RegGetValueW(HKEY_CLASSES_ROOT, sub.c_str(), nullptr,
+                     RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS &&
+        name[0] != L'\0') {
+        return name;
+    }
+    return clsid;
+}
+
+DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId) {
+    DiagSpatialInfo out;
+    if (endpointId.empty()) {
+        return out;
+    }
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return out;
+    }
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId.c_str(), &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps != nullptr) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            const HRESULT hr = pProps->GetValue(kPkeySpatialClsid, &pv);
+            if (SUCCEEDED(hr) && pv.vt == VT_LPWSTR &&
+                pv.pwszVal != nullptr && pv.pwszVal[0] != L'\0') {
+                out.state = DiagSpatial::On;
+                out.name = SpatialClsidDisplayName(pv.pwszVal);
+            } else if (SUCCEEDED(hr)) {
+                // Key present but empty: no active spatial mode.
+                out.state = DiagSpatial::Off;
+            } else {
+                // Key absent while the store itself reads fine: spatial is
+                // Off. (A store we can't open at all stays Unknown.)
+                out.state = DiagSpatial::Off;
             }
             PropVariantClear(&pv);
             pProps->Release();
@@ -308,7 +374,7 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
     if (SUCCEEDED(MiniEQ_IsAttachedToEndpoint(endpointId.c_str(), &attached))) {
         s.attached = attached;
     }
-    s.dllPath = ReadApoDllPath();
+    s.dllPath = MiniEQ_ApoDllPath();
     if (!s.dllPath.empty()) {
         s.dllExists = (GetFileAttributesW(s.dllPath.c_str()) != INVALID_FILE_ATTRIBUTES);
     }

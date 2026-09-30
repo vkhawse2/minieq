@@ -28,6 +28,22 @@ struct DiagSessionInfo {
 
 enum class DiagEnhancements { Unknown, On, Off };
 
+// Spatial-sound mode for one endpoint. Read from the endpoint property store:
+// {9637B4B9-11EE-4C35-B43C-7B2452C993CC},1 holds the active spatial-mode
+// CLSID as REG_SZ (absent/empty = Off). The friendly name (e.g. "Dolby Atmos
+// for Headphones") is resolved from HKCR\CLSID when available.
+enum class DiagSpatial { Unknown, Off, On };
+
+struct DiagSpatialInfo {
+    DiagSpatial state = DiagSpatial::Unknown;
+    std::wstring name;
+};
+
+DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId);
+
+// Full COM-registration path of MiniEQ_APO.dll
+// (HKCR\CLSID\{...}\InprocServer32). Empty when not registered.
+std::wstring MiniEQ_ApoDllPath();
 struct DiagSnapshot {
     std::wstring deviceName;
     std::wstring endpointId;
