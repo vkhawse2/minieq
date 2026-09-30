@@ -168,7 +168,7 @@ static HRESULT GrantAdminsKeyAllAccess(const wchar_t* endpointSubkey) {
     if (rc == ERROR_ACCESS_DENIED) {
         // Cannot even change the DACL: take ownership first. The
         // Administrators group holds SeTakeOwnershipPrivilege when elevated.
-        if (!EnablePrivilege(SE_TAKE_OWNERSHIP_NAME)) {
+        if (!EnablePrivilege(L"SeTakeOwnershipPrivilege")) {
             FreeSid(adminSid);
             return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
         }
