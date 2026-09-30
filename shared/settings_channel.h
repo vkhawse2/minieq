@@ -1,19 +1,26 @@
 // settings_channel.h -- shared between the APO DLL and the UI app.
 //
-// Two channels over named file mappings, both keyed by endpoint ID:
+// The live settings channel between MiniEQ (UI) and MiniEQ_APO (DSP).
 //
-//  1. Settings (UI -> APO): the live EQ settings. The UI is the single
-//     writer; the APO is the single reader. The APO's real-time thread only
-//     ever performs an atomic load of the sequence counter and, when it
-//     changes, a plain memcpy of the struct -- no locks, no syscalls, no COM
-//     on the audio thread.
+// Design: a named file-mapping object (shared memory) holding one EqSettings
+// struct, synchronized with a seqlock protocol on the 64-bit sequence counter.
+// The UI is the single writer; the APO is the single reader.
 //
-//  2. Status (APO -> UI): the heartbeat. The APO's background worker thread
-//     publishes APOProcess call counts and timestamps; the UI polls them on a
-//     timer to show whether audio is REALLY flowing through the APO instead
-//     of guessing from registry keys.
+// Protocol: the writer brackets every update with InterlockedIncrement64.
+// An ODD sequence means "a write is in flight -- do not trust the struct";
+// an EVEN sequence means "the struct is consistent". The reader takes an
+// atomic snapshot of the counter; if it is even and differs from the last
+// applied value, it copies the struct and re-reads the counter -- the copy
+// is accepted only if the counter is unchanged (bounded retries; on failure
+// the old settings are kept and the next audio buffer tries again).
 //
-// The mapping names are derived from the Windows audio endpoint ID, so each
+// The APO's real-time thread therefore only ever performs atomic 64-bit
+// counter loads and, on change, a plain memcpy -- no locks, no syscalls,
+// no COM on the audio thread. Interlocked* ops are used instead of C++
+// atomics so the protocol is identical in the C and C++ translation units
+// that share this header.
+//
+// The mapping name is derived from the Windows audio endpoint ID, so each
 // output device (e.g. WH-1000XM4 vs Tribit XSound Go) gets its own independent
 // EQ state: per-device EQ memory falls out naturally.
 
@@ -54,10 +61,12 @@ static inline float MiniEQ_BandFreq(int numBands, int band) {
 }
 
 // Layout of the shared memory block. Written by the UI, read by the APO.
-// `sequence` is bumped AFTER the rest of the struct is fully written; the APO
-// copies the struct only after observing a new sequence value.
+// `sequence` is the seqlock counter: the writer brackets each update with
+// InterlockedIncrement64 (odd = write in flight, even = struct consistent);
+// the reader accepts a copy only if the counter is the same even value
+// before and after. Must stay 8-byte aligned (it is: offset 0).
 typedef struct EqSettings {
-    volatile int64_t sequence;                    // writer-owned version counter
+    int64_t          sequence;                       // seqlock version counter
     float            bandGainDb[MINIEQ_MAX_BANDS]; // per-band gain, dB
     float            masterGainDb;                 // master trim, dB
     int32_t          bypass;                       // 0 = process, 1 = bypass
@@ -66,57 +75,9 @@ typedef struct EqSettings {
     int32_t          _reserved[5];
 } EqSettings;
 
-// APO -> UI heartbeat. Written by the APO's background worker thread; read by
-// the UI on a timer. processCalls advancing means APOProcess is really being
-// called by the engine -- the ground truth for "EQ is live".
-//
-// Version history:
-//   1: original fields.
-//   2: added buildId (repurposed the trailing reserved bytes, so the struct
-//      size is unchanged): the APO stamps the build it was compiled from,
-//      letting the UI tell a stale loaded DLL apart from the installed one.
-#define MINIEQ_STATUS_VERSION 2
-
-typedef struct MiniEQApoStatus {
-    uint32_t structSize;             // sizeof(MiniEQApoStatus): versioning
-    uint32_t version;                // MINIEQ_STATUS_VERSION
-    volatile int64_t processCalls;   // APOProcess invocations, all-time
-    volatile int64_t lastProcessQpc; // QPC value at the last APOProcess call
-    volatile int64_t qpcFrequency;   // QueryPerformanceFrequency() result
-    volatile int32_t locked;         // LockForProcess completed
-    volatile int32_t channels;       // locked format channel count
-    volatile int32_t sampleRate;     // locked format sample rate
-    volatile int32_t initOk;         // Initialize succeeded
-    char             buildId[16];    // APO build id (short commit SHA), NUL-terminated
-} MiniEQApoStatus;
-
 // "MiniEQ_{sanitized-endpoint-id}" -- caller supplies a buffer.
 void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
-
-// "Global\MiniEQ_Status_{sanitized-endpoint-id}" -- caller supplies a buffer.
-void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
-                                  wchar_t* outName, size_t outNameChars);
-
-// Global on/off (UI -> APO): one flag shared by every endpoint. The APO
-// creates "Global\MiniEQ__Enabled" -- it must be the creator, because only
-// the audio engine process (session 0) holds SeCreateGlobalPrivilege; the
-// UI (user session) can only open it. Fail-open: an absent mapping means
-// enabled, so audio keeps working with older UI builds. `sequence` is
-// bumped AFTER `enabled` is written; the APO adopts the pair only when the
-// two sequence reads match (no torn updates).
-#define MINIEQ_GLOBAL_VERSION 1
-
-typedef struct MiniEQGlobalState {
-    uint32_t structSize;       // sizeof(MiniEQGlobalState): versioning
-    uint32_t version;          // MINIEQ_GLOBAL_VERSION
-    volatile int64_t sequence; // writer-owned version counter
-    volatile int32_t enabled;  // 1 = MiniEQ processes audio, 0 = bypass all
-    volatile int32_t _reserved[3];
-} MiniEQGlobalState;
-
-// "Global\MiniEQ__Enabled" -- caller supplies a buffer.
-void MiniEQ_GlobalStateName(wchar_t* outName, size_t outNameChars);
 
 // Fill an EqSettings with flat (no-op) values, sequence = 1.
 void MiniEQ_SettingsInitFlat(EqSettings* s);

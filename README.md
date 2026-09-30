@@ -9,11 +9,15 @@ Open the app and the current output device's name is shown big at the top —
 it auto-selects the system default output, and the list refreshes live when
 devices are plugged in or unplugged.
 
-> **Status: scaffold.** The architecture, DSP, COM plumbing, registration,
-> and UI are all written, but this was authored on a Linux machine and has
-> **not been compile-tested**. The first build on a Windows laptop will
-> surface any issues — the code follows Microsoft's documented APO APIs and
-> is modeled on the official SwapAPO sample. See "Build" below.
+> **Status: working, with known limits.** Built by CI on Windows
+> (VS2022/MSVC) on every push to `main`; APO verified loading and processing
+> inside `audiodg.exe` on Realtek speakers and a USB-C earphone (heartbeat
+> advancing, stream locked 2ch @ 48/96 kHz). Honest limits: IEEE float32 only
+> (what the engine feeds SFX APOs in shared mode — other formats are declined
+> at negotiation), SFX placement (RAW streams bypass SFX APOs), and Bluetooth
+> endpoint re-enumeration across reconnects is a known weak point (roadmap).
+> No driver, no service, no audio-service restarts — the app never touches
+> the Windows Audio service.
 
 ## How it works
 
@@ -37,9 +41,10 @@ device. MiniEQ is exactly two pieces:
 ```
 
 - The **DSP runs inside the already-running audio engine**: effectively zero
-  extra RAM, zero extra latency (minimum-phase IIR), and it processes audio
-  *before* Bluetooth transmission — so it works with every BT device without
-  any vendor protocol.
+  extra RAM and no added block latency (minimum-phase IIR, `GetLatency() = 0`;
+  the per-buffer processing itself still costs CPU), and it processes audio
+  *before* Bluetooth transmission — so it works with BT devices without any
+  vendor protocol, wherever Windows feeds the SFX APO float32 in shared mode.
 - The **UI only runs when you open it**. Sliders write to shared memory; the
   APO's real-time thread picks up changes via a lock-free sequence counter
   (no locks, no syscalls, no COM on the audio thread).
@@ -116,18 +121,20 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
   toggle costs no RAM and no CPU.
 - **Format support:** IEEE float32 only (what the engine feeds SFX APOs in
   shared mode). Other formats are rejected at negotiation time.
-- **Real-time safety:** `APOProcess` never blocks, allocates, or touches COM;
-  coefficient recomputation on settings change is pure arithmetic.
+- **Real-time safety:** `APOProcess` never blocks, allocates, touches COM, or
+  performs I/O; coefficient recomputation on settings change is pure
+  arithmetic. UI→APO settings use a seqlock protocol (odd/even 64-bit
+  counter, `Interlocked*` atomics) with bounded reader retries.
 - **Persistence:** per-device curves live in `%APPDATA%\MiniEQ\devices.ini`;
   the APO itself stays flat until the UI pushes settings.
 
 ## Roadmap
 
-- [ ] First Windows compile + smoke test on a real BT endpoint
+- [x] Windows compile via CI (VS2022/MSVC) + smoke test on real endpoints
+- [x] WiX MSI installer (per-push artifacts from CI)
 - [ ] Verify attach/detach across device reconnects (BT endpoints can re-enumerate)
 - [ ] Consider auto-attach for newly seen devices (opt-in)
 - [ ] UI polish pass (custom-drawn sliders, dark mode) — structure is ready
-- [ ] Simple installer (one elevated setup instead of manual `regsvr32`)
 
 ## License
 
