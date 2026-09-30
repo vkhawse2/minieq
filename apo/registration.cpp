@@ -3,6 +3,7 @@
 #include "registration.h"
 #include "guids.h"
 
+#include <aclapi.h>
 #include <strsafe.h>
 
 // IID_IAudioProcessingObject -- the APO interface we implement.
@@ -117,10 +118,141 @@ HRESULT MiniEQ_UnregisterApoDeclaration() {
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
+static HRESULT EndpointKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    // MMDevices path of the endpoint itself (no FxProperties suffix).
+    return StringCchPrintfW(out, cch,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\%s",
+        endpointId);
+}
+
 static HRESULT FxPropertiesKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
     return StringCchPrintfW(out, cch,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\%s\\FxProperties",
         endpointId);
+}
+
+static bool EnablePrivilege(const wchar_t* privilegeName) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    BOOL ok = LookupPrivilegeValueW(nullptr, privilegeName,
+                                    &tp.Privileges[0].Luid) &&
+              AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+              GetLastError() == ERROR_SUCCESS;
+    CloseHandle(token);
+    return ok != FALSE;
+}
+
+// Grant the local Administrators group full control over the endpoint's
+// registry key (inherited by subkeys). Some endpoints -- notably Bluetooth
+// ones -- ship a DACL that denies even elevated administrators the right
+// to create the FxProperties subkey, so attach fails with
+// ERROR_ACCESS_DENIED. Existing ACEs are preserved; ours is merged in.
+static HRESULT GrantAdminsKeyAllAccess(const wchar_t* endpointSubkey) {
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    PSID adminSid = nullptr;
+    if (!AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS,
+                                  0, 0, 0, 0, 0, 0, &adminSid)) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    HKEY h = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, endpointSubkey, 0,
+                            READ_CONTROL | WRITE_DAC, &h);
+    if (rc == ERROR_ACCESS_DENIED) {
+        // Cannot even change the DACL: take ownership first. The
+        // Administrators group holds SeTakeOwnershipPrivilege when elevated.
+        if (!EnablePrivilege(SE_TAKE_OWNERSHIP_NAME)) {
+            FreeSid(adminSid);
+            return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+        }
+        rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, endpointSubkey, 0,
+                           READ_CONTROL | WRITE_OWNER, &h);
+        if (rc != ERROR_SUCCESS) {
+            FreeSid(adminSid);
+            return HRESULT_FROM_WIN32(rc);
+        }
+        DWORD err = SetSecurityInfo(h, SE_REGISTRY_KEY,
+                                    OWNER_SECURITY_INFORMATION,
+                                    adminSid, nullptr, nullptr, nullptr);
+        RegCloseKey(h);
+        h = nullptr;
+        if (err != ERROR_SUCCESS) {
+            FreeSid(adminSid);
+            return HRESULT_FROM_WIN32(err);
+        }
+        rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, endpointSubkey, 0,
+                           READ_CONTROL | WRITE_DAC, &h);
+    }
+    if (rc != ERROR_SUCCESS) {
+        if (h) RegCloseKey(h);
+        FreeSid(adminSid);
+        return HRESULT_FROM_WIN32(rc);
+    }
+
+    PACL oldDacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    DWORD err = GetSecurityInfo(h, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, &oldDacl, nullptr, &sd);
+    if (err != ERROR_SUCCESS || oldDacl == nullptr) {
+        if (sd) LocalFree(sd);
+        RegCloseKey(h);
+        FreeSid(adminSid);
+        return HRESULT_FROM_WIN32(err != ERROR_SUCCESS ? err
+                                                      : ERROR_ACCESS_DENIED);
+    }
+
+    EXPLICIT_ACCESSW ea = {};
+    ea.grfAccessPermissions = KEY_ALL_ACCESS;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    ea.Trustee.ptstrName = (LPWSTR)adminSid;
+
+    PACL newDacl = nullptr;
+    err = SetEntriesInAclW(1, &ea, oldDacl, &newDacl);
+    if (err == ERROR_SUCCESS) {
+        err = SetSecurityInfo(h, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, newDacl, nullptr);
+    }
+    if (newDacl) LocalFree(newDacl);
+    if (sd) LocalFree(sd);
+    RegCloseKey(h);
+    FreeSid(adminSid);
+    return err == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(err);
+}
+
+// Create the FxProperties subkey if needed, repairing a restrictive DACL on
+// the endpoint key when the system denies us.
+static HRESULT OpenFxPropertiesForWrite(const wchar_t* endpointId, HKEY* out) {
+    wchar_t key[512] = {};
+    HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+
+    HKEY h = nullptr;
+    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0,
+                              KEY_SET_VALUE, nullptr, &h, nullptr);
+    if (rc == ERROR_ACCESS_DENIED) {
+        wchar_t parent[512] = {};
+        hr = EndpointKey(endpointId, parent, ARRAYSIZE(parent));
+        if (FAILED(hr)) return hr;
+        hr = GrantAdminsKeyAllAccess(parent);
+        if (FAILED(hr)) return hr;
+        rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0,
+                             KEY_SET_VALUE, nullptr, &h, nullptr);
+    }
+    if (rc != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(rc);
+    }
+    *out = h;
+    return S_OK;
 }
 
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
@@ -129,20 +261,14 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     HRESULT hr = ClsidString(clsid, ARRAYSIZE(clsid));
     if (FAILED(hr)) return hr;
 
-    wchar_t key[512] = {};
-    hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
+    // The FxProperties subkey often does not exist yet (fresh endpoint);
+    // create it if needed, repairing a restrictive DACL when denied.
+    HKEY h = nullptr;
+    hr = OpenFxPropertiesForWrite(endpointId, &h);
     if (FAILED(hr)) return hr;
 
-    // The FxProperties subkey often does not exist yet (fresh endpoint);
-    // create it if needed, then set the SFX slot value in place.
-    HKEY h = nullptr;
-    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0,
-                              KEY_SET_VALUE, nullptr, &h, nullptr);
-    if (rc != ERROR_SUCCESS) {
-        return HRESULT_FROM_WIN32(rc);
-    }
-    rc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ, (const BYTE*)clsid,
-                        (DWORD)((wcslen(clsid) + 1) * sizeof(wchar_t)));
+    LONG rc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ, (const BYTE*)clsid,
+                             (DWORD)((wcslen(clsid) + 1) * sizeof(wchar_t)));
     RegCloseKey(h);
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }

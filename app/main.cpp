@@ -487,7 +487,7 @@ static int RunElevatedHelper(LPWSTR* argv, int argc) {
     wchar_t msg[384] = {};
     const wchar_t* hint = L"";
     if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
-        hint = L"\nAccess denied: make sure you approved the admin prompt.";
+        hint = L"\nAccess denied: the device's audio settings are locked down.";
     } else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
         hint = L"\nThe device's audio settings key was not found.";
     }
