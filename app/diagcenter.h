@@ -1,0 +1,84 @@
+// diagcenter.h -- MiniEQ Diagnostics Center.
+//
+// Answers "is the EQ actually working, and if not, why?" with measured
+// evidence instead of registry guessing:
+//   - Engine: audiodg.exe PID + whether MiniEQ_APO.dll is really loaded in it
+//     (best-effort module snapshot; access-denied is reported as unknown).
+//   - Heartbeat: the APO's APOProcess call counter from the status channel.
+//   - Registration: SFX slot state, DLL path/existence, Audio Enhancements.
+//   - Sessions: per-app audio sessions on this endpoint (chrome.exe, PID,
+//     active/idle, peak level) via IAudioSessionEnumerator.
+//   - Verdict: one plain-language diagnosis of the real issue + next step.
+
+#pragma once
+
+#include <windows.h>
+
+#include <string>
+#include <vector>
+
+// One audio session on the endpoint (e.g. chrome.exe playing music).
+struct DiagSessionInfo {
+    std::wstring exe;       // "chrome.exe", or "System sounds"
+    DWORD        pid = 0;
+    bool         active = false;      // AudioSessionStateActive right now
+    bool         systemSounds = false;
+    float        peak = -1.0f;        // 0..1 since last poll; < 0 = unknown
+};
+
+enum class DiagEnhancements { Unknown, On, Off };
+
+struct DiagSnapshot {
+    std::wstring deviceName;
+    std::wstring endpointId;
+
+    // Registration layer.
+    bool         attached = false;   // SFX slot points at MiniEQ_APO
+    std::wstring dllPath;            // InprocServer32 path of our CLSID
+    bool         dllExists = false;
+    DiagEnhancements enhancements = DiagEnhancements::Unknown;
+
+    // Engine layer.
+    DWORD        audiodgPid = 0;
+    int          dllLoaded = -1;      // 1 = yes, 0 = no, -1 = unknown
+    bool         statusChannelOk = false;
+    bool         heartbeatFresh = false; // heartbeat advanced between polls
+    int64_t      heartbeatCalls = 0;
+
+    // Stream details reported by the APO itself (valid when the status
+    // channel is up). Locked = Initialize completed on a real stream.
+    bool         apoLocked = false;
+    bool         apoInitOk = false;
+    int32_t      apoChannels = 0;
+    int32_t      apoSampleRate = 0;
+
+    // Playback layer.
+    std::vector<DiagSessionInfo> sessions;
+    bool         anySessionActive = false;
+};
+
+enum class DiagSeverity { Neutral, Good, Warn, Bad };
+
+struct DiagVerdict {
+    DiagSeverity severity = DiagSeverity::Neutral;
+    std::wstring title;      // plain-language diagnosis
+    std::wstring detail;     // the evidence behind it
+    std::wstring nextStep;   // what to do; may be empty
+};
+
+// Collect one full snapshot for an endpoint. Safe to call on the UI thread
+// (about once a second); every failing probe degrades to "unknown".
+DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId);
+
+// Turn a snapshot into the plain-language verdict.
+DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap);
+
+// The copyable plain-text report.
+std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v);
+
+// Show (or raise) the modeless Diagnostics Center window.
+void MiniEQ_ShowDiagCenter(HINSTANCE hInst, HWND hParent);
+
+// Tell the center which endpoint it is watching (call on device change and
+// after attach/detach). Empty string = no device.
+void MiniEQ_DiagCenterSetDevice(const std::wstring& endpointId);

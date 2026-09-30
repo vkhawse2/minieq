@@ -25,6 +25,11 @@ void MiniEQ_EnsureLogDir();
 // Append one timestamped "UI: ..." line to the log (UTF-16LE, like trace.cpp).
 void MiniEQ_AppLog(const wchar_t* fmt, ...);
 
+// Append one timestamped "[CATEGORY] ..." line to the log (UTF-16LE).
+// Categories used across the app: UI, DIAG, ENGINE, SESSION, REG, APO.
+// MiniEQ_AppLog is shorthand for category "UI".
+void MiniEQ_AppLogCat(const wchar_t* category, const wchar_t* fmt, ...);
+
 // Peak level (0..1) of the given render endpoint right now, or < 0 on error.
 // Used to tell "no audio playing" apart from "audio bypassing the APO".
 float MiniEQ_EndpointPeakLevel(const std::wstring& endpointId);

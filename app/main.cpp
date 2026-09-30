@@ -26,6 +26,7 @@
 #include "audio_devices.h"
 #include "settings_link.h"
 #include "diag.h"
+#include "diagcenter.h"
 #include "../apo/registration.h"
 
 //------------------------------------------------------------------------------
@@ -49,6 +50,7 @@ enum {
     IDC_DIAG_PILL    = 180,
     IDC_DIAG_LOG     = 181,
     IDC_DIAG_RESTART = 182,
+    IDC_DIAG_CENTER  = 183,
 };
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
@@ -92,7 +94,7 @@ static std::wstring         g_endpointId;
 static SettingsLink         g_link;
 static bool                 g_attached = false;
 static StatusLink           g_statusLink;    // APO heartbeat (APO -> UI)
-static HWND                 g_pill, g_btnLog, g_btnRestart;
+static HWND                 g_pill, g_btnLog, g_btnRestart, g_btnDiagCenter;
 static int                  g_diagState = -1; // -1 unset,0 idle,1 live,2 wait,3 err
 static int64_t              g_lastCalls = 0;
 static ULONGLONG            g_lastTick = 0;
@@ -315,6 +317,8 @@ static void SelectDevice(int index) {
     g_statusLink.Open(g_endpointId);
     g_lastCalls = 0;
     g_lastTick = 0;
+    // The Diagnostics Center watches the same device.
+    MiniEQ_DiagCenterSetDevice(g_endpointId);
     ApplyStagingToUI();
     UpdateAttachStatus();
     UpdateDiagStatus();
@@ -427,6 +431,11 @@ static void BuildControls(HWND hwnd) {
                                  140, 136, 170, 26, hwnd,
                                  (HMENU)IDC_DIAG_RESTART, g_hInst, nullptr);
     applyFont(g_btnRestart);
+    g_btnDiagCenter = CreateWindowW(L"BUTTON", L"Diagnostics",
+                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                    318, 136, 90, 26, hwnd,
+                                    (HMENU)IDC_DIAG_CENTER, g_hInst, nullptr);
+    applyFont(g_btnDiagCenter);
 
     // Band sliders are built by BuildBandControls() (5 or 10, per the
     // settings toggle); the initial set is created in WM_CREATE.
@@ -580,6 +589,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             MiniEQ_ShowLogViewer(g_hInst, g_hwnd);
         } else if (id == IDC_DIAG_RESTART) {
             RelaunchElevatedRestart();
+        } else if (id == IDC_DIAG_CENTER) {
+            MiniEQ_DiagCenterSetDevice(g_endpointId);
+            MiniEQ_ShowDiagCenter(g_hInst, g_hwnd);
         } else if (id == IDC_BYPASS) {
             g_link.Staging().bypass = (Button_GetCheck(g_bypass) == BST_CHECKED) ? 1 : 0;
             PushAndSave();

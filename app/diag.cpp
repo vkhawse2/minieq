@@ -35,23 +35,22 @@ void MiniEQ_EnsureLogDir() {
     CreateDirectoryW(d.c_str(), nullptr); // already exists: harmless
 }
 
-void MiniEQ_AppLog(const wchar_t* fmt, ...) {
+static void MiniEQ_AppLogV(const wchar_t* category, const wchar_t* fmt, va_list ap) {
     if (fmt == nullptr) {
         return;
     }
     wchar_t msg[1024] = {};
-    va_list ap;
-    va_start(ap, fmt);
     StringCchVPrintfW(msg, ARRAYSIZE(msg), fmt, ap);
-    va_end(ap);
 
     SYSTEMTIME st = {};
     GetLocalTime(&st);
     wchar_t line[1200] = {};
     StringCchPrintfW(line, ARRAYSIZE(line),
-                     L"[%02u:%02u:%02u.%03u pid=%lu] UI: %s\r\n",
+                     L"[%02u:%02u:%02u.%03u pid=%lu] [%s] %s\r\n",
                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                     GetCurrentProcessId(), msg);
+                     GetCurrentProcessId(),
+                     (category != nullptr && *category != L'\0') ? category : L"UI",
+                     msg);
 
     HANDLE h = CreateFileW(MiniEQ_DiagLogPath().c_str(), FILE_APPEND_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -69,6 +68,20 @@ void MiniEQ_AppLog(const wchar_t* fmt, ...) {
     DWORD w = 0;
     WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &w, nullptr);
     CloseHandle(h);
+}
+
+void MiniEQ_AppLogCat(const wchar_t* category, const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    MiniEQ_AppLogV(category, fmt, ap);
+    va_end(ap);
+}
+
+void MiniEQ_AppLog(const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    MiniEQ_AppLogV(L"UI", fmt, ap);
+    va_end(ap);
 }
 
 //------------------------------------------------------------------------------

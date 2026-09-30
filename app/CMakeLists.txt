@@ -8,6 +8,8 @@ add_executable(MiniEQ WIN32
     settings_link.h
     diag.cpp
     diag.h
+    diagcenter.cpp
+    diagcenter.h
     # Reused as-is: endpoint attach/detach registry writes.
     ../apo/registration.cpp
     ../apo/registration.h

@@ -17,7 +17,7 @@ static void WriteLine(const wchar_t* line) {
     GetLocalTime(&st);
     wchar_t stamped[1408] = {};
     StringCchPrintfW(stamped, ARRAYSIZE(stamped),
-                     L"[%02u:%02u:%02u.%03u pid=%lu tid=%lu] %s\r\n",
+                     L"[%02u:%02u:%02u.%03u pid=%lu tid=%lu] [APO] %s\r\n",
                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
                      GetCurrentProcessId(), GetCurrentThreadId(), line);
     OutputDebugStringW(stamped);
