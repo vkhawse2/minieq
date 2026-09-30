@@ -162,8 +162,19 @@ private:
     HANDLE         m_hStatusMap = nullptr;    // status mapping (worker only)
     MiniEQApoStatus* m_pStatus = nullptr;     // mapped view (worker only)
     std::atomic<uint64_t> m_rtCalls{0};       // RT thread (relaxed)
-    std::atomic<int64_t>  m_rtLastQpc{0};     // RT thread (relaxed)
-    uint32_t       m_rtQpcTick = 0;           // RT thread only
+    // Deferred RT diagnostics: the audio thread only records facts into
+    // these relaxed atomics -- no QPC, no file tracing there. The worker
+    // thread samples the clock and writes the trace lines (PublishStatus).
+    std::atomic<uint32_t> m_rtFirstCallFrames{0};   // validFrames, 1st call
+    std::atomic<uint32_t> m_rtFirstCallChannels{0}; // m_channels, 1st call
+    std::atomic<int32_t>  m_rtFirstCallBypass{0};    // bypass flag, 1st call
+    std::atomic<float>    m_rtFirstCallGain0{0.0f};  // band 0 gain, 1st call
+    std::atomic<bool>     m_rtFirstCallPending{false};
+    std::atomic<int32_t>  m_rtGlobalChangeValue{0};
+    std::atomic<int64_t>  m_rtGlobalChangeSeq{0};
+    std::atomic<bool>     m_rtGlobalChangePending{false};
+    std::atomic<bool>     m_rtExceptionPending{false};
+    uint64_t       m_workerLastCalls = 0;     // worker only
     int64_t        m_qpcFreq = 0;             // worker only
     uint32_t       m_sampleRate = 0;
 

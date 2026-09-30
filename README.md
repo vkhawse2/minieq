@@ -124,7 +124,9 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 - **Real-time safety:** `APOProcess` never blocks, allocates, touches COM, or
   performs I/O; coefficient recomputation on settings change is pure
   arithmetic. UI→APO settings use a seqlock protocol (odd/even 64-bit
-  counter, `Interlocked*` atomics) with bounded reader retries.
+  counter, `Interlocked*` atomics) with bounded reader retries; the heartbeat
+  counter is a relaxed atomic and all clock sampling/tracing is deferred to
+  the APO's worker thread.
 - **Persistence:** per-device curves live in `%APPDATA%\MiniEQ\devices.ini`;
   the APO itself stays flat until the UI pushes settings.
 

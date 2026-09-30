@@ -5,9 +5,8 @@
 #include <string.h>
 #include <wchar.h>
 
-void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
-                                  wchar_t* outName, size_t outNameChars) {
-    static const wchar_t prefix[] = L"Local\\MiniEQ_";
+static void BuildMappingName(const wchar_t* prefix, const wchar_t* endpointId,
+                             wchar_t* outName, size_t outNameChars) {
     size_t o = 0;
     for (size_t i = 0; prefix[i] != L'\0' && o + 1 < outNameChars; ++i) {
         outName[o++] = prefix[i];
@@ -24,6 +23,33 @@ void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
     outName[o] = L'\0';
 }
 
+void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
+                                  wchar_t* outName, size_t outNameChars) {
+    // Global\ namespace: the APO runs inside the audio engine (session 0,
+    // service identity) while the UI runs in the user's session. Local\
+    // objects can never cross that boundary, so the APO -- which holds
+    // SeCreateGlobalPrivilege -- creates both channels and the UI opens
+    // them. (A user-session process cannot create Global\ objects.)
+    static const wchar_t prefix[] = L"Global\\MiniEQ_";
+    BuildMappingName(prefix, endpointId, outName, outNameChars);
+}
+
+void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
+                                  wchar_t* outName, size_t outNameChars) {
+    // See above: Global\ is required for the APO (session 0) <-> UI
+    // (user session) channel.
+    static const wchar_t prefix[] = L"Global\\MiniEQ_Status_";
+    BuildMappingName(prefix, endpointId, outName, outNameChars);
+}
+
+void MiniEQ_GlobalStateName(wchar_t* outName, size_t outNameChars) {
+    // Same Global\ requirement as the per-endpoint channels: the APO
+    // (running in session 0) creates it; the UI (user session) only opens
+    // it. One flat name -- no endpoint GUID -- because the flag is global.
+    static const wchar_t name[] = L"Global\\MiniEQ__Enabled";
+    BuildMappingName(name, NULL, outName, outNameChars);
+}
+
 void MiniEQ_SettingsInitFlat(EqSettings* s) {
     memset(s, 0, sizeof(*s));
     for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
@@ -33,5 +59,7 @@ void MiniEQ_SettingsInitFlat(EqSettings* s) {
     s->bypass = 0;
     s->numBands = MINIEQ_NUM_BANDS; // default: 5-band
     s->virtualization = 0; // default: crossfeed off (zero DSP cost)
-    s->sequence = 0; // seqlock base: even = consistent (writer brackets to odd/even)
+    // Even: a consistent snapshot. The seqlock protocol needs the counter
+    // even whenever no write is in flight, including at creation.
+    s->sequence = 0;
 }
