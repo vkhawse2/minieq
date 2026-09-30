@@ -39,7 +39,7 @@ $apo = Get-ItemProperty -Path $ApoRegPath -ErrorAction SilentlyContinue
 if ($apo) {
     Write-Host ("FOUND  " + $ApoRegPath) -ForegroundColor Green
     Write-Host ("  FriendlyName: " + $apo.FriendlyName)
-    Write-Host ("  Flags:        " + $apo.Flags + "  (MiniEQ expects 0 = APO_FLAG_INPLACE)")
+    Write-Host ("  Flags:        " + $apo.Flags + "  (MiniEQ expects 1 = APO_FLAG_INPLACE per Microsoft docs)")
 } else {
     Write-Host ("MISSING " + $ApoRegPath) -ForegroundColor Red
     Write-Host '  The MSI did not register the APO. Reinstall MiniEQ-0.1.0-x64.msi.'
