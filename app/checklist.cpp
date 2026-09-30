@@ -11,8 +11,10 @@
 #include "diag.h"
 #include "settings_link.h"
 #include "engine_reload.h"
+#include "../apo/registration.h"
 
 #include <windows.h>
+#include <shellapi.h>
 #include <strsafe.h>
 
 #include <string>
@@ -44,6 +46,10 @@ enum {
     IDC_CL_CLOSE,
     IDC_CL_SPATIALFIX,
     IDC_CL_ENHFIX,
+    IDC_CL_SECT4,
+    IDC_CL_RECSEG,   // owner-drawn 3-way recovery toggle
+    IDC_CL_RECDESC,  // what the selected fix does
+    IDC_CL_RECSLT,   // last recovery outcome
 };
 
 constexpr int kRows = 9;
@@ -64,7 +70,7 @@ std::wstring s_deviceName;
 
 HWND      s_hDevName = nullptr;
 HWND      s_hSub = nullptr;
-HWND      s_hSect[3] = {};
+HWND      s_hSect[4] = {};
 HWND      s_hDot[kRows] = {};
 HWND      s_hTitle[kRows] = {};
 HWND      s_hDetail[kRows] = {};
@@ -74,6 +80,43 @@ HWND      s_hSpatialFix = nullptr; // one-click "Turn off" on the spatial row
 bool      s_spatialFixFailed = false;
 HWND      s_hEnhFix = nullptr; // one-click "Turn on" on the enhancements row
 bool      s_enhFixFailed = false;
+
+// --- Recovery: three-way toggle (Reload path / Re-attach / Watch engine) ---
+// Each position targets one suspect for "0 APOProcess calls while audio
+// plays": (0) the engine never loaded MiniEQ (stale graph) -- rebuild the
+// path via the format flip; (1) the engine loaded MiniEQ but routes around
+// it -- re-write the SFX slot (needs elevation), then rebuild; (2) the
+// engine keeps dying -- stay armed and re-establish MiniEQ whenever
+// audiodg's pid changes. Positions 0/1 run once per tap; 2 toggles.
+// Nothing here touches the audio service.
+enum class RecoverySel { Reload = 0, Reattach = 1, Watch = 2 };
+HWND        s_hRecSeg = nullptr;    // owner-drawn 3-segment control
+HWND        s_hRecDesc = nullptr;   // what the selected fix does
+HWND        s_hRecResult = nullptr; // last recovery outcome
+RecoverySel s_recSel = RecoverySel::Reload;
+bool        s_recBusy = false;      // a one-shot worker is running
+bool        s_recWatchArmed = false;
+DWORD       s_recWatchPid = 0;      // audiodg pid baseline while armed
+DWORD       s_lastAudiodgPid = 0;   // latest pid seen by RefreshChecklist
+ULONGLONG   s_recWatchLastMs = 0;   // cooldown between auto-recoveries
+int         s_recWatchCount = 0;    // auto-disarm after kWatchMaxRecoveries
+int         s_recSeq = 0;           // invalidates stale worker completions
+std::wstring s_recResultText;
+static constexpr ULONGLONG kWatchCooldownMs = 30000;
+static constexpr int kWatchMaxRecoveries = 5;
+#define WM_APP_RECOVERYDONE (WM_APP + 102)
+
+const wchar_t* kRecDesc[3] = {
+    L"Suspect: the engine never loaded MiniEQ (stale graph).\r\n"
+    L"Rebuilds the audio path so the engine reloads MiniEQ from disk, then "
+    L"watches for the processing heartbeat.",
+    L"Suspect: the engine loaded MiniEQ but routes audio around it.\r\n"
+    L"Re-writes MiniEQ\u2019s slot in the effects chain (one admin approval), "
+    L"then rebuilds the path.",
+    L"Suspect: the audio engine keeps dying and restarting.\r\n"
+    L"Stays on: when the engine restarts itself, MiniEQ re-establishes "
+    L"automatically. Never touches the audio service.",
+};
 // What a one-click fix reports on its row afterwards. Switching: the WinRT
 // worker is running. Watching: the live write went through and we're
 // waiting for the heartbeat to prove the graph rebuilt. AppliedLive: it
@@ -137,6 +180,8 @@ static DWORD WINAPI SpatialFixThread(LPVOID param) {
     PostMessageW(hwnd, WM_APP_SPATIALDONE, ok ? 1 : 0, seq);
     return 0;
 }
+
+
 
 HFONT     s_font = nullptr;
 HFONT     s_fontBold = nullptr;
@@ -552,6 +597,11 @@ void LayoutRows() {
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
         y += rh;
     }
+    // Recovery: three-way toggle (Reload path / Re-attach / Watch engine).
+    MoveWindow(s_hSect[3], 14, y, 472, sectH, TRUE); y += sectH + 6;
+    MoveWindow(s_hRecSeg, 14, y, 472, 32, TRUE); y += 32 + 6;
+    MoveWindow(s_hRecDesc, 14, y, 472, 40, TRUE); y += 40 + 4;
+    MoveWindow(s_hRecResult, 14, y, 472, 34, TRUE); y += 34 + 4;
     MoveWindow(s_hLegend, 14, y + 6, 300, 18, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_REFRESH), 316, y + 2, 80, 26, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_CLOSE), 404, y + 2, 80, 26, TRUE);
@@ -588,6 +638,7 @@ void RefreshChecklist() {
     }
     const std::wstring dllPath = MiniEQ_ApoDllPath();
     const DiagSnapshot snap = MiniEQ_RunDiagnosis(s_endpoint);
+    s_lastAudiodgPid = snap.audiodgPid; // feeds the recovery watch
     const DiagSpatialInfo spatial = MiniEQ_ReadSpatialSound(s_endpoint);
     BuildRows(snap, spatial, dllPath);
 
@@ -631,12 +682,12 @@ LRESULT ClOnCtlColorStatic(HDC hdc, HWND hctl) {
             return (LRESULT)GetStockObject(NULL_BRUSH);
         }
     }
-    if (hctl == s_hSub || hctl == s_hLegend) {
+    if (hctl == s_hSub || hctl == s_hLegend || hctl == s_hRecDesc) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(110, 110, 110));
         return (LRESULT)GetStockObject(NULL_BRUSH);
     }
-    for (int s = 0; s < 3; ++s) {
+    for (int s = 0; s < 4; ++s) {
         if (hctl == s_hSect[s]) {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(120, 120, 120));
@@ -708,8 +759,290 @@ void ClOnCreate(HWND hwnd) {
     s_hEnhFix = makeButton(IDC_CL_ENHFIX, L"Turn on");
     ShowWindow(s_hEnhFix, SW_HIDE);
 
+    // Recovery: three-way toggle. LayoutRows positions everything.
+    s_hSect[3] = makeStatic(IDC_CL_SECT4, L"RECOVERY", 14, 0, 472, 22, false);
+    s_hRecSeg = CreateWindowW(L"STATIC", L"",
+                              WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY,
+                              0, 0, 472, 32, hwnd,
+                              (HMENU)(INT_PTR)IDC_CL_RECSEG, s_hInst, nullptr);
+    s_hRecDesc = makeStatic(IDC_CL_RECDESC, kRecDesc[0], 14, 0, 472, 40, false);
+    s_hRecResult = makeStatic(IDC_CL_RECSLT, L"", 14, 0, 472, 34, false);
+
     SetTimer(hwnd, 1, 1500, nullptr);
     RefreshChecklist();
+}
+
+// ---------------------------------------------------------------------------
+// Recovery toggle implementation
+// ---------------------------------------------------------------------------
+
+static void UpdateRecoveryTexts() {
+    if (s_hRecDesc == nullptr) {
+        return;
+    }
+    SetTextIfChanged(s_hRecDesc, kRecDesc[(int)s_recSel]);
+    SetTextIfChanged(s_hRecResult, s_recResultText);
+    if (s_hRecSeg != nullptr) {
+        InvalidateRect(s_hRecSeg, nullptr, TRUE);
+    }
+}
+
+struct RecoveryJob {
+    HWND hwnd;
+    std::wstring endpoint;
+    int action; // 0 = reload, 1 = re-attach (slot already re-written), 2 = watch auto-recovery
+    int seq;
+};
+
+struct RecoveryDone {
+    int seq;
+    int action;
+    bool ok;
+    std::wstring text;
+};
+
+// Strong verification: the heartbeat must ADVANCE, not just exist. Returns
+// 0 = advancing (MiniEQ is processing), 1 = path rebuilt but nothing is
+// playing (can't prove it yet), 2 = still no heartbeat.
+static int VerifyHeartbeatAdvance(const std::wstring& endpoint) {
+    if (!MiniEQ_AudioPlaying(endpoint, nullptr)) {
+        return 1;
+    }
+    DiagSnapshot s0 = MiniEQ_RunDiagnosis(endpoint);
+    int64_t base = s0.statusChannelOk ? s0.heartbeatCalls : 0;
+    for (int i = 0; i < 12; ++i) {
+        Sleep(1000);
+        DiagSnapshot s = MiniEQ_RunDiagnosis(endpoint);
+        if (s.statusChannelOk && s.heartbeatCalls > base) {
+            // One advancing sample isn't enough (the row-8 freshness rule
+            // needs two); confirm with a second.
+            const int64_t mid = s.heartbeatCalls;
+            Sleep(1000);
+            DiagSnapshot s2 = MiniEQ_RunDiagnosis(endpoint);
+            if (s2.heartbeatCalls > mid) {
+                return 0;
+            }
+            base = mid;
+        }
+    }
+    return 2;
+}
+
+static DWORD WINAPI RecoveryThread(LPVOID param) {
+    RecoveryJob* job = static_cast<RecoveryJob*>(param);
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::wstring detail;
+    RecoveryDone* done = new RecoveryDone{ job->seq, job->action, false, L"" };
+    const wchar_t* kind = job->action == 1 ? L"re-attach"
+                        : job->action == 2 ? L"watch-recover" : L"reload";
+    if (!MiniEQ_FlipDefaultFormat(job->endpoint, &detail)) {
+        done->text = L"Couldn't rebuild the audio path (" + detail + L").";
+        MiniEQ_AppLogCat(L"ENGINE", L"recovery %s: flip failed (%s)",
+                         kind, detail.c_str());
+    } else {
+        const int v = VerifyHeartbeatAdvance(job->endpoint);
+        if (v == 0) {
+            done->ok = true;
+            done->text = job->action == 1
+                ? L"Re-attached and reloaded \u2014 heartbeat advancing, MiniEQ is processing audio."
+                : L"Reloaded \u2014 heartbeat advancing, MiniEQ is processing audio.";
+        } else if (v == 1) {
+            done->ok = true;
+            done->text = L"Path rebuilt, but nothing is playing \u2014 play audio on this device to confirm.";
+        } else {
+            done->text = L"Path rebuilt, but still no heartbeat. The rebuild may not "
+                         L"take effect on this device \u2014 try unplugging and "
+                         L"replugging the earphone, then replay.";
+        }
+        MiniEQ_AppLogCat(L"ENGINE", L"recovery %s: %s", kind, done->text.c_str());
+    }
+    CoUninitialize();
+    if (!PostMessageW(job->hwnd, WM_APP_RECOVERYDONE, 0, (LPARAM)done)) {
+        delete done; // dialog already gone
+    }
+    delete job;
+    return 0;
+}
+
+static void SpawnRecoveryJob(int action) {
+    s_recBusy = true;
+    ++s_recSeq;
+    RecoveryJob* job = new RecoveryJob{ s_hDlg, s_endpoint, action, s_recSeq };
+    DWORD tid = 0;
+    HANDLE h = CreateThread(nullptr, 0, RecoveryThread, job, 0, &tid);
+    if (h != nullptr) {
+        CloseHandle(h);
+    } else {
+        delete job;
+        s_recBusy = false;
+        s_recResultText = L"Couldn't start the recovery worker.";
+        UpdateRecoveryTexts();
+    }
+}
+
+// Re-writes the SFX slot. The FxProperties value lives under HKLM, so this
+// needs elevation -- same self-relaunch pattern as the main window's
+// "Attach to this device" (UAC prompt, --attach helper). Runs on the UI
+// thread, like the existing attach flow.
+static bool RelaunchElevatedReattach(const std::wstring& endpoint) {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    std::wstring args = L"--attach \"";
+    args += endpoint;
+    args += L"\"";
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_NORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        return false; // elevation cancelled
+    }
+    Sleep(800); // give the elevated helper a moment, then re-read
+    bool attached = false;
+    return SUCCEEDED(MiniEQ_IsAttachedToEndpoint(endpoint.c_str(), &attached)) &&
+           attached;
+}
+
+static void OnRecoveryTap(int index) {
+    if (s_recBusy || s_hDlg == nullptr || s_endpoint.empty()) {
+        return;
+    }
+    if (index == 2) {
+        // Watch engine: toggle the armed state.
+        s_recSel = RecoverySel::Watch;
+        s_recWatchArmed = !s_recWatchArmed;
+        if (s_recWatchArmed) {
+            s_recWatchPid = s_lastAudiodgPid; // baseline; never fires on arm
+            s_recWatchCount = 0;
+            s_recWatchLastMs = 0;
+            s_recResultText =
+                L"Watching the audio engine \u2014 MiniEQ will re-establish "
+                L"itself if the engine restarts.";
+            MiniEQ_AppLogCat(L"ENGINE", L"recovery watch armed (audiodg pid %u)",
+                             s_recWatchPid);
+        } else {
+            s_recResultText = L"Watch stopped.";
+            MiniEQ_AppLogCat(L"ENGINE", L"recovery watch disarmed");
+        }
+        UpdateRecoveryTexts();
+        return;
+    }
+    s_recSel = static_cast<RecoverySel>(index);
+    if (index == 1) {
+        s_recResultText =
+            L"Requesting admin approval to re-write the effects-chain slot\u2026";
+        UpdateRecoveryTexts();
+        if (!RelaunchElevatedReattach(s_endpoint)) {
+            s_recResultText =
+                L"Admin approval was cancelled or the slot couldn't be re-written "
+                L"\u2014 MiniEQ's registration is unchanged.";
+            MiniEQ_AppLogCat(L"ENGINE", L"recovery re-attach: elevation cancelled/failed");
+            UpdateRecoveryTexts();
+            return;
+        }
+    }
+    s_recResultText = L"Working\u2026 rebuilding the audio path.";
+    UpdateRecoveryTexts();
+    SpawnRecoveryJob(index);
+}
+
+// Called from the 1.5 s timer while the watch is armed: a changed audiodg
+// pid means the engine restarted on its own (we never restart it). One
+// format-flip recovery per new pid, 30 s cooldown, auto-disarm after 5 so
+// a crash loop can't churn forever.
+static void CheckWatchEngine() {
+    if (!s_recWatchArmed || s_endpoint.empty() || s_recBusy) {
+        return;
+    }
+    const DWORD pid = s_lastAudiodgPid;
+    if (pid == 0) {
+        return;
+    }
+    if (s_recWatchPid == 0) {
+        s_recWatchPid = pid; // late baseline
+        return;
+    }
+    if (pid == s_recWatchPid) {
+        return;
+    }
+    wchar_t changed[128] = {};
+    StringCchPrintfW(changed, ARRAYSIZE(changed),
+                     L"Engine restarted (pid %u \u2192 %u)", s_recWatchPid, pid);
+    s_recWatchPid = pid;
+    if (s_recWatchCount >= kWatchMaxRecoveries) {
+        s_recWatchArmed = false;
+        s_recResultText =
+            L"Engine restarted 5 times \u2014 auto-recovery stopped to avoid churn. "
+            L"Check Event Viewer for audiodg.exe crashes.";
+        MiniEQ_AppLogCat(L"ENGINE", L"recovery watch: auto-disarmed after 5 recoveries");
+        UpdateRecoveryTexts();
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_recWatchLastMs < kWatchCooldownMs) {
+        MiniEQ_AppLogCat(L"ENGINE", L"recovery watch: engine restarted inside cooldown, waiting");
+        return;
+    }
+    s_recWatchLastMs = now;
+    ++s_recWatchCount;
+    s_recResultText = std::wstring(changed) + L" \u2014 re-establishing MiniEQ\u2026";
+    MiniEQ_AppLogCat(L"ENGINE", L"recovery watch: %s (recovery %d of %d)",
+                     changed, s_recWatchCount, kWatchMaxRecoveries);
+    UpdateRecoveryTexts();
+    SpawnRecoveryJob(2);
+}
+
+// Owner-drawn 3-segment control, drawn to match the light dialog: gray
+// track, white pill on the selected segment, gray labels otherwise.
+static void DrawRecoverySeg(const DRAWITEMSTRUCT* di) {
+    HDC hdc = di->hDC;
+    const RECT rc = di->rcItem;
+    const int w = rc.right - rc.left;
+    const int sel = static_cast<int>(s_recSel);
+    const int segW = w / 3;
+
+    HBRUSH track = CreateSolidBrush(RGB(227, 227, 227));
+    HBRUSH pill = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN edge = CreatePen(PS_SOLID, 1, RGB(198, 198, 198));
+    HGDIOBJ oldBrush = SelectObject(hdc, track);
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+
+    RECT pr = { rc.left + sel * segW + 2, rc.top + 2,
+                rc.left + (sel + 1) * segW - 2, rc.bottom - 2 };
+    SelectObject(hdc, pill);
+    SelectObject(hdc, edge);
+    RoundRect(hdc, pr.left, pr.top, pr.right, pr.bottom, 10, 10);
+
+    const wchar_t* labels[3] = { L"Reload path", L"Re-attach", L"Watch engine" };
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, s_font));
+    for (int i = 0; i < 3; ++i) {
+        RECT lr = { rc.left + i * segW, rc.top, rc.left + (i + 1) * segW, rc.bottom };
+        if (i == static_cast<int>(RecoverySel::Watch) && s_recWatchArmed) {
+            lr.right -= 14; // room for the armed dot
+        }
+        SetTextColor(hdc, i == sel ? RGB(26, 26, 26) : RGB(110, 110, 110));
+        DrawTextW(hdc, labels[i], -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    if (s_recWatchArmed) {
+        // Green "armed" dot at the right edge of the Watch segment.
+        const int cx = rc.left + 2 * segW + segW - 11;
+        const int cy = (rc.top + rc.bottom) / 2;
+        HBRUSH dot = CreateSolidBrush(RGB(29, 158, 75));
+        HGDIOBJ oldB = SelectObject(hdc, dot);
+        SelectObject(hdc, GetStockObject(NULL_PEN));
+        Ellipse(hdc, cx - 4, cy - 4, cx + 4, cy + 4);
+        SelectObject(hdc, oldB);
+        DeleteObject(dot);
+    }
+    SelectObject(hdc, oldFont);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(track);
+    DeleteObject(pill);
+    DeleteObject(edge);
 }
 
 LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -721,6 +1054,7 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1) {
             RefreshChecklist();
+            CheckWatchEngine();
             // Live-apply watch: after the WinRT switch the APO heartbeat
             // has to prove the running graph picked it up. If it heals on
             // its own -- the Dolby-level path -- no reload is needed.
@@ -755,6 +1089,20 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_CL_RECSEG && HIWORD(wp) == STN_CLICKED) {
+            // Recovery toggle tap: hit-test which third was tapped.
+            POINT pt = {};
+            GetCursorPos(&pt);
+            ScreenToClient(s_hRecSeg, &pt);
+            RECT rc = {};
+            GetClientRect(s_hRecSeg, &rc);
+            const int w = max(rc.right - rc.left, 1);
+            int idx = (pt.x * 3) / w;
+            if (idx < 0) idx = 0;
+            if (idx > 2) idx = 2;
+            OnRecoveryTap(idx);
+            return 0;
+        }
         switch (LOWORD(wp)) {
         case IDC_CL_REFRESH:
             // Reset freshness baselines so "confirming they're advancing"
@@ -818,6 +1166,23 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         }
         break;
+    case WM_DRAWITEM:
+        if (wp == (WPARAM)IDC_CL_RECSEG) {
+            DrawRecoverySeg((const DRAWITEMSTRUCT*)lp);
+            return TRUE;
+        }
+        break;
+    case WM_APP_RECOVERYDONE: {
+        RecoveryDone* done = (RecoveryDone*)lp;
+        if (s_open && done->seq == s_recSeq) {
+            s_recBusy = false;
+            s_recResultText = done->text;
+            UpdateRecoveryTexts();
+            RefreshChecklist(); // the path may have healed; re-run the rows
+        }
+        delete done;
+        return 0;
+    }
     case WM_APP_SPATIALDONE:
         if (s_open && (int)lp == s_fixSeq) {
             EnableWindow(s_hSpatialFix, TRUE);
@@ -884,6 +1249,16 @@ void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
     s_fixNoteRow = -1;
     s_fixNoteTick = 0;
     ++s_fixSeq; // invalidate any in-flight worker completion
+    // Recovery toggle: fresh selection, disarmed watch, no stale results.
+    s_recSel = RecoverySel::Reload;
+    s_recBusy = false;
+    s_recWatchArmed = false;
+    s_recWatchPid = 0;
+    s_lastAudiodgPid = 0;
+    s_recWatchLastMs = 0;
+    s_recWatchCount = 0;
+    s_recResultText.clear();
+    ++s_recSeq;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
