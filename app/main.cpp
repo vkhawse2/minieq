@@ -437,6 +437,7 @@ static void UpdateAttachStatus() {
 // the reload waits (banner offers "Reload now"); when idle it fires on its
 // own. One attempt per (endpoint, stale build) -- never a loop.
 static void SpawnReloadWorker(bool force);
+static void TryOpenChannels(); // defined below; re-opens the APO channels
 
 static void UpdateEngineReload() {
     if (g_endpointId.empty() || !g_attached || g_reloadWorkerBusy) {

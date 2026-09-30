@@ -4,6 +4,7 @@
 
 #include <audioclient.h>
 #include <audiopolicy.h>
+#include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
 #include <functiondiscoverykeys_devpkey.h> // PKEY_AudioEngine_DeviceFormat
 #include <mmdeviceapi.h>
 #include <strsafe.h>
