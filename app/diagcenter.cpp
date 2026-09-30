@@ -13,6 +13,7 @@
 
 #include <audiopolicy.h>
 #include <endpointvolume.h>
+#include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
 #include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <propvarutil.h>
