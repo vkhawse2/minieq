@@ -56,7 +56,7 @@ bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId);
 // completion; the caller then watches the APO heartbeat to confirm the
 // path healed. Returns false when WinRT is unavailable or the call failed
 // -- the caller should fall back to MiniEQ_SetSpatialSoundOff plus a
-// chained audio-service restart.
+// chained format flip (MiniEQ_FlipDefaultFormat).
 bool MiniEQ_SetSpatialSoundOffWinRT(const std::wstring& endpointId);
 
 // Writes the "Audio enhancements" switch for one endpoint (on = device

@@ -28,6 +28,9 @@ target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32)
 # Diagnostic trace of the APO load path (see trace.h). Compiled out when 0.
 target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=1)
 
+# Build id for the status-channel stamp (see root CMakeLists).
+target_compile_definitions(MiniEQ_APO PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")
+
 # Static CRT: audiodg.exe loads this DLL with no guarantee that the VC++
 # redistributable is reachable from its context. A dynamic-CRT dependency
 # (VCRUNTIME140.dll) is a load failure waiting to happen.

@@ -21,6 +21,7 @@
 #include <strsafe.h>
 
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "audio_devices.h"
@@ -28,6 +29,7 @@
 #include "diag.h"
 #include "diagcenter.h"
 #include "checklist.h"
+#include "engine_reload.h"
 #include "../apo/registration.h"
 
 //------------------------------------------------------------------------------
@@ -50,7 +52,6 @@ enum {
     IDC_VIRTUALIZATION = 170,
     IDC_DIAG_PILL    = 180,
     IDC_DIAG_LOG     = 181,
-    IDC_DIAG_RESTART = 182,
     IDC_DIAG_CENTER  = 183,
     IDC_DIAG_SOUND   = 184, // "Open Sound settings" (enhancements-off state)
     IDC_DIAG_HINT    = 185, // one-line contextual fix guidance under the pill
@@ -102,10 +103,12 @@ static SettingsLink         g_link;
 static bool                 g_linkSynced = false; // saved EQ pushed to the live channel
 static bool                 g_attached = false;
 static StatusLink           g_statusLink;    // APO heartbeat (APO -> UI)
-static HWND                 g_pill, g_btnLog, g_btnRestart, g_btnDiagCenter;
+static HWND                 g_pill, g_btnLog, g_btnDiagCenter;
 static HWND                 g_btnSound, g_hint; // sound-settings btn + fix hint
 static HWND                 g_power;      // global MiniEQ on/off button
-static HWND                 g_bannerText, g_bannerBtn; // auto-attach banner
+static HWND                 g_bannerText, g_bannerBtn; // banner text + action button
+static HBRUSH               g_bannerOkBrush = nullptr;   // green tint: reload done
+static HBRUSH               g_bannerWarnBrush = nullptr; // amber tint: reload pending/failed
 static HWND                 g_preset[4];  // preset buttons (for power dimming)
 static HWND                 g_masterLabel, g_presetLabel, g_settingsLabel;
 static HWND                 g_bandsLabel, g_note; // fixed labels repositioned by LayoutContent
@@ -115,15 +118,42 @@ static HWND                 g_btnChecklist; // "Checklist" button
 static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
 static ULONGLONG            g_lastTick = 0;
-static HBRUSH               g_diagBrush[7] = {}; // one per DIAG_* state
+static HBRUSH               g_diagBrush[8] = {}; // one per DIAG_* state
+// Banner: shared slot for the auto-attach offer and the engine-reload
+// states. Reload states outrank attach states while they are active.
+enum class BannerKind {
+    None,
+    ReloadPending, // update ready, waiting for audio to stop (amber)
+    ReloadFailed,  // flip didn't take: manual step (amber)
+    ReloadDone,    // engine reloaded + new build verified (green)
+    AttachNote,    // post-attach note (plain)
+    AttachOffer,   // new default device, offer one-click attach (plain)
+};
+static BannerKind           g_bannerKind = BannerKind::None;
 // Auto-attach banner: shown when the Windows default render endpoint changed
 // to a device MiniEQ isn't attached to. Never auto-detaches old devices.
 static std::wstring         g_lastDefaultId; // last seen system default endpoint
 static int                  g_contentDy = 0; // banner pushes content down by this
 static bool                 g_bannerVisible = false;
-static bool                 g_bannerNote = false; // "change applied" note showing
+static bool                 g_bannerNote = false; // post-attach note showing
 static ULONGLONG            g_bannerNoteTick = 0;
 static constexpr ULONGLONG  kBannerNoteMs = 120000; // 2 min
+// Engine auto-reload: when the status channel reports a stale APO build, the
+// app flips the default format itself (no services, no UAC) and verifies the
+// new build. One attempt per (endpoint, stale build); never loops.
+#define WM_APP_RELOAD_DONE (WM_APP + 102)
+enum class ReloadUiState { None, Working, Pending, DoneNote, FailedNote };
+static ReloadUiState        g_reloadUi = ReloadUiState::None;
+static std::wstring         g_reloadKey; // endpoint|reported-build: once per detection
+static bool                 g_reloadAttempted = false; // auto-arm fired for g_reloadKey
+static std::wstring         g_reloadBuild;   // new live build id, for banner/log text
+static std::wstring         g_reloadSession; // Deferred: who is playing
+static std::wstring         g_reloadDetail;  // Failed/FlipError: why
+static ULONGLONG            g_reloadNoteTick = 0;  // DoneNote/FailedNote expiry
+static ULONGLONG            g_reloadRetryTick = 0; // Pending: re-check cadence
+static bool                 g_reloadDeferredLogged = false;
+static bool                 g_reloadWorkerBusy = false;
+static constexpr ULONGLONG  kReloadRetryMs = 15000; // Pending: re-check every 15 s
 static GlobalStateLink      g_globalLink; // UI side of the global on/off flag
 // Audio-enhancements switch, re-read every few seconds (cheap single-key
 // property read; never a wrong value -- Unknown when unreadable).
@@ -291,45 +321,90 @@ static void SetBandCount(int n) {
     ApplyStagingToUI();
 }
 
-// Auto-attach banner: when the Windows default render endpoint changed to a
-// device MiniEQ isn't attached to, an info banner offers a one-click attach
-// (one admin consent, then permanent). Never auto-detaches old devices. After
-// a banner-driven attach, the banner shows a "change applied, audio
-// restarted" note for ~2 min, then hides. Safe to call from the timer: the
-// note expiry is the only timer-driven change.
-static void UpdateAttachBanner() {
-    // Expire the post-attach note.
-    if (g_bannerNote && GetTickCount64() - g_bannerNoteTick >= kBannerNoteMs) {
+// Banner: one shared slot. Engine-reload states outrank the auto-attach
+// states while active. Safe to call from the 500 ms timer: note expiry is
+// the only timer-driven change.
+static void UpdateBanner() {
+    // Expire the timed notes.
+    const ULONGLONG now = GetTickCount64();
+    if (g_bannerNote && now - g_bannerNoteTick >= kBannerNoteMs) {
         g_bannerNote = false;
     }
-    bool show = false;
+    if ((g_reloadUi == ReloadUiState::DoneNote ||
+         g_reloadUi == ReloadUiState::FailedNote) &&
+        now - g_reloadNoteTick >= kBannerNoteMs) {
+        g_reloadUi = ReloadUiState::None;
+    }
+    BannerKind kind = BannerKind::None;
     wchar_t wantText[384] = {};
-    if (g_bannerNote) {
-        show = true;
+    wchar_t wantBtn[48] = {};
+    bool wantBtnVisible = false;
+    if (g_reloadUi == ReloadUiState::Pending) {
+        kind = BannerKind::ReloadPending;
+        StringCchPrintfW(wantText, ARRAYSIZE(wantText),
+            L"Update ready \u2014 waiting for audio to stop before reloading "
+            L"the engine (%s is playing).",
+            g_reloadSession.empty() ? L"an app" : g_reloadSession.c_str());
+        StringCchCopyW(wantBtn, ARRAYSIZE(wantBtn), L"Reload now");
+        wantBtnVisible = true;
+    } else if (g_reloadUi == ReloadUiState::FailedNote) {
+        kind = BannerKind::ReloadFailed;
+        StringCchPrintfW(wantText, ARRAYSIZE(wantText),
+            L"Engine reload didn\u2019t take (%s). Open Sound settings, change "
+            L"the Default Format and change it back.",
+            g_reloadDetail.empty() ? L"build still stale" : g_reloadDetail.c_str());
+        StringCchCopyW(wantBtn, ARRAYSIZE(wantBtn), L"Try again");
+        wantBtnVisible = true;
+    } else if (g_reloadUi == ReloadUiState::DoneNote) {
+        kind = BannerKind::ReloadDone;
+        StringCchPrintfW(wantText, ARRAYSIZE(wantText),
+            L"Audio engine reloaded automatically \u2014 build %s is live.",
+            g_reloadBuild.empty() ? L"?" : g_reloadBuild.c_str());
+        StringCchCopyW(wantBtn, ARRAYSIZE(wantBtn), L"View log");
+        wantBtnVisible = true;
+    } else if (g_reloadUi == ReloadUiState::Working) {
+        // The worker is mid-flip: keep the previous banner (if any) rather
+        // than flashing. The pill already shows the rebuild state.
+        kind = g_bannerKind;
+        if (kind != BannerKind::None) {
+            GetWindowTextW(g_bannerText, wantText, ARRAYSIZE(wantText));
+            GetWindowTextW(g_bannerBtn, wantBtn, ARRAYSIZE(wantBtn));
+            wantBtnVisible = IsWindowVisible(g_bannerBtn) == TRUE;
+        }
+    } else if (g_bannerNote) {
+        kind = BannerKind::AttachNote;
         StringCchCopyW(wantText, ARRAYSIZE(wantText),
-            L"Attached \u2014 change applied, audio restarted to rebuild the path.");
-        ShowWindow(g_bannerBtn, SW_HIDE);
+            L"Attached \u2014 reloading the audio path to pick up the change.");
     } else if (!g_endpointId.empty() && !g_attached &&
                !g_lastDefaultId.empty() && g_endpointId == g_lastDefaultId) {
         // The selected device IS the current system default and MiniEQ isn't
         // attached to it: this is the "new default device" case.
-        show = true;
+        kind = BannerKind::AttachOffer;
         wchar_t dev[128] = {};
         GetWindowTextW(g_deviceName, dev, ARRAYSIZE(dev));
         StringCchPrintfW(wantText, ARRAYSIZE(wantText),
             L"New default device detected. Windows switched playback to %s. "
             L"Attach MiniEQ to it? (one-time admin consent, then permanent)",
             dev[0] ? dev : L"this device");
-        ShowWindow(g_bannerBtn, SW_SHOW);
-        EnableWindow(g_bannerBtn, TRUE);
+        StringCchCopyW(wantBtn, ARRAYSIZE(wantBtn), L"Attach MiniEQ");
+        wantBtnVisible = true;
     }
+    g_bannerKind = kind;
+    const bool show = (kind != BannerKind::None);
     if (show) {
-        // Set the text only when it changed (this runs on the 500 ms timer).
+        // Set text/button only when they changed (this runs on the timer).
         wchar_t cur[384] = {};
         GetWindowTextW(g_bannerText, cur, ARRAYSIZE(cur));
         if (wcscmp(cur, wantText) != 0) {
             SetWindowTextW(g_bannerText, wantText);
         }
+        wchar_t curBtn[48] = {};
+        GetWindowTextW(g_bannerBtn, curBtn, ARRAYSIZE(curBtn));
+        if (wantBtnVisible && wcscmp(curBtn, wantBtn) != 0) {
+            SetWindowTextW(g_bannerBtn, wantBtn);
+        }
+        ShowWindow(g_bannerBtn, wantBtnVisible ? SW_SHOW : SW_HIDE);
+        EnableWindow(g_bannerBtn, TRUE);
     }
     if (show == g_bannerVisible) {
         return;
@@ -354,7 +429,77 @@ static void UpdateAttachStatus() {
     // The diagnostics pill below shows the measured path state.
     SetWindowTextW(g_status, attached ? L"Attached: linked to this device."
                                       : L"Not attached: attach once (admin).");
-    UpdateAttachBanner();
+    UpdateBanner();
+}
+
+// Engine auto-reload driver, called from the 500 ms timer via
+// UpdateDiagStatus. When the loaded APO build is stale: if audio is playing
+// the reload waits (banner offers "Reload now"); when idle it fires on its
+// own. One attempt per (endpoint, stale build) -- never a loop.
+static void SpawnReloadWorker(bool force);
+
+static void UpdateEngineReload() {
+    if (g_endpointId.empty() || !g_attached || g_reloadWorkerBusy) {
+        return;
+    }
+    // The APO must actually be loaded before a reload means anything.
+    TryOpenChannels();
+    MiniEQApoStatus st = {};
+    const bool live = g_statusLink.IsOpen() && g_statusLink.Read(&st) &&
+                      st.structSize >= sizeof(MiniEQApoStatus) && st.version >= 1;
+    if (!live) {
+        return;
+    }
+    std::wstring reported;
+    const bool stale =
+        MiniEQ_EngineBuildFreshness(g_endpointId, &reported) == BuildFreshness::Stale;
+    const std::wstring key =
+        g_endpointId + L"|" + (stale ? reported : L"fresh");
+    if (key != g_reloadKey) {
+        // New detection episode (new stale build, or the reload landed).
+        g_reloadKey = key;
+        g_reloadAttempted = false;
+        g_reloadDeferredLogged = false;
+        if (g_reloadUi != ReloadUiState::DoneNote &&
+            g_reloadUi != ReloadUiState::FailedNote) {
+            g_reloadUi = ReloadUiState::None;
+        }
+    }
+    if (!stale) {
+        return;
+    }
+    if (g_reloadUi == ReloadUiState::None && !g_reloadAttempted) {
+        // Fire exactly once per detection: after a failure the banner's
+        // "Try again" is the only way back in (manual consent), never the
+        // timer.
+        g_reloadAttempted = true;
+        MiniEQ_AppLogCat(L"ENGINE",
+            L"stale APO detected -- engine runs build %s, installed %S; auto-reload armed",
+            reported.c_str(), MiniEQ_ExpectedBuildId());
+        SpawnReloadWorker(false);
+    } else if (g_reloadUi == ReloadUiState::Pending &&
+               GetTickCount64() - g_reloadRetryTick >= kReloadRetryMs) {
+        // Still deferred: re-check whether the coast is clear now.
+        g_reloadRetryTick = GetTickCount64();
+        SpawnReloadWorker(false);
+    }
+}
+
+static void SpawnReloadWorker(bool force) {
+    if (g_reloadWorkerBusy || g_endpointId.empty() || g_hwnd == nullptr) {
+        return;
+    }
+    g_reloadWorkerBusy = true;
+    g_reloadUi = ReloadUiState::Working;
+    const std::wstring endpoint = g_endpointId;
+    const HWND hwnd = g_hwnd;
+    std::thread([endpoint, hwnd, force]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        EngineReloadOutcome* out = MiniEQ_RunReloadJob(endpoint, force);
+        CoUninitialize();
+        PostMessageW(hwnd, WM_APP_RELOAD_DONE, 0, reinterpret_cast<LPARAM>(out));
+    }).detach();
+    UpdateBanner();
 }
 
 // The APO (running in the audio engine, session 0) creates the Global\
@@ -395,16 +540,19 @@ enum {
     DIAG_REBUILD = 5,// heartbeat lost after being live: settings-driven
                      // graph rebuild, recovering on its own
     DIAG_OFF = 6,    // global MiniEQ switch off: user chose unprocessed audio
+    DIAG_STALEWAIT = 7, // update installed, engine runs a stale DLL: waiting
+                     // for audio to stop before the automatic reload
 };
 
 // The honest liveness check: the APO's worker thread publishes a heartbeat
 // (APOProcess call count) into the status mapping. A heartbeat that keeps
 // advancing means audio is REALLY being processed by our code -- no registry
 // guessing. Combined with the endpoint peak meter and the Audio Enhancements
-// switch we get six real states: idle / live / waiting / error /
-// enhancements-off / rebuilding. A settings change (enhancements, spatial
-// sound) tears the graph down and rebuilds it; that transition is amber and
-// self-healing -- never a red error, never a service restart.
+// switch we get seven live states: idle / live / waiting / error /
+// enhancements-off / rebuilding / update-pending. A settings change
+// (enhancements, spatial sound) tears the graph down and rebuilds it; that
+// transition is amber and self-healing -- never a red error, never a service
+// restart.
 static void UpdateDiagStatus() {
     int state = DIAG_IDLE;
     wchar_t text[160] = {};
@@ -423,6 +571,17 @@ static void UpdateDiagStatus() {
         // only open them, so keep retrying until the APO is up.
         TryOpenChannels();
         const ULONGLONG now = GetTickCount64();
+        // An update is installed but the engine still runs the old DLL: the
+        // auto-reload is waiting for playback to stop. This outranks the
+        // live/waiting states -- it is the most useful thing to say.
+        if (g_reloadUi == ReloadUiState::Pending) {
+            state = DIAG_STALEWAIT;
+            StringCchCopyW(text, ARRAYSIZE(text),
+                L"\u25CF Update pending \u2014 reloads when audio stops");
+            StringCchCopyW(hint, ARRAYSIZE(hint),
+                L"MiniEQ reloads the audio path by itself once playback stops. "
+                L"Nothing is restarted; or click \u201CReload now\u201D above.");
+        } else {
         // Re-read the enhancements switch every ~3 s: immediately after a
         // settings change this is what tells "off, fix it in Settings" apart
         // from "rebuilding, wait a moment".
@@ -463,20 +622,21 @@ static void UpdateDiagStatus() {
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio engine is rebuilding \u2014 recovering\u2026");
             StringCchCopyW(hint, ARRAYSIZE(hint),
-                L"A settings change restarted the audio path; "
+                L"A settings change rebuilt the audio path; "
                 L"this clears on its own, no restart needed.");
         } else if (MiniEQ_EndpointPeakLevel(g_endpointId) > 0.001f) {
             state = DIAG_ERROR;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio is playing but NOT going through MiniEQ");
             StringCchCopyW(hint, ARRAYSIZE(hint),
-                L"Try replaying the audio. If it stays red, use "
-                L"\u201CRestart audio service\u201D, then check Diagnostics.");
+                L"Try replaying the audio. If it stays red, open Sound settings "
+                L"and flip the Default Format once, then check Diagnostics.");
         } else {
             state = DIAG_WAITING;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Waiting for audio \u2014 play something on this device");
         }
+        } // end: not a pending engine reload
     } else {
         StringCchCopyW(text, ARRAYSIZE(text),
             L"\u25CB Not attached \u2014 attach MiniEQ to this device to begin.");
@@ -485,7 +645,8 @@ static void UpdateDiagStatus() {
     if (state != g_diagState) {
         g_diagState = state;
         static const wchar_t* names[] = {
-            L"IDLE", L"LIVE", L"WAITING", L"ERROR", L"ENHOFF", L"REBUILD", L"OFF"
+            L"IDLE", L"LIVE", L"WAITING", L"ERROR", L"ENHOFF", L"REBUILD", L"OFF",
+            L"STALEWAIT"
         };
         MiniEQ_AppLog(L"path state -> %s", names[state]);
         InvalidateRect(g_pill, nullptr, TRUE);
@@ -502,34 +663,17 @@ static void UpdateDiagStatus() {
         SetWindowTextW(g_hint, hint);
     }
     ShowWindow(g_hint, hint[0] ? SW_SHOW : SW_HIDE);
-    // Each broken state gets the one action that actually fixes it:
-    // enhancements-off -> open Sound settings; genuinely broken path ->
-    // restart the audio service. Rebuilds need no button at all.
-    ShowWindow(g_btnRestart, state == DIAG_ERROR ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_btnSound, state == DIAG_ENHOFF ? SW_SHOW : SW_HIDE);
+    // The broken states get the one action that actually fixes them:
+    // enhancements-off or a bypassed path -> open Sound settings (the
+    // Default Format toggle there rebuilds the audio path). Rebuilds and
+    // pending reloads need no button at all.
+    ShowWindow(g_btnSound, (state == DIAG_ERROR || state == DIAG_ENHOFF) ? SW_SHOW : SW_HIDE);
     // Keep the global on/off flag pushed to the APO (the APO creates the
-    // channel on lock; until then this just retries the open) and let the
-    // attach banner's "change applied" note expire on the timer.
+    // channel on lock; until then this just retries the open), drive the
+    // engine auto-reload check, and let the banner notes expire on the timer.
     SyncGlobalEnabled();
-    UpdateAttachBanner();
-}
-
-static void RelaunchElevatedRestart() {
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
-    sei.lpFile = exe;
-    sei.lpParameters = L"--restart-audio";
-    sei.nShow = SW_NORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        MessageBoxW(g_hwnd, L"Elevation was cancelled.", L"MiniEQ", MB_ICONINFORMATION);
-        return;
-    }
-    MiniEQ_AppLog(L"UI: audio-service restart requested (elevated helper)");
-    // No blocking wait: the 500 ms status timer turns the pill green as soon
-    // as the APO heartbeat resumes after the restart.
+    UpdateEngineReload();
+    UpdateBanner();
 }
 
 static void SelectDevice(int index) {
@@ -615,18 +759,18 @@ static void CheckDefaultDevice() {
     if (firstSeen) {
         // Baseline at startup: RefreshDeviceList already pre-selected the
         // default; just evaluate the banner for it.
-        UpdateAttachBanner();
+        UpdateBanner();
         return;
     }
     MiniEQ_AppLog(L"default render endpoint changed; following it");
     for (size_t i = 0; i < g_devices.size(); ++i) {
         if (g_devices[i].id == def) {
             SendMessageW(g_combo, CB_SETCURSEL, (WPARAM)i, 0);
-            SelectDevice((int)i); // -> UpdateAttachStatus -> UpdateAttachBanner
+            SelectDevice((int)i); // -> UpdateAttachStatus -> UpdateBanner
             return;
         }
     }
-    UpdateAttachBanner();
+    UpdateBanner();
 }
 
 static bool DoElevatedAttach(bool attach) {
@@ -655,26 +799,16 @@ static void RelaunchElevatedAttach(bool attach) {
     }
 }
 
-// Banner-driven attach: after the one-click attach, chain the audio-service
-// restart (exactly like the checklist one-click fixes) so the fresh
-// registration takes effect now instead of at the next reboot. No MessageBox
-// on cancellation -- the banner simply stays.
-static void ChainAudioRestartForBanner() {
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
-    sei.lpFile = exe;
-    sei.lpParameters = L"--restart-audio";
-    sei.nShow = SW_NORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        MiniEQ_AppLog(L"UI: banner chained audio restart cancelled");
-        return;
-    }
+// Banner-driven attach: after the one-click attach, the fresh SFX
+// registration needs the engine to rebuild the graph once. Chain the same
+// format-flip reload the auto path uses: no services, no extra UAC beyond
+// the attach itself. No MessageBox -- the banner reports the outcome.
+static void ChainReloadForBanner() {
     g_bannerNote = true;
     g_bannerNoteTick = GetTickCount64();
-    MiniEQ_AppLog(L"UI: banner attach chained audio-service restart");
+    MiniEQ_AppLogCat(L"ENGINE",
+        L"banner attach: reloading the audio path so the new registration takes effect");
+    SpawnReloadWorker(/*force=*/true);
 }
 
 //------------------------------------------------------------------------------
@@ -718,7 +852,7 @@ static void BuildControls(HWND hwnd) {
 
     // Auto-attach banner: shown when the Windows default render endpoint
     // changed to a device MiniEQ isn't attached to (see
-    // UpdateAttachBanner). Hidden otherwise; pushes the content below down
+    // UpdateBanner). Hidden otherwise; pushes the content below down
     // via LayoutContent().
     g_bannerText = CreateWindowW(L"STATIC", L"", WS_CHILD | SS_LEFT,
                                  12, 108, 340, 36, hwnd, (HMENU)IDC_BANNERTEXT,
@@ -753,14 +887,9 @@ static void BuildControls(HWND hwnd) {
                              12, 168, 120, 26, hwnd, (HMENU)IDC_DIAG_LOG,
                              g_hInst, nullptr);
     applyFont(g_btnLog);
-    // Hidden until the error state needs it (see UpdateDiagStatus).
-    g_btnRestart = CreateWindowW(L"BUTTON", L"Restart audio service",
-                                 WS_CHILD | BS_PUSHBUTTON,
-                                 140, 168, 170, 26, hwnd,
-                                 (HMENU)IDC_DIAG_RESTART, g_hInst, nullptr);
-    applyFont(g_btnRestart);
-    // Same slot: shown instead when Audio Enhancements are off -- the one
-    // action that actually fixes that state.
+    // Shown only when Audio Enhancements are off or the path is bypassed --
+    // Sound settings is where the fix lives (the Default Format toggle
+    // there rebuilds the audio path).
     g_btnSound = CreateWindowW(L"BUTTON", L"Open Sound settings",
                                WS_CHILD | BS_PUSHBUTTON,
                                140, 168, 170, 26, hwnd,
@@ -858,7 +987,6 @@ static void LayoutContent() {
     place(g_power, 348, 108, 120, 24);
     place(g_hint, 12, 134, 456, 30);
     place(g_btnLog, 12, 168, 120, 26);
-    place(g_btnRestart, 140, 168, 170, 26);
     place(g_btnSound, 140, 168, 170, 26);
     place(g_btnDiagCenter, 378, 168, 90, 26);
     // Band sliders are dynamic; recover their x/width and set the shifted y.
@@ -929,15 +1057,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         BuildControls(hwnd);
         {
             // Pill background brushes, one per path state (see WM_CTLCOLORSTATIC).
-            static const COLORREF bgc[7] = {
+            static const COLORREF bgc[8] = {
                 RGB(240, 240, 240), RGB(233, 247, 238),
                 RGB(255, 248, 232), RGB(253, 238, 238),
                 RGB(253, 238, 238), RGB(255, 248, 232),
-                RGB(235, 235, 235)
+                RGB(235, 235, 235), RGB(255, 248, 232)
             };
-            for (int i = 0; i < 7; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 g_diagBrush[i] = CreateSolidBrush(bgc[i]);
             }
+            // Banner tints for the engine-reload states.
+            g_bannerOkBrush = CreateSolidBrush(RGB(233, 247, 238));
+            g_bannerWarnBrush = CreateSolidBrush(RGB(255, 248, 232));
         }
         RefreshDeviceList();
         ApplyStagingToUI(); // builds the band sliders if no device was selected
@@ -961,23 +1092,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_CTLCOLORSTATIC: {
         // The diagnostics pill is color-coded by path state.
-        if ((HWND)lParam == g_pill && g_diagState >= 0 && g_diagState <= 6) {
-            static const COLORREF bg[7] = {
+        if ((HWND)lParam == g_pill && g_diagState >= 0 && g_diagState <= 7) {
+            static const COLORREF bg[8] = {
                 RGB(240, 240, 240), RGB(233, 247, 238),
                 RGB(255, 248, 232), RGB(253, 238, 238),
                 RGB(253, 238, 238), RGB(255, 248, 232),
-                RGB(235, 235, 235)
+                RGB(235, 235, 235), RGB(255, 248, 232)
             };
-            static const COLORREF fg[7] = {
+            static const COLORREF fg[8] = {
                 RGB(85, 85, 85), RGB(20, 83, 45),
                 RGB(122, 91, 0), RGB(143, 29, 29),
                 RGB(143, 29, 29), RGB(122, 91, 0),
-                RGB(110, 110, 110)
+                RGB(110, 110, 110), RGB(122, 91, 0)
             };
             HDC hdc = (HDC)wParam;
             SetBkColor(hdc, bg[g_diagState]);
             SetTextColor(hdc, fg[g_diagState]);
             return (LRESULT)g_diagBrush[g_diagState];
+        }
+        // The banner tints green/amber for the engine-reload states, so the
+        // outcome reads at a glance. Plain otherwise.
+        if ((HWND)lParam == g_bannerText) {
+            HDC hdc = (HDC)wParam;
+            if (g_bannerKind == BannerKind::ReloadDone && g_bannerOkBrush != nullptr) {
+                SetBkColor(hdc, RGB(233, 247, 238));
+                SetTextColor(hdc, RGB(20, 83, 45));
+                return (LRESULT)g_bannerOkBrush;
+            }
+            if ((g_bannerKind == BannerKind::ReloadPending ||
+                 g_bannerKind == BannerKind::ReloadFailed) &&
+                g_bannerWarnBrush != nullptr) {
+                SetBkColor(hdc, RGB(255, 248, 232));
+                SetTextColor(hdc, RGB(122, 91, 0));
+                return (LRESULT)g_bannerWarnBrush;
+            }
+            break;
         }
         // The hint line: quiet gray on the window background.
         if ((HWND)lParam == g_hint) {
@@ -1015,20 +1164,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ApplyPowerUI();
             UpdateDiagStatus();
         } else if (id == IDC_BANNERBTN) {
-            // One-click attach for the new default device: elevated attach,
-            // then chain the audio-service restart so the fresh registration
-            // takes effect now (exactly like the checklist one-click fixes).
-            if (!g_endpointId.empty() && !g_attached) {
-                MiniEQ_AppLog(L"UI: attach banner accepted for new default device");
-                if (DoElevatedAttach(true)) {
-                    ChainAudioRestartForBanner();
+            // The banner button's meaning follows the banner kind.
+            switch (g_bannerKind) {
+            case BannerKind::AttachOffer: {
+                // One-click attach for the new default device: elevated
+                // attach, then chain the format-flip reload so the fresh
+                // registration takes effect now.
+                if (!g_endpointId.empty() && !g_attached) {
+                    MiniEQ_AppLog(L"UI: attach banner accepted for new default device");
+                    if (DoElevatedAttach(true)) {
+                        ChainReloadForBanner();
+                    }
+                    UpdateAttachStatus(); // re-evaluates the banner (note or hide)
                 }
-                UpdateAttachStatus(); // re-evaluates the banner (note or hide)
+                break;
+            }
+            case BannerKind::ReloadPending:
+                // "Reload now": explicit consent, flip even with audio playing.
+                MiniEQ_AppLogCat(L"ENGINE", L"manual reload requested from banner");
+                g_reloadDeferredLogged = true; // the manual run supersedes the wait
+                SpawnReloadWorker(/*force=*/true);
+                break;
+            case BannerKind::ReloadFailed:
+                MiniEQ_AppLogCat(L"ENGINE", L"reload retry requested from banner");
+                SpawnReloadWorker(/*force=*/false);
+                break;
+            case BannerKind::ReloadDone:
+                MiniEQ_ShowLogViewer(g_hInst, g_hwnd);
+                break;
+            default:
+                break;
             }
         } else if (id == IDC_DIAG_LOG) {
             MiniEQ_ShowLogViewer(g_hInst, g_hwnd);
-        } else if (id == IDC_DIAG_RESTART) {
-            RelaunchElevatedRestart();
         } else if (id == IDC_DIAG_SOUND) {
             // Audio Enhancements live under Settings -> System -> Sound ->
             // [device]. Land the user on the Sound page; the hint line under
@@ -1065,6 +1233,77 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_APP_RELOAD_DONE: {
+        // A reload worker finished (lParam owns an EngineReloadOutcome*).
+        EngineReloadOutcome* out =
+            reinterpret_cast<EngineReloadOutcome*>(lParam);
+        g_reloadWorkerBusy = false;
+        if (out == nullptr) {
+            break;
+        }
+        // The user may have switched devices mid-reload: a stale outcome
+        // must not paint the new device's banner. The flip itself is
+        // harmless (it always restores the format), so just log and drop.
+        if (out->endpoint != g_endpointId) {
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"reload outcome for a deselected device arrived late; ignored");
+            delete out;
+            break;
+        }
+        switch (out->result) {
+        case EngineReloadResult::UpToDate:
+            g_reloadUi = ReloadUiState::None;
+            break;
+        case EngineReloadResult::Deferred:
+            g_reloadUi = ReloadUiState::Pending;
+            g_reloadSession = out->activeSession;
+            g_reloadRetryTick = GetTickCount64();
+            if (!g_reloadDeferredLogged) {
+                g_reloadDeferredLogged = true;
+                MiniEQ_AppLogCat(L"ENGINE",
+                    L"auto-reload deferred -- active session \"%s\"; "
+                    L"waiting for audio to stop (banner shown)",
+                    out->activeSession.c_str());
+            }
+            break;
+        case EngineReloadResult::Reloaded: {
+            g_reloadUi = ReloadUiState::DoneNote;
+            g_reloadNoteTick = GetTickCount64();
+            // The banner names the build that is live NOW (the installed
+            // one), not the stale build it replaced.
+            wchar_t live[16] = {};
+            size_t conv = 0;
+            mbstowcs_s(&conv, live, ARRAYSIZE(live),
+                       MiniEQ_ExpectedBuildId(), _TRUNCATE);
+            g_reloadBuild = live;
+            g_bannerNote = false; // the reload banner supersedes the attach note
+            // Mark this build as seen so the timer doesn't re-arm.
+            g_reloadKey = g_endpointId + L"|fresh";
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"auto-reload verified -- engine now runs build %S (was %s)",
+                MiniEQ_ExpectedBuildId(), out->reportedBuild.c_str());
+            break;
+        }
+        case EngineReloadResult::Failed:
+            g_reloadUi = ReloadUiState::FailedNote;
+            g_reloadNoteTick = GetTickCount64();
+            g_reloadDetail = out->detail;
+            MiniEQ_AppLogCat(L"ENGINE", L"auto-reload FAILED -- %s",
+                             out->detail.c_str());
+            break;
+        case EngineReloadResult::FlipError:
+            g_reloadUi = ReloadUiState::FailedNote;
+            g_reloadNoteTick = GetTickCount64();
+            g_reloadDetail = out->detail;
+            MiniEQ_AppLogCat(L"ENGINE", L"auto-reload could not flip the format -- %s",
+                             out->detail.c_str());
+            break;
+        }
+        delete out;
+        UpdateDiagStatus(); // pill + banner reflect the outcome immediately
+        break;
+    }
+
     case WM_DEVICECHANGE:
         // Aux / USB-C / Bluetooth (un)plugged while the app is open: re-list
         // endpoints and keep the current selection when it is still present.
@@ -1079,11 +1318,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_DIAG);
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             if (g_diagBrush[i] != nullptr) {
                 DeleteObject(g_diagBrush[i]);
                 g_diagBrush[i] = nullptr;
             }
+        }
+        if (g_bannerOkBrush != nullptr) {
+            DeleteObject(g_bannerOkBrush);
+            g_bannerOkBrush = nullptr;
+        }
+        if (g_bannerWarnBrush != nullptr) {
+            DeleteObject(g_bannerWarnBrush);
+            g_bannerWarnBrush = nullptr;
         }
         PostQuitMessage(0);
         return 0;
@@ -1096,15 +1343,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 //------------------------------------------------------------------------------
 
 static int RunElevatedHelper(LPWSTR* argv, int argc) {
-    // argv: [exe, --restart-audio] or [exe, --attach|--detach, <endpoint-id>]
-    if (argc >= 2 && _wcsicmp(argv[1], L"--restart-audio") == 0) {
-        const bool ok = MiniEQ_RestartAudioService();
-        MessageBoxW(nullptr,
-                    ok ? L"Windows Audio restarted.\nPlay something on the device: the status pill turns green when audio passes through MiniEQ."
-                       : L"Could not restart Windows Audio.\nOpen \"View live log\" for details.",
-                    L"MiniEQ", MB_ICONINFORMATION);
-        return ok ? 0 : 1;
-    }
+    // argv: [exe, --attach|--detach, <endpoint-id>]
     if (argc < 3) {
         return 1;
     }
@@ -1113,7 +1352,7 @@ static int RunElevatedHelper(LPWSTR* argv, int argc) {
                         : MiniEQ_DetachFromEndpoint(argv[2]);
     if (SUCCEEDED(hr)) {
         MessageBoxW(nullptr,
-                    attach ? L"MiniEQ is now attached to this device.\nYou may need to restart audio playback."
+                    attach ? L"MiniEQ is now attached to this device.\nReplay audio on the device to pick it up."
                            : L"MiniEQ has been detached from this device.",
                     L"MiniEQ", MB_ICONINFORMATION);
         return 0;

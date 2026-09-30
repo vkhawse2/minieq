@@ -69,7 +69,13 @@ typedef struct EqSettings {
 // APO -> UI heartbeat. Written by the APO's background worker thread; read by
 // the UI on a timer. processCalls advancing means APOProcess is really being
 // called by the engine -- the ground truth for "EQ is live".
-#define MINIEQ_STATUS_VERSION 1
+//
+// Version history:
+//   1: original fields.
+//   2: added buildId (repurposed the trailing reserved bytes, so the struct
+//      size is unchanged): the APO stamps the build it was compiled from,
+//      letting the UI tell a stale loaded DLL apart from the installed one.
+#define MINIEQ_STATUS_VERSION 2
 
 typedef struct MiniEQApoStatus {
     uint32_t structSize;             // sizeof(MiniEQApoStatus): versioning
@@ -81,7 +87,7 @@ typedef struct MiniEQApoStatus {
     volatile int32_t channels;       // locked format channel count
     volatile int32_t sampleRate;     // locked format sample rate
     volatile int32_t initOk;         // Initialize succeeded
-    volatile int32_t _reserved[4];
+    char             buildId[16];    // APO build id (short commit SHA), NUL-terminated
 } MiniEQApoStatus;
 
 // "MiniEQ_{sanitized-endpoint-id}" -- caller supplies a buffer.

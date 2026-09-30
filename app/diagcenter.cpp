@@ -857,8 +857,8 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
             v.detail = L"Audio is flowing on the endpoint, but no processing "
                        L"heartbeat is coming back from our APO.";
         }
-        v.nextStep = L"Use \"Restart audio service\" in the main window, then replay. "
-                     L"If it stays red, copy this report and send it over.";
+        v.nextStep = L"Open Sound settings and flip the device's Default Format once, "
+                     L"then replay. If it stays red, copy this report and send it over.";
         return v;
     }
     v.severity = DiagSeverity::Neutral;

@@ -10,11 +10,13 @@
 #include "diagcenter.h"
 #include "diag.h"
 #include "settings_link.h"
+#include "engine_reload.h"
 
 #include <windows.h>
 #include <strsafe.h>
 
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -75,11 +77,11 @@ bool      s_enhFixFailed = false;
 // What a one-click fix reports on its row afterwards. Switching: the WinRT
 // worker is running. Watching: the live write went through and we're
 // waiting for the heartbeat to prove the graph rebuilt. AppliedLive: it
-// did -- no restart needed. Restarted: the live path didn't heal in time,
-// so we chained the elevated service restart. The note shows for ~2
-// minutes, on the fixed row only (s_fixNoteRow: 3 = enhancements,
+// did -- no reload needed. Reloaded: the live path didn't heal in time, so
+// we chained the format-flip engine reload (no services). The note shows for
+// ~2 minutes, on the fixed row only (s_fixNoteRow: 3 = enhancements,
 // 4 = spatial).
-enum class FixNote { None, Switching, Watching, AppliedLive, Restarted };
+enum class FixNote { None, Switching, Watching, AppliedLive, Reloaded };
 FixNote   s_fixNote = FixNote::None;
 int       s_fixNoteRow = -1;
 ULONGLONG s_fixNoteTick = 0;
@@ -91,28 +93,23 @@ static constexpr ULONGLONG kFixNoteMs = 120000;
 // After a one-click property fix the engine can keep the old graph for
 // already-running streams: a raw property write doesn't invalidate it.
 // (The Settings app routes through the audio service, which is why its own
-// toggles apply live.) Chain the same elevated service restart the main
-// window offers, so the fix takes effect without hunting for the button.
-// UAC is the consent; cancelling it clears the note, never loops.
-static void ChainAudioRestart(int row) {
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.hwnd = s_hDlg;
-    sei.lpVerb = L"runas";
-    sei.lpFile = exe;
-    sei.lpParameters = L"--restart-audio";
-    sei.nShow = SW_NORMAL;
-    if (!ShellExecuteExW(&sei)) {
-        MiniEQ_AppLogCat(L"UI", L"checklist chained restart: elevation cancelled");
-        s_fixNote = FixNote::None;
-        s_fixNoteRow = -1;
-        return;
-    }
-    s_fixNote = FixNote::Restarted;
+// toggles apply live.) Chain the same format-flip engine reload the main
+// window uses: no services, no UAC. Runs on a worker thread; the row note
+// below is informational only.
+static void ChainReloadFlip(int row) {
+    s_fixNote = FixNote::Reloaded;
     s_fixNoteRow = row;
     s_fixNoteTick = GetTickCount64();
-    MiniEQ_AppLogCat(L"UI", L"checklist chained audio-service restart after fix");
+    const std::wstring endpoint = s_endpoint;
+    std::thread([endpoint]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::wstring detail;
+        const bool ok = MiniEQ_FlipDefaultFormat(endpoint, &detail);
+        CoUninitialize();
+        MiniEQ_AppLogCat(L"ENGINE",
+            ok ? L"checklist fix: audio path reloaded via format flip"
+               : L"checklist fix: format flip failed (%s)", detail.c_str());
+    }).detach();
 }
 
 // Marks the start of the live-apply watch: the WinRT switch completed, now
@@ -248,12 +245,12 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 
     // 4 -- Audio Enhancements switch.
     s_rows[3].title = L"Audio enhancements";
-    const bool enhNote = s_fixNoteRow == 3 && s_fixNote == FixNote::Restarted &&
+    const bool enhNote = s_fixNoteRow == 3 && s_fixNote == FixNote::Reloaded &&
         (GetTickCount64() - s_fixNoteTick < kFixNoteMs);
     if (snap.enhancements == DiagEnhancements::On) {
         s_rows[3].state = CheckState::Ok;
         s_rows[3].detail = enhNote
-            ? L"Device Default Effects \u2014 change applied, audio restarted to rebuild the path."
+            ? L"Device Default Effects \u2014 change applied, path reloaded (format flip)."
             : L"Device Default Effects \u2014 system effects are allowed.";
     } else if (snap.enhancements == DiagEnhancements::Off) {
         s_rows[3].state = CheckState::Error;
@@ -284,7 +281,7 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
     s_rows[4].title = L"Spatial sound";
     const bool spatNote = s_fixNoteRow == 4 &&
         (s_fixNote == FixNote::Watching || s_fixNote == FixNote::AppliedLive ||
-         s_fixNote == FixNote::Restarted) &&
+         s_fixNote == FixNote::Reloaded) &&
         (GetTickCount64() - s_fixNoteTick < kFixNoteMs);
     if (spatial.state == DiagSpatial::Off) {
         s_rows[4].state = CheckState::Ok;
@@ -294,10 +291,10 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
                 s_rows[4].detail = L"Off \u2014 change applied, waiting for the audio path to rebuild\u2026";
                 break;
             case FixNote::AppliedLive:
-                s_rows[4].detail = L"Off \u2014 change applied live, no restart needed.";
+                s_rows[4].detail = L"Off \u2014 change applied live, no reload needed.";
                 break;
-            case FixNote::Restarted:
-                s_rows[4].detail = L"Off \u2014 change applied, audio restarted to rebuild the path.";
+            case FixNote::Reloaded:
+                s_rows[4].detail = L"Off \u2014 change applied, path reloaded (format flip).";
                 break;
             default:
                 s_rows[4].detail = L"Off.";
@@ -726,13 +723,13 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RefreshChecklist();
             // Live-apply watch: after the WinRT switch the APO heartbeat
             // has to prove the running graph picked it up. If it heals on
-            // its own -- the Dolby-level path -- no restart is needed.
+            // its own -- the Dolby-level path -- no reload is needed.
             if (s_fixNote == FixNote::Watching && s_fixNoteRow >= 0 &&
                 s_fixNoteRow < kRows) {
                 // "Applied live" needs both halves of the proof: the
                 // endpoint reads back as spatial Off (the switch really
                 // took) and the heartbeat is advancing (the running graph
-                // picked it up with no restart).
+                // picked it up with no reload).
                 if (s_rows[4].state == CheckState::Ok &&
                     s_rows[7].state == CheckState::Ok) {
                     s_fixNote = FixNote::AppliedLive;
@@ -742,13 +739,13 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else if (GetTickCount64() - s_fixNoteTick >= kFixWatchMs) {
                     if (s_rows[6].state == CheckState::Ok) {
                         // Audio is playing but the old graph is still
-                        // alive: fall back to the chained restart.
-                        MiniEQ_AppLogCat(L"UI", L"checklist live fix timed out with audio playing, chaining restart");
-                        ChainAudioRestart(s_fixNoteRow);
+                        // alive: fall back to the chained format flip.
+                        MiniEQ_AppLogCat(L"ENGINE", L"checklist live fix timed out with audio playing, chaining reload");
+                        ChainReloadFlip(s_fixNoteRow);
                     } else {
                         // Nothing playing: nothing to heal, the change is
                         // in place for the next stream.
-                        MiniEQ_AppLogCat(L"UI", L"checklist fix applied while idle, no restart needed");
+                        MiniEQ_AppLogCat(L"ENGINE", L"checklist fix applied while idle, no reload needed");
                         s_fixNote = FixNote::AppliedLive;
                         s_fixNoteTick = GetTickCount64();
                     }
@@ -774,9 +771,9 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // One-click fix, Dolby-level: switch spatial off through the
             // public WinRT API -- the Sound settings page's own channel --
             // on a worker thread, so the audio service rebuilds the running
-            // graph immediately with no restart. The heartbeat watch
-            // confirms the path healed; if the WinRT call fails we fall
-            // back to the direct write plus a chained service restart.
+            // graph immediately with no service restart at all. The heartbeat
+            // watch confirms the path healed; if the WinRT call fails we
+            // fall back to the direct write plus a chained format flip.
             s_spatialFixFailed = false;
             s_fixNote = FixNote::Switching;
             s_fixNoteRow = 4;
@@ -798,7 +795,7 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
                 s_spatialFixFailed = !ok;
                 if (ok) {
-                    ChainAudioRestart(4);
+                    ChainReloadFlip(4);
                 }
             }
             RefreshChecklist();
@@ -806,14 +803,15 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case IDC_CL_ENHFIX: {
             // One-click fix: switch enhancements back to device defaults
-            // so the SysFx chain (MiniEQ's SFX APO) runs again, then
-            // restart the audio engine so the change takes effect now.
+            // so the SysFx chain (MiniEQ's SFX APO) runs again, then flip
+            // the format so the engine rebuilds the graph and the change
+            // takes effect now.
             const bool ok = MiniEQ_SetAudioEnhancements(s_endpoint, true);
             s_enhFixFailed = !ok;
             MiniEQ_AppLogCat(L"UI", ok ? L"audio enhancements turned on from checklist"
                                        : L"checklist enhancements turn-on failed");
             if (ok) {
-                ChainAudioRestart(3);
+                ChainReloadFlip(3);
             }
             RefreshChecklist();
             return 0;
@@ -827,11 +825,11 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 MiniEQ_AppLogCat(L"UI", L"spatial turn-off: WinRT switch completed, watching path");
                 BeginFixWatch(4);
             } else {
-                MiniEQ_AppLogCat(L"UI", L"spatial turn-off: WinRT failed, direct write + restart");
+                MiniEQ_AppLogCat(L"UI", L"spatial turn-off: WinRT failed, direct write + reload");
                 const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
                 s_spatialFixFailed = !ok;
                 if (ok) {
-                    ChainAudioRestart(4);
+                    ChainReloadFlip(4);
                 } else {
                     s_fixNote = FixNote::None;
                     s_fixNoteRow = -1;

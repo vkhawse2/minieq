@@ -4,8 +4,6 @@
 //  - MiniEQ_DiagLogPath / MiniEQ_AppLog: the trace file the APO writes to,
 //    plus the app's own timestamped lines in the same timeline.
 //  - MiniEQ_EndpointPeakLevel: is any audio flowing on an endpoint right now?
-//  - MiniEQ_RestartAudioService: one-click fix for the broken path (runs in
-//    the ELEVATED helper -- it stops/starts Audiosrv and its dependents).
 //  - MiniEQ_ShowLogViewer: modeless window tailing the live log.
 
 #pragma once
@@ -33,10 +31,6 @@ void MiniEQ_AppLogCat(const wchar_t* category, const wchar_t* fmt, ...);
 // Peak level (0..1) of the given render endpoint right now, or < 0 on error.
 // Used to tell "no audio playing" apart from "audio bypassing the APO".
 float MiniEQ_EndpointPeakLevel(const std::wstring& endpointId);
-
-// Restart the Windows Audio service and its active dependents (the same dance
-// as `Restart-Service Audiosrv -Force`). Must run elevated.
-bool MiniEQ_RestartAudioService();
 
 // Show (or raise) the modeless live-log viewer.
 void MiniEQ_ShowLogViewer(HINSTANCE hInst, HWND hParent);

@@ -13,7 +13,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure (CMake, x64, VS2022)
-        run: cmake -S . -B build -A x64
+        run: |
+          # Stamp the short commit SHA into both binaries so the UI can tell
+          # whether the audio engine is running a stale APO DLL.
+          $sha = $env:GITHUB_SHA.Substring(0, 8)
+          cmake -S . -B build -A x64 "-DMINIEQ_BUILD_ID=$sha"
 
       - name: Build (Release)
         run: cmake --build build --config Release

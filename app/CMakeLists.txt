@@ -12,6 +12,8 @@ add_executable(MiniEQ WIN32
     diagcenter.h
     checklist.cpp
     checklist.h
+    engine_reload.cpp
+    engine_reload.h
     # Reused as-is: endpoint attach/detach registry writes.
     ../apo/registration.cpp
     ../apo/registration.h
@@ -31,3 +33,6 @@ target_include_directories(MiniEQ PRIVATE
 # shell32: SHGetFolderPathW + elevated relaunch. runtimeobject: WinRT
 # (RoGetActivationFactory / HSTRING) for the live spatial-sound switch.
 target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 runtimeobject)
+
+# Build id the UI expects the loaded APO to report (see root CMakeLists).
+target_compile_definitions(MiniEQ PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")

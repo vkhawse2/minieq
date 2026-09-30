@@ -20,6 +20,17 @@
 #include <sddl.h>      // ConvertStringSecurityDescriptorToSecurityDescriptorW
 #include <xmmintrin.h> // _mm_getcsr/_mm_setcsr: FTZ|DAZ denormal safety on RT threads
 
+// Build id stamped into the APO status channel so the UI can tell a stale
+// loaded DLL apart from the installed one. CI passes the short commit SHA
+// via -DMINIEQ_BUILD_ID; local builds get "dev".
+static const char* MiniEQ_ApoBuildId() {
+#ifdef MINIEQ_BUILD_ID
+    return MINIEQ_BUILD_ID;
+#else
+    return "dev";
+#endif
+}
+
 // PKEY_AudioEndpoint_GUID = {[1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E}, 4}.
 // functiondiscoverykeys_devpkey.h only *declares* this key -- no import
 // lib provides the definition, so referencing it is a link error
@@ -680,13 +691,15 @@ void CEqApo::CreateStatusMapping() {
         return;
     }
     MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(v);
-    if (fresh) {
-        // We created it: initialize the header. On adopt, another live
-        // instance owns the counters -- the worker republishes the live
-        // fields below on every step, so leave its header alone.
-        memset(st, 0, sizeof(*st));
+    if (fresh || st->version < MINIEQ_STATUS_VERSION) {
+        // We created it, or a newer build is adopting a channel left behind
+        // by an older one: (re)initialize the header. On a same-version
+        // adopt, another live instance owns the counters -- the worker
+        // republishes the live fields below on every step, so leave its
+        // header alone. Never memset on adopt: that would wipe live counters.
         st->structSize = sizeof(MiniEQApoStatus);
         st->version = MINIEQ_STATUS_VERSION;
+        StringCchCopyA(st->buildId, ARRAYSIZE(st->buildId), MiniEQ_ApoBuildId());
     }
     LARGE_INTEGER freq;
     if (QueryPerformanceFrequency(&freq)) {
@@ -711,6 +724,9 @@ void CEqApo::PublishStatus() {
     m_pStatus->channels = (int32_t)m_channels;
     m_pStatus->sampleRate = (int32_t)m_sampleRate;
     m_pStatus->initOk = m_initialized ? 1 : 0;
+    // Idempotent per instance: keeps the build stamp correct even when this
+    // instance adopted a channel created by an older build.
+    StringCchCopyA(m_pStatus->buildId, ARRAYSIZE(m_pStatus->buildId), MiniEQ_ApoBuildId());
 }
 
 void CEqApo::CloseStatusMapping() {
