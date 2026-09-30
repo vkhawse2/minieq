@@ -402,9 +402,15 @@ try {
 // suggestions. Built in-house instead of calling the SDK's
 // CreateAudioMediaTypeFromUncompressedAudioFormat: that symbol does not
 // resolve against AudioEng.lib on current SDKs (LNK2019 on CI), while a
-// hand-rolled type has zero link dependencies. The engine only ever calls
-// GetAudioFormat (and occasionally IsEqual) on the object returned with
-// S_FALSE, then re-proposes the format it read back.
+// hand-rolled type has zero link dependencies. Method signatures below are
+// the exact ones from the SDK header (verified against the CI compiler's
+// C2259 "is abstract" notes):
+//   HRESULT IsCompressedFormat(BOOL*);
+//   HRESULT IsEqual(IAudioMediaType*, DWORD*);
+//   HRESULT GetUncompressedAudioFormat(UNCOMPRESSEDAUDIOFORMAT*);
+//   const WAVEFORMATEX* GetAudioFormat();
+// The engine only ever reads the suggested format back (GetAudioFormat /
+// GetUncompressedAudioFormat) before re-proposing it.
 class CMiniEQMediaType : public IAudioMediaType {
 public:
     explicit CMiniEQMediaType(const WAVEFORMATEXTENSIBLE& format)
@@ -437,51 +443,66 @@ public:
     }
 
     // IAudioMediaType
-    STDMETHODIMP_(BOOL) IsCompressedFormat(GUID subFormat) override {
-        // Our suggested format is always IEEE float: only that subtype
-        // counts as uncompressed.
-        return (subFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? FALSE : TRUE;
+    STDMETHODIMP IsCompressedFormat(BOOL* pIsCompressed) override {
+        if (pIsCompressed == nullptr) {
+            return E_POINTER;
+        }
+        // Our suggested format is always IEEE float: never compressed.
+        *pIsCompressed = FALSE;
+        return S_OK;
     }
-    STDMETHODIMP_(BOOL) IsEqual(IAudioMediaType* pOther,
-                                IAudioMediaType** ppOut) override {
-        if (ppOut != nullptr) {
-            *ppOut = nullptr;
+    STDMETHODIMP IsEqual(IAudioMediaType* pOther, DWORD* pEqual) override {
+        if (pEqual == nullptr) {
+            return E_POINTER;
         }
+        *pEqual = 0;
         if (pOther == nullptr) {
-            return FALSE;
+            return E_INVALIDARG;
         }
-        WAVEFORMATEXTENSIBLE other = {};
-        if (FAILED(pOther->GetAudioFormat(
-                reinterpret_cast<WAVEFORMATEX*>(&other)))) {
-            return FALSE;
+        const WAVEFORMATEX* b = pOther->GetAudioFormat();
+        if (b == nullptr) {
+            return S_OK; // *pEqual already 0: not equal
         }
         const WAVEFORMATEX& a = m_format.Format;
-        const WAVEFORMATEX& b = other.Format;
-        if (a.wFormatTag != b.wFormatTag ||
-            a.nChannels != b.nChannels ||
-            a.nSamplesPerSec != b.nSamplesPerSec ||
-            a.wBitsPerSample != b.wBitsPerSample) {
-            return FALSE;
+        if (a.wFormatTag != b->wFormatTag ||
+            a.nChannels != b->nChannels ||
+            a.nSamplesPerSec != b->nSamplesPerSec ||
+            a.wBitsPerSample != b->wBitsPerSample) {
+            return S_OK;
         }
         if (a.wFormatTag == WAVE_FORMAT_EXTENSIBLE ||
-            b.wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-            if (m_format.dwChannelMask != other.dwChannelMask) {
-                return FALSE;
+            b->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            const WAVEFORMATEXTENSIBLE* be =
+                (b->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                 b->cbSize >= 22)
+                    ? reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(b)
+                    : nullptr;
+            const DWORD maskB = (be != nullptr) ? be->dwChannelMask : 0;
+            if (m_format.dwChannelMask != maskB) {
+                return S_OK;
             }
         }
-        return TRUE;
+        *pEqual = 1;
+        return S_OK;
     }
-    STDMETHODIMP GetAudioFormat(WAVEFORMATEX* pFormat) override {
+    STDMETHODIMP GetUncompressedAudioFormat(
+        UNCOMPRESSEDAUDIOFORMAT* pFormat) override {
         if (pFormat == nullptr) {
             return E_POINTER;
         }
-        // The engine always passes a WAVEFORMATEXTENSIBLE-sized buffer here:
-        // engine media types are built from UNCOMPRESSEDAUDIOFORMAT, which
-        // carries a channel mask that can only round-trip through the
-        // extensible tail -- so the engine's own consumer code must already
-        // provide room for it.
-        memcpy(pFormat, &m_format, sizeof(m_format));
+        pFormat->guidFormatType = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        pFormat->dwSamplesPerFrame = m_format.Format.nChannels;
+        pFormat->dwBytesPerSampleContainer = 4;
+        pFormat->dwValidBitsPerSample = 32;
+        pFormat->fFramesPerSecond =
+            static_cast<FLOAT32>(m_format.Format.nSamplesPerSec);
+        pFormat->dwChannelMask = m_format.dwChannelMask;
         return S_OK;
+    }
+    STDMETHODIMP_(const WAVEFORMATEX*) GetAudioFormat() override {
+        // Returned pointer stays valid as long as this object is alive;
+        // the engine only reads it during negotiation while holding a ref.
+        return &m_format.Format;
     }
 
 private:
