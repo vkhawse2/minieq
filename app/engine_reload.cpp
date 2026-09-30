@@ -4,14 +4,23 @@
 
 #include <audioclient.h>
 #include <audiopolicy.h>
-#include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
-#include <functiondiscoverykeys_devpkey.h> // PKEY_AudioEngine_DeviceFormat
+#include <propkey.h> // PROPERTYKEY
 #include <mmdeviceapi.h>
 #include <strsafe.h>
 
 #include <vector>
 
 #include "diag.h"
+
+// PKEY_AudioEngine_DeviceFormat = {F19F064D-082C-4E27-BC73-6882A1BB8E4C}, 0.
+// functiondiscoverykeys_devpkey.h only *declares* this key -- no import lib
+// provides the definition, so referencing it is a link error (LNK2019).
+// Define it TU-local instead (same pattern as eq_apo.cpp).
+static const PROPERTYKEY kPkeyAudioEngineDeviceFormat = {
+    { 0xF19F064D, 0x082C, 0x4E27,
+      { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } },
+    0
+};
 
 // The build this UI was compiled from; CI stamps the short commit SHA.
 #ifdef MINIEQ_BUILD_ID
@@ -151,7 +160,7 @@ bool ReadDeviceFormatBlob(IMMDevice* dev, std::vector<BYTE>* blobOut) {
     }
     PROPVARIANT v;
     PropVariantInit(&v);
-    const HRESULT hr = st->GetValue(PKEY_AudioEngine_DeviceFormat, &v);
+    const HRESULT hr = st->GetValue(kPkeyAudioEngineDeviceFormat, &v);
     st->Release();
     bool ok = false;
     if (SUCCEEDED(hr) && v.vt == VT_BLOB && v.blob.cbSize >= sizeof(WAVEFORMATEX) &&
@@ -178,7 +187,7 @@ bool WriteDeviceFormatBlob(IMMDevice* dev, const std::vector<BYTE>& blob,
     v.vt = VT_BLOB;
     v.blob.cbSize = static_cast<ULONG>(blob.size());
     v.blob.pBlobData = const_cast<BYTE*>(blob.data());
-    hr = st->SetValue(PKEY_AudioEngine_DeviceFormat, v);
+    hr = st->SetValue(kPkeyAudioEngineDeviceFormat, v);
     if (SUCCEEDED(hr)) {
         hr = st->Commit(); // harmless when the store commits on release
     }
