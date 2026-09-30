@@ -39,6 +39,7 @@ enum {
     IDC_CL_LEGEND = 450,
     IDC_CL_REFRESH,
     IDC_CL_CLOSE,
+    IDC_CL_SPATIALFIX,
 };
 
 constexpr int kRows = 8;
@@ -65,6 +66,8 @@ HWND      s_hTitle[kRows] = {};
 HWND      s_hDetail[kRows] = {};
 HWND      s_hFix[kRows] = {};
 HWND      s_hLegend = nullptr;
+HWND      s_hSpatialFix = nullptr; // one-click "Turn off" on the spatial row
+bool      s_spatialFixFailed = false;
 HFONT     s_font = nullptr;
 HFONT     s_fontBold = nullptr;
 HFONT     s_fontName = nullptr; // larger device header; freed on destroy
@@ -204,12 +207,18 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
             spatial.name.empty() ? L"A spatial mode" : spatial.name;
         s_rows[4].detail = name + L" is on \u2014 the spatial graph can starve "
                            L"MiniEQ of audio.";
-        wchar_t fix[256] = {};
-        StringCchPrintfW(fix, ARRAYSIZE(fix),
-            L"Fix: Settings \u2192 System \u2192 Sound \u2192 %s \u2192 "
-            L"Spatial sound \u2192 Off, then replay",
-            dev.c_str());
-        s_rows[4].fix = fix;
+        if (s_spatialFixFailed) {
+            s_rows[4].fix = L"Couldn't switch it automatically \u2014 turn it off "
+                            L"manually: Settings \u2192 System \u2192 Sound \u2192 "
+                            L"Spatial sound \u2192 Off, then replay";
+        } else {
+            wchar_t fix[256] = {};
+            StringCchPrintfW(fix, ARRAYSIZE(fix),
+                L"Fix: Settings \u2192 System \u2192 Sound \u2192 %s \u2192 "
+                L"Spatial sound \u2192 Off, then replay",
+                dev.c_str());
+            s_rows[4].fix = fix;
+        }
     } else {
         s_rows[4].state = CheckState::Idle;
         wchar_t detail[256] = {};
@@ -354,7 +363,14 @@ void LayoutRows() {
     }
     place(s_hSect[1], 14, 472, sectH); y += sectH + 4;
     for (int i = 3; i < 5; ++i) {
-        const int rh = RowHeight(s_rows[i]);
+        int rh = RowHeight(s_rows[i]);
+        // The spatial row (index 4) gets a one-click "Turn off" button
+        // under its fix line while spatial is On.
+        const bool showSpatialBtn =
+            (i == 4 && s_rows[i].state == CheckState::Error);
+        if (showSpatialBtn) {
+            rh += 34;
+        }
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
         int dy = y + 24;
@@ -368,6 +384,12 @@ void LayoutRows() {
                               !s_rows[i].fix.empty());
         MoveWindow(s_hFix[i], 38, dy, 448, 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
+        if (showSpatialBtn) {
+            MoveWindow(s_hSpatialFix, 38, dy + 16 + 6, 110, 26, TRUE);
+            ShowWindow(s_hSpatialFix, SW_SHOW);
+        } else if (i == 4) {
+            ShowWindow(s_hSpatialFix, SW_HIDE);
+        }
         y += rh;
     }
     place(s_hSect[2], 14, 472, sectH); y += sectH + 4;
@@ -523,6 +545,10 @@ void ClOnCreate(HWND hwnd) {
 
     makeButton(IDC_CL_REFRESH, L"Refresh");
     makeButton(IDC_CL_CLOSE, L"Close");
+    // One-click fix for the spatial-sound row: visible only while spatial
+    // is On (row 4 in Error). LayoutRows positions it.
+    s_hSpatialFix = makeButton(IDC_CL_SPATIALFIX, L"Turn off");
+    ShowWindow(s_hSpatialFix, SW_HIDE);
 
     SetTimer(hwnd, 1, 1500, nullptr);
     RefreshChecklist();
@@ -552,6 +578,16 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_CL_CLOSE:
             DestroyWindow(hwnd);
             return 0;
+        case IDC_CL_SPATIALFIX: {
+            // One-click fix: clear the endpoint's spatial mode so the
+            // SysFx chain (MiniEQ's SFX APO) is back in the graph.
+            const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
+            s_spatialFixFailed = !ok;
+            MiniEQ_AppLogCat(L"UI", ok ? L"spatial sound turned off from checklist"
+                                       : L"checklist spatial turn-off failed");
+            RefreshChecklist();
+            return 0;
+        }
         }
         break;
     case WM_CTLCOLORSTATIC: {
@@ -594,6 +630,7 @@ void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
     s_hInst = hInst;
     s_endpoint = endpointId;
     s_deviceName = deviceName;
+    s_spatialFixFailed = false;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);

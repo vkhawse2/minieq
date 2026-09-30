@@ -226,6 +226,45 @@ DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId) {
     return out;
 }
 
+bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId) {
+    if (endpointId.empty()) {
+        return false;
+    }
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId.c_str(), &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READWRITE, &pProps)) &&
+            pProps != nullptr) {
+            // Empty REG_SZ = spatial Off (mirrors what the Settings app writes
+            // when the user picks "Off"). Allocate with CoTaskMemAlloc so
+            // PropVariantClear can free it.
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            pv.vt = VT_LPWSTR;
+            pv.pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc(sizeof(wchar_t)));
+            if (pv.pwszVal != nullptr) {
+                pv.pwszVal[0] = L'\0';
+                if (SUCCEEDED(pProps->SetValue(kPkeySpatialClsid, pv)) &&
+                    SUCCEEDED(pProps->Commit())) {
+                    ok = true;
+                }
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return ok;
+}
+
 static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
     DeviceProps d;
     if (endpointId.empty()) {

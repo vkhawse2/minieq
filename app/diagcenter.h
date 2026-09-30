@@ -41,6 +41,12 @@ struct DiagSpatialInfo {
 
 DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId);
 
+// Clears the active spatial-sound mode for one endpoint (writes the Off
+// state back to the endpoint property store). Returns false when the
+// property store can't be opened for write or the commit fails -- the
+// caller should then fall back to the manual Settings path.
+bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId);
+
 // Full COM-registration path of MiniEQ_APO.dll
 // (HKCR\CLSID\{...}\InprocServer32). Empty when not registered.
 std::wstring MiniEQ_ApoDllPath();
