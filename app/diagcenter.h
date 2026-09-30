@@ -76,6 +76,11 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap);
 // The copyable plain-text report.
 std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v);
 
+// Cheap single-key read of the Audio Enhancements switch
+// (PKEY_AudioEndpoint_Disable_SysFx) for the main window's status timer.
+// Unknown = the key couldn't be read; never a wrong value.
+DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId);
+
 // Show (or raise) the modeless Diagnostics Center window.
 void MiniEQ_ShowDiagCenter(HINSTANCE hInst, HWND hParent);
 

@@ -25,13 +25,15 @@
 #include <wchar.h>
 
 // PKEY_AudioEndpoint_Disable_SysFx -- the "Audio enhancements" switch.
-// {1da5d803-dab9-4c87-aca4-7a043e02e5f0},5 (VT_BOOL; TRUE = enhancements OFF,
-// i.e. the engine skips the whole SysFx chain, MiniEQ included). Defined
-// locally rather than via the SDK header so the build doesn't depend on SDK
-// header version skew. If a future Windows changes this key, the read below
-// simply fails and the row reports "unknown" -- never a wrong value.
+// {1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5 (VT_BOOL; TRUE = enhancements OFF,
+// i.e. the engine skips the whole SysFx chain, MiniEQ included). Same fmtid
+// as PKEY_AudioEndpoint_GUID (pid 4); this key is pid 5. Defined locally
+// rather than via the SDK header so the build doesn't depend on SDK header
+// version skew. If a future Windows changes this key, the read below simply
+// fails and the row reports "unknown" -- never a wrong value.
 static const PROPERTYKEY kPkeyDisableSysFx = {
-    { 0x1da5d803, 0xdab9, 0x4c87, { 0xac, 0xa4, 0x7a, 0x04, 0x3e, 0x02, 0xe5, 0xf0 } }, 5
+    { 0x1DA5D803, 0xD492, 0x4EDD, { 0x8C, 0x23, 0xE0, 0xC0, 0xFF, 0xEE, 0x7F, 0x0E } },
+    5
 };
 
 // Keep in sync with apo/guids.h (CLSID_MiniEQAPO).
@@ -123,6 +125,40 @@ struct DeviceProps {
     DiagEnhancements enhancements = DiagEnhancements::Unknown;
     bool             ok = false;
 };
+
+// Single-key read of PKEY_AudioEndpoint_Disable_SysFx for one endpoint.
+// Exported for the main window's 500 ms status path: cheap enough to poll
+// every few seconds, and it degrades to Unknown (never a wrong value) when
+// the key is missing or unreadable.
+DiagEnhancements MiniEQ_ReadEnhancements(const std::wstring& endpointId) {
+    if (endpointId.empty()) {
+        return DiagEnhancements::Unknown;
+    }
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return DiagEnhancements::Unknown;
+    }
+    DiagEnhancements out = DiagEnhancements::Unknown;
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId.c_str(), &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps != nullptr) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(pProps->GetValue(kPkeyDisableSysFx, &pv)) &&
+                pv.vt == VT_BOOL) {
+                out = pv.boolVal ? DiagEnhancements::Off : DiagEnhancements::On;
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return out;
+}
 
 static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
     DeviceProps d;

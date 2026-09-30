@@ -12,11 +12,20 @@
 
 EqDsp::EqDsp() {
     memset(m_bands, 0, sizeof(m_bands));
+    memset(m_target, 0, sizeof(m_target));
     memset(m_state, 0, sizeof(m_state));
     // Default to flat (unity) coefficients so a zeroed struct is a no-op.
     for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
         m_bands[b].b0 = 1.0f;
+        m_target[b].b0 = 1.0f;
     }
+}
+
+EqDsp::~EqDsp() {
+    ShutdownVirtualization();
+    delete[] m_scratch;
+    m_scratch = nullptr;
+    m_scratchFrames = 0;
 }
 
 void EqDsp::Configure(float sampleRateHz, uint32_t numChannels) {
@@ -28,6 +37,22 @@ void EqDsp::Configure(float sampleRateHz, uint32_t numChannels) {
     }
     m_sampleRate = sampleRateHz;
     m_channels = numChannels;
+    // Smoothing time constants from the real stream rate.
+    m_smoothAlpha = 1.0f - expf(-1.0f / (0.008f * sampleRateHz)); // ~8 ms
+    m_mixStep = 1.0f / (0.005f * sampleRateHz);                   // 5 ms
+    m_xfMixStep = 1.0f / (0.010f * sampleRateHz);                 // 10 ms
+    // Scratch buffer for the bypass dry/wet crossfade. Allocated here
+    // (LockForProcess runs on a setup thread -- never the RT thread).
+    delete[] m_scratch;
+    m_scratch = nullptr;
+    m_scratchFrames = 4096; // engine blocks are far smaller in practice
+    m_scratch = new (std::nothrow) float[(size_t)m_scratchFrames * numChannels];
+    if (m_scratch == nullptr) {
+        m_scratchFrames = 0;
+    }
+    SnapCoeffs();
+    m_mix = m_mixTarget = 1.0f;
+    m_xfMix = m_xfMixTarget = 0.0f;
     Reset();
 }
 
@@ -64,32 +89,85 @@ void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
         if (g < MINIEQ_GAIN_MIN_DB) g = MINIEQ_GAIN_MIN_DB;
         if (g > MINIEQ_GAIN_MAX_DB) g = MINIEQ_GAIN_MAX_DB;
         PeakingCoeffs(MiniEQ_BandFreq(numBands, b), MINIEQ_BAND_Q, g,
-                      m_sampleRate, &m_bands[b]);
+                      m_sampleRate, &m_target[b]);
+    }
+    // Bands above the active count park at flat, so a later 5->10 switch
+    // sweeps from a known state instead of stale coefficients.
+    for (int b = numBands; b < MINIEQ_MAX_BANDS; ++b) {
+        m_target[b].b0 = 1.0f;
+        m_target[b].b1 = 0.0f;
+        m_target[b].b2 = 0.0f;
+        m_target[b].a1 = 0.0f;
+        m_target[b].a2 = 0.0f;
     }
     if (masterGainDb < MINIEQ_GAIN_MIN_DB) masterGainDb = MINIEQ_GAIN_MIN_DB;
     if (masterGainDb > MINIEQ_GAIN_MAX_DB) masterGainDb = MINIEQ_GAIN_MAX_DB;
-    m_masterLinear = powf(10.0f, masterGainDb / 20.0f);
+    m_targetMaster = powf(10.0f, masterGainDb / 20.0f);
+    // The RT thread sweeps the live coefficients toward these targets in
+    // Process() -- no instant jump, no click.
+    m_settling = true;
 }
 
-EqDsp::~EqDsp() {
-    ShutdownVirtualization();
+void EqDsp::SnapCoeffs() {
+    memcpy(m_bands, m_target, sizeof(m_bands));
+    m_masterLinear = m_targetMaster;
+    m_settling = false;
+}
+
+void EqDsp::AdvanceCoeffs() {
+    const float a = m_smoothAlpha;
+    float maxDiff = 0.0f;
+    for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+        Biquad* k = &m_bands[b];
+        const Biquad* t = &m_target[b];
+        float d;
+        d = t->b0 - k->b0; k->b0 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+        d = t->b1 - k->b1; k->b1 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+        d = t->b2 - k->b2; k->b2 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+        d = t->a1 - k->a1; k->a1 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+        d = t->a2 - k->a2; k->a2 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+    }
+    const float dm = m_targetMaster - m_masterLinear;
+    m_masterLinear += dm * a;
+    maxDiff = fmaxf(maxDiff, fabsf(dm));
+    if (maxDiff < 1e-7f) {
+        SnapCoeffs(); // close enough: park exactly, stop sweeping
+    }
 }
 
 void EqDsp::Reset() {
     memset(m_state, 0, sizeof(m_state));
-    XFeed* xf = m_xfeedLive.load(std::memory_order_acquire);
-    if (xf != nullptr) {
-        xf->loL = xf->loR = 0.0f;
-        xf->hiL = xf->hiR = 0.0f;
-        xf->prevL = xf->prevR = 0.0f;
+    // No audio is flowing here (silence or between streams): park the
+    // smoothed parameters exactly on their targets instead of sweeping.
+    SnapCoeffs();
+    m_mix = m_mixTarget;
+    m_xfMix = m_xfMixTarget;
+    if (m_xfMixTarget <= 0.0f) {
+        // Crossfeed is (or is being) turned off: don't leave a half-faded
+        // state parked -- hand it to the worker for freeing.
+        XFeed* xf = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
+        if (xf != nullptr) {
+            m_xfeedOrphan.store(xf, std::memory_order_release);
+        }
+    } else {
+        XFeed* xf = m_xfeedLive.load(std::memory_order_acquire);
+        if (xf != nullptr) {
+            xf->loL = xf->loR = 0.0f;
+            xf->hiL = xf->hiR = 0.0f;
+            xf->prevL = xf->prevR = 0.0f;
+        }
     }
 }
 
-// RT-safe: only arms/frees via lock-free handoff. The worker thread owns
-// every new/delete (see ServiceVirtualizationWorker).
+// RT-safe: only moves fade targets. The worker thread owns every
+// new/delete (see ServiceVirtualizationWorker); the RT thread fades the
+// stage in/out in Process() and retires the state once a fade-out
+// completes -- never an instant switch mid-stream.
 void EqDsp::SetVirtualization(bool on) {
     m_virtWanted.store(on, std::memory_order_release);
     if (on) {
+        // Fade the crossfeed stage in (~10 ms) once the worker publishes it.
+        m_xfMixTarget = 1.0f;
         // Request the worker to allocate+derive if nothing is live yet.
         // Until it publishes, Process() simply skips the crossfeed stage.
         if (m_xfeedLive.load(std::memory_order_acquire) == nullptr) {
@@ -97,13 +175,10 @@ void EqDsp::SetVirtualization(bool on) {
         }
         return;
     }
+    // Fade out on the RT thread; the state is retired to the worker when the
+    // fade completes (see Process). No instant switch -> no click.
+    m_xfMixTarget = 0.0f;
     m_allocReq.store(false, std::memory_order_release);
-    // Retire the live state: the RT thread stops using it from this point
-    // on, and the worker frees it.
-    XFeed* xf = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
-    if (xf != nullptr) {
-        m_xfeedOrphan.store(xf, std::memory_order_release);
-    }
 }
 
 // Worker thread (non-RT): perform pending crossfeed alloc/free.
@@ -171,31 +246,55 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
     if (interleaved == nullptr || numFrames == 0 || m_channels == 0) {
         return;
     }
-    if (bypass) {
-        return; // in-place: nothing to do
+
+    // Bypass crossfade target: 1 = fully wet (EQ on), 0 = fully dry.
+    m_mixTarget = bypass ? 0.0f : 1.0f;
+
+    if (m_mix <= 0.0f && m_mixTarget <= 0.0f) {
+        // Steady-state bypass: bit-transparent, zero CPU. Coefficients keep
+        // tracking silently (snapped: nothing is audible) so un-bypassing
+        // fades in from the right state.
+        if (m_settling) {
+            SnapCoeffs();
+        }
+        return;
     }
 
     const uint32_t ch = m_channels;
+    const bool steadyWet = (m_mix >= 1.0f && m_mixTarget >= 1.0f);
+
+    // A bypass transition needs the dry signal for the crossfade: copy the
+    // block aside first. If the block is bigger than the scratch buffer,
+    // fall back to an instant switch for that block (the engine uses small
+    // blocks, so this is a just-in-case path, never the common one).
+    float* dry = nullptr;
+    if (!steadyWet && m_scratch != nullptr && numFrames <= m_scratchFrames) {
+        dry = m_scratch;
+        memcpy(dry, interleaved, (size_t)numFrames * ch * sizeof(float));
+    }
 
     // (1) Optional headphone virtualization: bs2b-style Bauer crossfeed.
     // Runs BEFORE the EQ bands -- crossfeed rebuilds a speaker-like stereo
     // image, the EQ then shapes the final tonality. Stereo only. The whole
     // stage is skipped (one branch) when the toggle is off.
     //
-    // RT-safe: only an atomic load; allocation/derivation happens on the
-    // worker thread (ServiceVirtualizationWorker).
+    // RT-safe: only atomic loads; allocation/derivation happens on the
+    // worker thread (ServiceVirtualizationWorker). The toggle fades the
+    // stage in/out (~10 ms) so it never clicks.
     XFeed* xf = m_xfeedLive.load(std::memory_order_acquire);
     if (xf != nullptr && ch == 2) {
         if (xf->sampleRate != m_sampleRate &&
             m_virtWanted.load(std::memory_order_acquire)) {
             // Rate changed under us: retire the stale state to the worker
             // and request a fresh derivation. Audio passes through
-            // un-crossfed until the worker publishes the new state.
+            // un-crossfed until the worker publishes the new state, which
+            // then fades in from dry (m_xfMix = 0 below).
             XFeed* stale = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
             if (stale != nullptr) {
                 m_xfeedOrphan.store(stale, std::memory_order_release);
             }
             m_allocReq.store(true, std::memory_order_release);
+            m_xfMix = 0.0f;
             xf = nullptr;
         }
     } else {
@@ -207,6 +306,9 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
         float loL = xf->loL, loR = xf->loR;
         float hiL = xf->hiL, hiR = xf->hiR;
         float prevL = xf->prevL, prevR = xf->prevR;
+        float mix = m_xfMix;
+        const float mixTarget = m_xfMixTarget;
+        const float mixStep = m_xfMixStep;
         for (uint32_t f = 0; f < numFrames; ++f) {
             float* frame = interleaved + (size_t)f * 2;
             const float inL = frame[0];
@@ -217,8 +319,16 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
             hiR = a0h * inR + a1h * prevR + b1h * hiR;
             prevL = inL;
             prevR = inR;
-            frame[0] = hiL + loR; // each ear also hears the other's lows
-            frame[1] = hiR + loL;
+            // Fade the crossfeed stage: mix = 0 is plain stereo.
+            if (mix < mixTarget) {
+                mix += mixStep;
+                if (mix > mixTarget) mix = mixTarget;
+            } else if (mix > mixTarget) {
+                mix -= mixStep;
+                if (mix < mixTarget) mix = mixTarget;
+            }
+            frame[0] = inL + mix * ((hiL + loR) - inL);
+            frame[1] = inR + mix * ((hiR + loL) - inR);
         }
         // Park state; flush denormals once per buffer, not per sample.
         xf->loL = (fabsf(loL) < 1e-30f) ? 0.0f : loL;
@@ -227,14 +337,28 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
         xf->hiR = (fabsf(hiR) < 1e-30f) ? 0.0f : hiR;
         xf->prevL = prevL;
         xf->prevR = prevR;
+        m_xfMix = mix;
+        if (mix <= 0.0f && mixTarget <= 0.0f) {
+            // Fade-out complete: hand the state to the worker for freeing.
+            XFeed* gone = m_xfeedLive.exchange(nullptr, std::memory_order_acq_rel);
+            if (gone != nullptr) {
+                m_xfeedOrphan.store(gone, std::memory_order_release);
+            }
+        }
     }
 
-    // (2) EQ bands + master gain.
-    const float master = m_masterLinear;
+    // (2) EQ bands + master gain. The live coefficients sweep toward their
+    // targets once per frame (shared across channels): a short one-pole
+    // ramp instead of an instant jump, so slider drags and preset switches
+    // never crackle.
     const int nb = m_numBands;
 
     for (uint32_t f = 0; f < numFrames; ++f) {
+        if (m_settling) {
+            AdvanceCoeffs();
+        }
         float* frame = interleaved + (size_t)f * ch;
+        const float master = m_masterLinear;
         for (uint32_t c = 0; c < ch; ++c) {
             float x = frame[c];
             for (int b = 0; b < nb; ++b) {
@@ -247,6 +371,26 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
                 x = y;
             }
             frame[c] = x * master;
+        }
+        // Bypass crossfade (~5 ms): dry <-> wet, no clicks.
+        if (!steadyWet) {
+            if (dry == nullptr) {
+                m_mix = m_mixTarget; // oversized block: instant switch
+            } else {
+                if (m_mix < m_mixTarget) {
+                    m_mix += m_mixStep;
+                    if (m_mix > m_mixTarget) m_mix = m_mixTarget;
+                } else if (m_mix > m_mixTarget) {
+                    m_mix -= m_mixStep;
+                    if (m_mix < m_mixTarget) m_mix = m_mixTarget;
+                }
+                const float m = m_mix;
+                const float* dframe = dry + (size_t)f * ch;
+                for (uint32_t c = 0; c < ch; ++c) {
+                    const float wet = frame[c];
+                    frame[c] = dframe[c] + m * (wet - dframe[c]);
+                }
+            }
         }
     }
 }

@@ -51,6 +51,8 @@ enum {
     IDC_DIAG_LOG     = 181,
     IDC_DIAG_RESTART = 182,
     IDC_DIAG_CENTER  = 183,
+    IDC_DIAG_SOUND   = 184, // "Open Sound settings" (enhancements-off state)
+    IDC_DIAG_HINT    = 185, // one-line contextual fix guidance under the pill
 };
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
@@ -96,10 +98,20 @@ static bool                 g_linkSynced = false; // saved EQ pushed to the live
 static bool                 g_attached = false;
 static StatusLink           g_statusLink;    // APO heartbeat (APO -> UI)
 static HWND                 g_pill, g_btnLog, g_btnRestart, g_btnDiagCenter;
-static int                  g_diagState = -1; // -1 unset,0 idle,1 live,2 wait,3 err
+static HWND                 g_btnSound, g_hint; // sound-settings btn + fix hint
+static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
 static ULONGLONG            g_lastTick = 0;
-static HBRUSH               g_diagBrush[4] = {};
+static HBRUSH               g_diagBrush[6] = {};
+// Audio-enhancements switch, re-read every few seconds (cheap single-key
+// property read; never a wrong value -- Unknown when unreadable).
+static DiagEnhancements     g_enhState = DiagEnhancements::Unknown;
+static ULONGLONG            g_enhCheckTick = 0;
+// Graph-rebuild tracking: once the heartbeat has been seen live on this
+// device, a later loss is treated as a settings-driven rebuild (amber,
+// auto-recovering) for a grace period instead of an instant red error.
+static bool                 g_sawLive = false;
+static ULONGLONG            g_lastLiveTick = 0;
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -164,7 +176,7 @@ static void BuildBandControls(int numBands) {
         const int x = x0 + i * spacing;
         g_band[i] = CreateWindowW(TRACKBAR_CLASSW, nullptr,
                                   WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_AUTOTICKS,
-                                  x + (spacing - sliderW) / 2, 168, sliderW, 170,
+                                  x + (spacing - sliderW) / 2, 200, sliderW, 170,
                                   g_hwnd, (HMENU)(IDC_BAND0 + i),
                                   g_hInst, nullptr);
         SendMessageW(g_band[i], TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
@@ -173,11 +185,11 @@ static void BuildBandControls(int numBands) {
 
         g_bandName[i] = CreateWindowW(L"STATIC", names[i],
                                       WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                      x, 342, spacing, 18, g_hwnd, nullptr,
+                                      x, 374, spacing, 18, g_hwnd, nullptr,
                                       g_hInst, nullptr);
         SendMessageW(g_bandName[i], WM_SETFONT, (WPARAM)font, TRUE);
         g_bandVal[i] = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                     x, 360, spacing, 18, g_hwnd,
+                                     x, 392, spacing, 18, g_hwnd,
                                      (HMENU)(INT_PTR)(IDC_BANDVAL0 + i),
                                      g_hInst, nullptr);
         SendMessageW(g_bandVal[i], WM_SETFONT, (WPARAM)font, TRUE);
@@ -250,22 +262,41 @@ static void TryOpenChannels() {
 }
 
 // Path states for the diagnostics pill.
-enum { DIAG_IDLE = 0, DIAG_LIVE = 1, DIAG_WAITING = 2, DIAG_ERROR = 3 };
+enum {
+    DIAG_IDLE = 0,   // not attached
+    DIAG_LIVE = 1,   // heartbeat advancing: EQ is really processing
+    DIAG_WAITING = 2,// attached, healthy path, no audio right now
+    DIAG_ERROR = 3,  // audio playing but bypassing MiniEQ (genuinely broken)
+    DIAG_ENHOFF = 4, // Audio enhancements off: Windows skips the whole chain
+    DIAG_REBUILD = 5,// heartbeat lost after being live: settings-driven
+                     // graph rebuild, recovering on its own
+};
 
 // The honest liveness check: the APO's worker thread publishes a heartbeat
 // (APOProcess call count) into the status mapping. A heartbeat that keeps
 // advancing means audio is REALLY being processed by our code -- no registry
-// guessing. Combined with the endpoint peak meter we get three real states:
-// live / waiting-for-audio / broken-path.
+// guessing. Combined with the endpoint peak meter and the Audio Enhancements
+// switch we get six real states: idle / live / waiting / error /
+// enhancements-off / rebuilding. A settings change (enhancements, spatial
+// sound) tears the graph down and rebuilds it; that transition is amber and
+// self-healing -- never a red error, never a service restart.
 static void UpdateDiagStatus() {
     int state = DIAG_IDLE;
     wchar_t text[160] = {};
+    wchar_t hint[256] = {};
     if (g_attached && !g_endpointId.empty()) {
         // The APO creates the channels when it locks a stream; the UI can
         // only open them, so keep retrying until the APO is up.
         TryOpenChannels();
-        MiniEQApoStatus st = {};
         const ULONGLONG now = GetTickCount64();
+        // Re-read the enhancements switch every ~3 s: immediately after a
+        // settings change this is what tells "off, fix it in Settings" apart
+        // from "rebuilding, wait a moment".
+        if (g_enhCheckTick == 0 || now - g_enhCheckTick >= 3000) {
+            g_enhCheckTick = now;
+            g_enhState = MiniEQ_ReadEnhancements(g_endpointId);
+        }
+        MiniEQApoStatus st = {};
         if (g_statusLink.Read(&st) && st.processCalls > 0) {
             if (st.processCalls != g_lastCalls) {
                 g_lastCalls = st.processCalls;
@@ -273,14 +304,40 @@ static void UpdateDiagStatus() {
             }
         }
         const bool fresh = (g_lastCalls > 0) && (now - g_lastTick < 2000);
-        if (fresh) {
+        if (g_enhState == DiagEnhancements::Off) {
+            state = DIAG_ENHOFF;
+            StringCchCopyW(text, ARRAYSIZE(text),
+                L"\u25CF Audio enhancements are Off \u2014 MiniEQ is bypassed");
+            wchar_t dev[96] = {};
+            GetWindowTextW(g_deviceName, dev, ARRAYSIZE(dev));
+            StringCchPrintfW(hint, ARRAYSIZE(hint),
+                L"Fix: Settings \u2192 System \u2192 Sound \u2192 %s \u2192 "
+                L"Audio enhancements \u2192 \u201CDevice Default Effects\u201D",
+                dev[0] ? dev : L"this device");
+        } else if (fresh) {
             state = DIAG_LIVE;
+            g_sawLive = true;
+            g_lastLiveTick = now;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF EQ live \u2014 audio is passing through MiniEQ");
+        } else if (g_sawLive && (now - g_lastLiveTick < 15000)) {
+            // The path was live moments ago and died: Windows is rebuilding
+            // the audio graph (e.g. after an enhancements/spatial-sound
+            // change). The APO re-creates its channels on lock; our 500 ms
+            // retry re-opens them and the heartbeat resumes by itself.
+            state = DIAG_REBUILD;
+            StringCchCopyW(text, ARRAYSIZE(text),
+                L"\u25CF Audio engine is rebuilding \u2014 recovering\u2026");
+            StringCchCopyW(hint, ARRAYSIZE(hint),
+                L"A settings change restarted the audio path; "
+                L"this clears on its own, no restart needed.");
         } else if (MiniEQ_EndpointPeakLevel(g_endpointId) > 0.001f) {
             state = DIAG_ERROR;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio is playing but NOT going through MiniEQ");
+            StringCchCopyW(hint, ARRAYSIZE(hint),
+                L"Try replaying the audio. If it stays red, use "
+                L"\u201CRestart audio service\u201D, then check Diagnostics.");
         } else {
             state = DIAG_WAITING;
             StringCchCopyW(text, ARRAYSIZE(text),
@@ -293,7 +350,9 @@ static void UpdateDiagStatus() {
 
     if (state != g_diagState) {
         g_diagState = state;
-        static const wchar_t* names[] = { L"IDLE", L"LIVE", L"WAITING", L"ERROR" };
+        static const wchar_t* names[] = {
+            L"IDLE", L"LIVE", L"WAITING", L"ERROR", L"ENHOFF", L"REBUILD"
+        };
         MiniEQ_AppLog(L"path state -> %s", names[state]);
         InvalidateRect(g_pill, nullptr, TRUE);
     }
@@ -302,9 +361,18 @@ static void UpdateDiagStatus() {
     if (wcscmp(cur, text) != 0) {
         SetWindowTextW(g_pill, text);
     }
-    // The fix for the broken path sits one click away, right where the
-    // error is shown.
+    // The contextual fix guidance lives right under the pill.
+    wchar_t curHint[256] = {};
+    GetWindowTextW(g_hint, curHint, ARRAYSIZE(curHint));
+    if (wcscmp(curHint, hint) != 0) {
+        SetWindowTextW(g_hint, hint);
+    }
+    ShowWindow(g_hint, hint[0] ? SW_SHOW : SW_HIDE);
+    // Each broken state gets the one action that actually fixes it:
+    // enhancements-off -> open Sound settings; genuinely broken path ->
+    // restart the audio service. Rebuilds need no button at all.
     ShowWindow(g_btnRestart, state == DIAG_ERROR ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_btnSound, state == DIAG_ENHOFF ? SW_SHOW : SW_HIDE);
 }
 
 static void RelaunchElevatedRestart() {
@@ -343,6 +411,12 @@ static void SelectDevice(int index) {
     g_statusLink.Open(g_endpointId);
     g_lastCalls = 0;
     g_lastTick = 0;
+    // Fresh device, fresh path history: the rebuild grace and the
+    // enhancements reading start over.
+    g_sawLive = false;
+    g_lastLiveTick = 0;
+    g_enhCheckTick = 0;
+    g_enhState = DiagEnhancements::Unknown;
     // The Diagnostics Center watches the same device.
     MiniEQ_DiagCenterSetDevice(g_endpointId);
     ApplyStagingToUI();
@@ -440,26 +514,38 @@ static void BuildControls(HWND hwnd) {
     applyFont(g_status);
 
     // Diagnostics: the honest EQ-path status pill, color-coded by the APO
-    // heartbeat (see UpdateDiagStatus) -- never by registry guesses.
+    // heartbeat (see UpdateDiagStatus) -- never by registry guesses. The
+    // hint line under it carries the exact fix for the current state.
     g_pill = CreateWindowW(L"STATIC", L"",
                            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE,
                            12, 108, 396, 24, hwnd, (HMENU)IDC_DIAG_PILL,
                            g_hInst, nullptr);
     applyFont(g_pill);
+    g_hint = CreateWindowW(L"STATIC", L"", WS_CHILD | SS_LEFT,
+                           12, 134, 396, 30, hwnd, (HMENU)IDC_DIAG_HINT,
+                           g_hInst, nullptr);
+    applyFont(g_hint);
     g_btnLog = CreateWindowW(L"BUTTON", L"View live log",
                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                             12, 136, 120, 26, hwnd, (HMENU)IDC_DIAG_LOG,
+                             12, 168, 120, 26, hwnd, (HMENU)IDC_DIAG_LOG,
                              g_hInst, nullptr);
     applyFont(g_btnLog);
     // Hidden until the error state needs it (see UpdateDiagStatus).
     g_btnRestart = CreateWindowW(L"BUTTON", L"Restart audio service",
                                  WS_CHILD | BS_PUSHBUTTON,
-                                 140, 136, 170, 26, hwnd,
+                                 140, 168, 170, 26, hwnd,
                                  (HMENU)IDC_DIAG_RESTART, g_hInst, nullptr);
     applyFont(g_btnRestart);
+    // Same slot: shown instead when Audio Enhancements are off -- the one
+    // action that actually fixes that state.
+    g_btnSound = CreateWindowW(L"BUTTON", L"Open Sound settings",
+                               WS_CHILD | BS_PUSHBUTTON,
+                               140, 168, 170, 26, hwnd,
+                               (HMENU)IDC_DIAG_SOUND, g_hInst, nullptr);
+    applyFont(g_btnSound);
     g_btnDiagCenter = CreateWindowW(L"BUTTON", L"Diagnostics",
                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    318, 136, 90, 26, hwnd,
+                                    318, 168, 90, 26, hwnd,
                                     (HMENU)IDC_DIAG_CENTER, g_hInst, nullptr);
     applyFont(g_btnDiagCenter);
 
@@ -467,60 +553,60 @@ static void BuildControls(HWND hwnd) {
     // settings toggle); the initial set is created in WM_CREATE.
 
     HWND masterLabel = CreateWindowW(L"STATIC", L"Master", WS_CHILD | WS_VISIBLE,
-                                     12, 396, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+                                     12, 428, 60, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(masterLabel);
     g_master = CreateWindowW(TRACKBAR_CLASSW, nullptr,
                              WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
-                             70, 390, 230, 34, hwnd, (HMENU)IDC_MASTER, g_hInst, nullptr);
+                             70, 422, 230, 34, hwnd, (HMENU)IDC_MASTER, g_hInst, nullptr);
     SendMessageW(g_master, TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
     SendMessageW(g_master, TBM_SETPAGESIZE, 0, 20);
     g_masterVal = CreateWindowW(L"STATIC", L"+0.0 dB", WS_CHILD | WS_VISIBLE,
-                                308, 396, 70, 18, hwnd, (HMENU)IDC_MASTERVAL,
+                                308, 428, 70, 18, hwnd, (HMENU)IDC_MASTERVAL,
                                 g_hInst, nullptr);
     applyFont(g_masterVal);
 
     g_bypass = CreateWindowW(L"BUTTON", L"Bypass (EQ off)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                             12, 428, 140, 20, hwnd, (HMENU)IDC_BYPASS, g_hInst, nullptr);
+                             12, 460, 140, 20, hwnd, (HMENU)IDC_BYPASS, g_hInst, nullptr);
     applyFont(g_bypass);
 
     HWND presetLabel = CreateWindowW(L"STATIC", L"Presets:", WS_CHILD | WS_VISIBLE,
-                                     12, 462, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+                                     12, 494, 60, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(presetLabel);
     const wchar_t* presetNames[4] = { L"Flat", L"Bass", L"Vocal", L"Bright" };
     for (int i = 0; i < 4; ++i) {
         HWND b = CreateWindowW(L"BUTTON", presetNames[i], WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               76 + i * 78, 458, 70, 26, hwnd,
+                               76 + i * 78, 490, 70, 26, hwnd,
                                (HMENU)(INT_PTR)(IDC_PRESET_FLAT + i), g_hInst, nullptr);
         applyFont(b);
     }
 
     HWND settingsLabel = CreateWindowW(L"STATIC", L"Settings:", WS_CHILD | WS_VISIBLE,
-                                       12, 496, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+                                       12, 528, 60, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(settingsLabel);
     HWND bandsLabel = CreateWindowW(L"STATIC", L"Bands:", WS_CHILD | WS_VISIBLE,
-                                    76, 496, 44, 18, hwnd, nullptr, g_hInst, nullptr);
+                                    76, 528, 44, 18, hwnd, nullptr, g_hInst, nullptr);
     applyFont(bandsLabel);
     g_bands5 = CreateWindowW(L"BUTTON", L"5", WS_CHILD | WS_VISIBLE |
                              BS_AUTORADIOBUTTON | WS_GROUP,
-                             122, 494, 36, 20, hwnd, (HMENU)IDC_BANDS5,
+                             122, 526, 36, 20, hwnd, (HMENU)IDC_BANDS5,
                              g_hInst, nullptr);
     applyFont(g_bands5);
     g_bands10 = CreateWindowW(L"BUTTON", L"10", WS_CHILD | WS_VISIBLE |
                               BS_AUTORADIOBUTTON,
-                              160, 494, 40, 20, hwnd, (HMENU)IDC_BANDS10,
+                              160, 526, 40, 20, hwnd, (HMENU)IDC_BANDS10,
                               g_hInst, nullptr);
     applyFont(g_bands10);
     // Optional headphone virtualization (bs2b-style crossfeed). Costs nothing
     // until turned on: the APO allocates its tiny state lazily.
     g_virtCheck = CreateWindowW(L"BUTTON", L"Virtualization",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                210, 494, 150, 20, hwnd,
+                                210, 526, 150, 20, hwnd,
                                 (HMENU)IDC_VIRTUALIZATION, g_hInst, nullptr);
     applyFont(g_virtCheck);
 
     HWND note = CreateWindowW(L"STATIC",
         L"Attach once per device (asks for admin). Sliders apply live.",
-        WS_CHILD | WS_VISIBLE, 12, 522, 396, 30, hwnd, nullptr, g_hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 12, 554, 396, 30, hwnd, nullptr, g_hInst, nullptr);
     applyFont(note);
 }
 
@@ -554,11 +640,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         BuildControls(hwnd);
         {
             // Pill background brushes, one per path state (see WM_CTLCOLORSTATIC).
-            static const COLORREF bgc[4] = {
+            static const COLORREF bgc[6] = {
                 RGB(240, 240, 240), RGB(233, 247, 238),
-                RGB(255, 248, 232), RGB(253, 238, 238)
+                RGB(255, 248, 232), RGB(253, 238, 238),
+                RGB(253, 238, 238), RGB(255, 248, 232)
             };
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 g_diagBrush[i] = CreateSolidBrush(bgc[i]);
             }
         }
@@ -583,19 +670,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_CTLCOLORSTATIC: {
         // The diagnostics pill is color-coded by path state.
-        if ((HWND)lParam == g_pill && g_diagState >= 0 && g_diagState <= 3) {
-            static const COLORREF bg[4] = {
+        if ((HWND)lParam == g_pill && g_diagState >= 0 && g_diagState <= 5) {
+            static const COLORREF bg[6] = {
                 RGB(240, 240, 240), RGB(233, 247, 238),
-                RGB(255, 248, 232), RGB(253, 238, 238)
+                RGB(255, 248, 232), RGB(253, 238, 238),
+                RGB(253, 238, 238), RGB(255, 248, 232)
             };
-            static const COLORREF fg[4] = {
+            static const COLORREF fg[6] = {
                 RGB(85, 85, 85), RGB(20, 83, 45),
-                RGB(122, 91, 0), RGB(143, 29, 29)
+                RGB(122, 91, 0), RGB(143, 29, 29),
+                RGB(143, 29, 29), RGB(122, 91, 0)
             };
             HDC hdc = (HDC)wParam;
             SetBkColor(hdc, bg[g_diagState]);
             SetTextColor(hdc, fg[g_diagState]);
             return (LRESULT)g_diagBrush[g_diagState];
+        }
+        // The hint line: quiet gray on the window background.
+        if ((HWND)lParam == g_hint) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+            SetTextColor(hdc, RGB(90, 90, 90));
+            return (LRESULT)(COLOR_WINDOW + 1);
         }
         break;
     }
@@ -615,6 +711,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             MiniEQ_ShowLogViewer(g_hInst, g_hwnd);
         } else if (id == IDC_DIAG_RESTART) {
             RelaunchElevatedRestart();
+        } else if (id == IDC_DIAG_SOUND) {
+            // Audio Enhancements live under Settings -> System -> Sound ->
+            // [device]. Land the user on the Sound page; the hint line under
+            // the pill names the exact device and value to pick.
+            MiniEQ_AppLog(L"UI: opening Sound settings (enhancements fix)");
+            ShellExecuteW(nullptr, L"open", L"ms-settings:sound",
+                          nullptr, nullptr, SW_SHOWNORMAL);
         } else if (id == IDC_DIAG_CENTER) {
             MiniEQ_DiagCenterSetDevice(g_endpointId);
             MiniEQ_ShowDiagCenter(g_hInst, g_hwnd);
@@ -652,7 +755,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_DIAG);
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (g_diagBrush[i] != nullptr) {
                 DeleteObject(g_diagBrush[i]);
                 g_diagBrush[i] = nullptr;
@@ -741,7 +844,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
 
     HWND hwnd = CreateWindowExW(0, L"MiniEQWnd", L"MiniEQ",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 600,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 632,
                                 nullptr, nullptr, hInst, nullptr);
     if (hwnd == nullptr) {
         CoUninitialize();
