@@ -65,15 +65,15 @@
                Guid="148E2613-A394-44A6-BC49-FCC4EFD26B28"
                Directory="INSTALLFOLDER">
       <!--
-        SelfReg: Windows Installer calls the DLL's DllRegisterServer at
-        install time (registers COM CLSID {5E52BF50-F229-46A0-8B7D-AA805D47FB60})
+        SelfRegCost="1": Windows Installer calls the DLL's DllRegisterServer
+        at install time (registers COM CLSID {5E52BF50-F229-46A0-8B7D-AA805D47FB60})
         and DllUnregisterServer at uninstall. Runs elevated: the package is
         per-machine.
       -->
       <File Id="File_MiniEQ_APO_dll"
             Source="$(var.BinDir)\MiniEQ_APO.dll"
             KeyPath="yes"
-            SelfReg="yes" />
+            SelfRegCost="1" />
     </Component>
 
   </Product>
