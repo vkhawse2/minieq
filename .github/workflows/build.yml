@@ -1,0 +1,28 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, x64, VS2022)
+        run: cmake -S . -B build -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: minieq-windows-x64
+          path: |
+            build/Release/MiniEQ.exe
+            build/Release/MiniEQ_APO.dll
+          if-no-files-found: error
