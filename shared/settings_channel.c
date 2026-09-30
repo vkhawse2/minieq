@@ -26,10 +26,11 @@ void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
 
 void MiniEQ_SettingsInitFlat(EqSettings* s) {
     memset(s, 0, sizeof(*s));
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
         s->bandGainDb[i] = 0.0f;
     }
     s->masterGainDb = 0.0f;
     s->bypass = 0;
+    s->numBands = MINIEQ_NUM_BANDS; // default: 5-band
     s->sequence = 1;
 }

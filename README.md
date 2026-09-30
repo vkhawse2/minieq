@@ -51,7 +51,7 @@ device. MiniEQ is exactly two pieces:
 ```
 apo/                  MiniEQ_APO.dll -- the system effect
   eq_apo.h/.cpp       CEqApo: IAudioProcessingObject + RT + Configuration
-  dsp.h/.cpp          5-band biquad peaking EQ (RBJ cookbook), TDF-II
+  dsp.h/.cpp          5/10-band biquad peaking EQ (RBJ cookbook), TDF-II
   dllmain.cpp         DllMain, class factory, DllRegisterServer
   registration.h/.cpp one-time HKLM registration + per-device attach/detach
   guids.h             our CLSID + property-store context GUID

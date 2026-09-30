@@ -61,11 +61,12 @@ void SettingsLink::Push() {
     if (m_pView == nullptr) {
         return;
     }
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
         m_pView->bandGainDb[i] = m_staging.bandGainDb[i];
     }
     m_pView->masterGainDb = m_staging.masterGainDb;
     m_pView->bypass = m_staging.bypass;
+    m_pView->numBands = m_staging.numBands;
     MemoryBarrier();
     m_pView->sequence = ++m_seq;
     m_staging.sequence = m_seq;
@@ -95,7 +96,7 @@ void MiniEQ_SaveDeviceSettings(const std::wstring& endpointId, const EqSettings&
     }
     // Endpoint IDs contain characters INI sections tolerate; keep them raw so
     // the mapping is obvious when inspecting the file.
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
         wchar_t key[16] = {};
         StringCchPrintfW(key, ARRAYSIZE(key), L"Band%d", i);
         WriteFloat(ini, endpointId, key, s.bandGainDb[i]);
@@ -103,6 +104,9 @@ void MiniEQ_SaveDeviceSettings(const std::wstring& endpointId, const EqSettings&
     WriteFloat(ini, endpointId, L"Master", s.masterGainDb);
     WritePrivateProfileStringW(endpointId.c_str(), L"Bypass",
                                s.bypass ? L"1" : L"0", ini.c_str());
+    wchar_t nb[8] = {};
+    StringCchPrintfW(nb, ARRAYSIZE(nb), L"%d", s.numBands);
+    WritePrivateProfileStringW(endpointId.c_str(), L"NumBands", nb, ini.c_str());
 }
 
 bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out) {
@@ -121,12 +125,15 @@ bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out) 
         return (float)_wtof(buf);
     };
     MiniEQ_SettingsInitFlat(out);
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
         wchar_t key[16] = {};
         StringCchPrintfW(key, ARRAYSIZE(key), L"Band%d", i);
         out->bandGainDb[i] = getf(key);
     }
     out->masterGainDb = getf(L"Master");
     out->bypass = GetPrivateProfileIntW(endpointId.c_str(), L"Bypass", 0, ini.c_str());
+    const int nb = GetPrivateProfileIntW(endpointId.c_str(), L"NumBands",
+                                         MINIEQ_NUM_BANDS, ini.c_str());
+    out->numBands = (nb == MINIEQ_MAX_BANDS) ? MINIEQ_MAX_BANDS : MINIEQ_NUM_BANDS;
     return true;
 }

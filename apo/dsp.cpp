@@ -13,7 +13,7 @@ EqDsp::EqDsp() {
     memset(m_bands, 0, sizeof(m_bands));
     memset(m_state, 0, sizeof(m_state));
     // Default to flat (unity) coefficients so a zeroed struct is a no-op.
-    for (int b = 0; b < MINIEQ_NUM_BANDS; ++b) {
+    for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
         m_bands[b].b0 = 1.0f;
     }
 }
@@ -52,12 +52,18 @@ void EqDsp::PeakingCoeffs(float freqHz, float q, float gainDb,
     out->a2 = a2 / a0;
 }
 
-void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_NUM_BANDS], float masterGainDb) {
-    for (int b = 0; b < MINIEQ_NUM_BANDS; ++b) {
+void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
+                      float masterGainDb) {
+    if (numBands != MINIEQ_MAX_BANDS) {
+        numBands = MINIEQ_NUM_BANDS; // only 5 or 10 are valid
+    }
+    m_numBands = numBands;
+    for (int b = 0; b < numBands; ++b) {
         float g = bandGainDb[b];
         if (g < MINIEQ_GAIN_MIN_DB) g = MINIEQ_GAIN_MIN_DB;
         if (g > MINIEQ_GAIN_MAX_DB) g = MINIEQ_GAIN_MAX_DB;
-        PeakingCoeffs(MINIEQ_BAND_FREQS[b], MINIEQ_BAND_Q, g, m_sampleRate, &m_bands[b]);
+        PeakingCoeffs(MiniEQ_BandFreq(numBands, b), MINIEQ_BAND_Q, g,
+                      m_sampleRate, &m_bands[b]);
     }
     if (masterGainDb < MINIEQ_GAIN_MIN_DB) masterGainDb = MINIEQ_GAIN_MIN_DB;
     if (masterGainDb > MINIEQ_GAIN_MAX_DB) masterGainDb = MINIEQ_GAIN_MAX_DB;
@@ -78,12 +84,13 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
 
     const uint32_t ch = m_channels;
     const float master = m_masterLinear;
+    const int nb = m_numBands;
 
     for (uint32_t f = 0; f < numFrames; ++f) {
         float* frame = interleaved + (size_t)f * ch;
         for (uint32_t c = 0; c < ch; ++c) {
             float x = frame[c];
-            for (int b = 0; b < MINIEQ_NUM_BANDS; ++b) {
+            for (int b = 0; b < nb; ++b) {
                 const Biquad* k = &m_bands[b];
                 Tdf2State* st = &m_state[c][b];
                 // Transposed Direct Form II.

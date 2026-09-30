@@ -1,7 +1,8 @@
 // dsp.h -- minimal peaking-EQ DSP for MiniEQ.
 //
-// A bank of MINIEQ_NUM_BANDS biquad peaking filters (RBJ cookbook) plus a
-// master gain stage. One instance handles all channels of one audio stream.
+// A bank of up to MINIEQ_MAX_BANDS biquad peaking filters (RBJ cookbook) plus
+// a master gain stage. One instance handles all channels of one audio stream.
+// The active band count (5 or 10) comes from the settings toggle.
 //
 // Real-time notes: after construction, Process() performs no allocation and
 // no syscalls. UpdateGains() only does arithmetic. All state lives in
@@ -25,7 +26,9 @@ public:
     void Configure(float sampleRateHz, uint32_t numChannels);
 
     // Push new gains; recomputes biquad coefficients. Cheap: pure math.
-    void UpdateGains(const float bandGainDb[MINIEQ_NUM_BANDS], float masterGainDb);
+    // numBands is 5 or 10 (clamped); only that many filters run in Process().
+    void UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
+                     float masterGainDb);
 
     // Process `numFrames` interleaved float32 frames in place.
     // `bypass` short-circuits to a plain copy-free pass-through.
@@ -49,7 +52,8 @@ private:
 
     float     m_sampleRate = 48000.0f;
     uint32_t  m_channels = 0;
-    Biquad    m_bands[MINIEQ_NUM_BANDS];
-    Tdf2State m_state[MINIEQ_MAX_CHANNELS][MINIEQ_NUM_BANDS];
+    int       m_numBands = MINIEQ_NUM_BANDS;
+    Biquad    m_bands[MINIEQ_MAX_BANDS];
+    Tdf2State m_state[MINIEQ_MAX_CHANNELS][MINIEQ_MAX_BANDS];
     float     m_masterLinear = 1.0f;
 };

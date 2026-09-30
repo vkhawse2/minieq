@@ -321,7 +321,8 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
                 MemoryBarrier();
                 // Re-read to guard against a torn write racing us.
                 if (m_localCopy.sequence == seq) {
-                    m_dsp.UpdateGains(m_localCopy.bandGainDb, m_localCopy.masterGainDb);
+                    m_dsp.UpdateGains(m_localCopy.bandGainDb, m_localCopy.numBands,
+                                      m_localCopy.masterGainDb);
                     m_lastSequence = seq;
                 }
             }

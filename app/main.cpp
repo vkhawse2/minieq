@@ -1,8 +1,8 @@
 // main.cpp -- MiniEQ UI: a tiny native Win32 window.
 //
-// One window: a prominent current-device header, device picker, 5 EQ sliders,
-// master gain, bypass, presets, and a one-click (elevated) "attach to this
-// device" action. On open it auto-selects the system default output (aux,
+// One window: a prominent current-device header, device picker, 5- or 10-band
+// EQ sliders (settings toggle reshapes the UI live), master gain, bypass,
+// presets, and a one-click (elevated) "attach to this device" action. On open it auto-selects the system default output (aux,
 // USB-C or Bluetooth -- whatever you're listening on) and re-lists endpoints
 // live when devices are plugged/unplugged. No frameworks, no runtime beyond
 // the Windows SDK: the whole app is well under a megabyte and a few MB of RAM.
@@ -43,16 +43,27 @@ enum {
     IDC_MASTERVAL    = 131,
     IDC_BYPASS       = 140,
     IDC_PRESET_FLAT  = 150, IDC_PRESET_BASS, IDC_PRESET_VOCAL, IDC_PRESET_BRIGHT,
+    IDC_BANDS5       = 160, IDC_BANDS10,
 };
 
-static const wchar_t* kBandNames[MINIEQ_NUM_BANDS] = {
+static const wchar_t* kBandNames5[MINIEQ_NUM_BANDS] = {
     L"60", L"230", L"910", L"3.6k", L"14k"
 };
-static const float kPresets[4][MINIEQ_NUM_BANDS] = {
+static const wchar_t* kBandNames10[MINIEQ_MAX_BANDS] = {
+    L"31", L"62", L"125", L"250", L"500",
+    L"1k", L"2k", L"4k", L"8k", L"16k"
+};
+static const float kPresets5[4][MINIEQ_NUM_BANDS] = {
     { 0, 0, 0, 0, 0 },   // Flat
     { 6, 4, 1, 0, 0 },   // Bass
     { -2, -1, 3, 4, 2 }, // Vocal
     { 0, 0, -1, 3, 5 },  // Bright
+};
+static const float kPresets10[4][MINIEQ_MAX_BANDS] = {
+    { 0, 0, 0, 0, 0,  0, 0, 0, 0, 0 }, // Flat
+    { 6, 5, 4, 2, 1,  0, 0, 0, 0, 0 }, // Bass
+    { -1, -1, 0, 1, 2,  3, 4, 3, 1, 0 }, // Vocal
+    { -1, 0, 0, 0, 0,  1, 2, 3, 4, 5 }, // Bright
 };
 
 //------------------------------------------------------------------------------
@@ -63,8 +74,11 @@ static HINSTANCE            g_hInst;
 static HWND                 g_hwnd;
 static HWND                 g_deviceName;
 static HWND                 g_combo, g_refresh, g_attach, g_status;
-static HWND                 g_band[MINIEQ_NUM_BANDS], g_bandVal[MINIEQ_NUM_BANDS];
+static HWND                 g_band[MINIEQ_MAX_BANDS], g_bandVal[MINIEQ_MAX_BANDS];
+static HWND                 g_bandName[MINIEQ_MAX_BANDS];
 static HWND                 g_master, g_masterVal, g_bypass;
+static HWND                 g_bands5, g_bands10;
+static int                  g_numBandsShown = 0; // band sliders currently built
 static std::vector<AudioEndpoint> g_devices;
 static std::wstring         g_endpointId;
 static SettingsLink         g_link;
@@ -74,9 +88,14 @@ static bool                 g_attached = false;
 // Helpers
 //------------------------------------------------------------------------------
 
-static void FormatDb(wchar_t* out, size_t cch, float db) {
+static void FormatDb(wchar_t* out, size_t cch, float db, bool compact) {
     wchar_t sign = db < 0 ? L'-' : L'+';
-    StringCchPrintfW(out, cch, L"%c%.1f dB", sign, db < 0 ? -db : db);
+    if (compact) {
+        // 10-band mode: narrow columns, so "+3.5" instead of "+3.5 dB".
+        StringCchPrintfW(out, cch, L"%c%.1f", sign, db < 0 ? -db : db);
+    } else {
+        StringCchPrintfW(out, cch, L"%c%.1f dB", sign, db < 0 ? -db : db);
+    }
 }
 
 static void PushAndSave() {
@@ -88,16 +107,86 @@ static void PushAndSave() {
 
 static void SyncControlsFromStaging() {
     const EqSettings& s = g_link.Staging();
+    const bool compact = g_numBandsShown > MINIEQ_NUM_BANDS;
     wchar_t buf[32];
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < g_numBandsShown; ++i) {
         SendMessageW(g_band[i], TBM_SETPOS, TRUE, (LPARAM)(int)(s.bandGainDb[i] * 10.0f));
-        FormatDb(buf, ARRAYSIZE(buf), s.bandGainDb[i]);
+        FormatDb(buf, ARRAYSIZE(buf), s.bandGainDb[i], compact);
         SetWindowTextW(g_bandVal[i], buf);
     }
     SendMessageW(g_master, TBM_SETPOS, TRUE, (LPARAM)(int)(s.masterGainDb * 10.0f));
-    FormatDb(buf, ARRAYSIZE(buf), s.masterGainDb);
+    FormatDb(buf, ARRAYSIZE(buf), s.masterGainDb, false);
     SetWindowTextW(g_masterVal, buf);
     Button_SetCheck(g_bypass, s.bypass ? BST_CHECKED : BST_UNCHECKED);
+}
+
+// (Re)build the band slider columns for `numBands` (5 or 10). The settings
+// toggle calls this, so the UI reshapes itself live.
+static void DestroyBandControls() {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
+        if (g_band[i] != nullptr)     { DestroyWindow(g_band[i]);     g_band[i] = nullptr; }
+        if (g_bandVal[i] != nullptr)  { DestroyWindow(g_bandVal[i]);  g_bandVal[i] = nullptr; }
+        if (g_bandName[i] != nullptr) { DestroyWindow(g_bandName[i]); g_bandName[i] = nullptr; }
+    }
+    g_numBandsShown = 0;
+}
+
+static void BuildBandControls(int numBands) {
+    DestroyBandControls();
+    if (numBands != MINIEQ_MAX_BANDS) {
+        numBands = MINIEQ_NUM_BANDS;
+    }
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    const int spacing = (numBands <= MINIEQ_NUM_BANDS) ? 76 : 38;
+    const int sliderW = (numBands <= MINIEQ_NUM_BANDS) ? 40 : 28;
+    const int x0 = 14;
+    const wchar_t* const* names =
+        (numBands <= MINIEQ_NUM_BANDS) ? kBandNames5 : kBandNames10;
+
+    for (int i = 0; i < numBands; ++i) {
+        const int x = x0 + i * spacing;
+        g_band[i] = CreateWindowW(TRACKBAR_CLASSW, nullptr,
+                                  WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_AUTOTICKS,
+                                  x + (spacing - sliderW) / 2, 112, sliderW, 170,
+                                  g_hwnd, (HMENU)(IDC_BAND0 + i),
+                                  g_hInst, nullptr);
+        SendMessageW(g_band[i], TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
+        SendMessageW(g_band[i], TBM_SETPAGESIZE, 0, 20);
+        SendMessageW(g_band[i], TBM_SETTICFREQ, 60, 0);
+
+        g_bandName[i] = CreateWindowW(L"STATIC", names[i],
+                                      WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                      x, 286, spacing, 18, g_hwnd, nullptr,
+                                      g_hInst, nullptr);
+        SendMessageW(g_bandName[i], WM_SETFONT, (WPARAM)font, TRUE);
+        g_bandVal[i] = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                     x, 304, spacing, 18, g_hwnd,
+                                     (HMENU)(IDC_BANDVAL0 + i),
+                                     g_hInst, nullptr);
+        SendMessageW(g_bandVal[i], WM_SETFONT, (WPARAM)font, TRUE);
+    }
+    g_numBandsShown = numBands;
+}
+
+// Reflect the staged settings (band count + values) in the whole UI.
+static void ApplyStagingToUI() {
+    const int n = (g_link.Staging().numBands == MINIEQ_MAX_BANDS)
+                  ? MINIEQ_MAX_BANDS : MINIEQ_NUM_BANDS;
+    Button_SetCheck(g_bands5, n == MINIEQ_NUM_BANDS ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_bands10, n == MINIEQ_MAX_BANDS ? BST_CHECKED : BST_UNCHECKED);
+    if (g_numBandsShown != n) {
+        BuildBandControls(n);
+    }
+    SyncControlsFromStaging();
+}
+
+static void SetBandCount(int n) {
+    if (n != MINIEQ_NUM_BANDS && n != MINIEQ_MAX_BANDS) {
+        return;
+    }
+    g_link.Staging().numBands = n;
+    PushAndSave(); // live to the APO + remembered per device
+    ApplyStagingToUI();
 }
 
 static void UpdateAttachStatus() {
@@ -130,7 +219,7 @@ static void SelectDevice(int index) {
         g_link.Staging() = saved;
         g_link.Push();
     }
-    SyncControlsFromStaging();
+    ApplyStagingToUI();
     UpdateAttachStatus();
 }
 
@@ -223,25 +312,8 @@ static void BuildControls(HWND hwnd) {
                              190, 85, 218, 18, hwnd, (HMENU)IDC_STATUS, g_hInst, nullptr);
     applyFont(g_status);
 
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
-        const int x = 14 + i * 76;
-        g_band[i] = CreateWindowW(TRACKBAR_CLASSW, nullptr,
-                                  WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_AUTOTICKS,
-                                  x + 12, 112, 40, 170, hwnd, (HMENU)(IDC_BAND0 + i),
-                                  g_hInst, nullptr);
-        SendMessageW(g_band[i], TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
-        SendMessageW(g_band[i], TBM_SETPAGESIZE, 0, 20);
-        SendMessageW(g_band[i], TBM_SETTICFREQ, 60, 0);
-
-        HWND name = CreateWindowW(L"STATIC", kBandNames[i],
-                                  WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                  x, 286, 64, 18, hwnd, nullptr, g_hInst, nullptr);
-        applyFont(name);
-        g_bandVal[i] = CreateWindowW(L"STATIC", L"+0.0 dB", WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                     x, 304, 64, 18, hwnd, (HMENU)(IDC_BANDVAL0 + i),
-                                     g_hInst, nullptr);
-        applyFont(g_bandVal[i]);
-    }
+    // Band sliders are built by BuildBandControls() (5 or 10, per the
+    // settings toggle); the initial set is created in WM_CREATE.
 
     HWND masterLabel = CreateWindowW(L"STATIC", L"Master", WS_CHILD | WS_VISIBLE,
                                      12, 340, 60, 18, hwnd, nullptr, g_hInst, nullptr);
@@ -271,19 +343,37 @@ static void BuildControls(HWND hwnd) {
         applyFont(b);
     }
 
+    HWND settingsLabel = CreateWindowW(L"STATIC", L"Settings:", WS_CHILD | WS_VISIBLE,
+                                       12, 440, 60, 18, hwnd, nullptr, g_hInst, nullptr);
+    applyFont(settingsLabel);
+    HWND bandsLabel = CreateWindowW(L"STATIC", L"Bands:", WS_CHILD | WS_VISIBLE,
+                                    76, 440, 44, 18, hwnd, nullptr, g_hInst, nullptr);
+    applyFont(bandsLabel);
+    g_bands5 = CreateWindowW(L"BUTTON", L"5", WS_CHILD | WS_VISIBLE |
+                             BS_AUTORADIOBUTTON | WS_GROUP,
+                             122, 438, 36, 20, hwnd, (HMENU)IDC_BANDS5,
+                             g_hInst, nullptr);
+    applyFont(g_bands5);
+    g_bands10 = CreateWindowW(L"BUTTON", L"10", WS_CHILD | WS_VISIBLE |
+                              BS_AUTORADIOBUTTON,
+                              160, 438, 40, 20, hwnd, (HMENU)IDC_BANDS10,
+                              g_hInst, nullptr);
+    applyFont(g_bands10);
+
     HWND note = CreateWindowW(L"STATIC",
         L"Attach once per device (asks for admin). Sliders apply live.",
-        WS_CHILD | WS_VISIBLE, 12, 444, 396, 30, hwnd, nullptr, g_hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 12, 466, 396, 30, hwnd, nullptr, g_hInst, nullptr);
     applyFont(note);
 }
 
 static void OnSliderChanged(HWND slider) {
     const int pos = (int)SendMessageW(slider, TBM_GETPOS, 0, 0);
     const float db = pos / 10.0f;
+    const bool compact = g_numBandsShown > MINIEQ_NUM_BANDS;
     wchar_t buf[32];
-    FormatDb(buf, ARRAYSIZE(buf), db);
+    FormatDb(buf, ARRAYSIZE(buf), db, compact);
 
-    for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
+    for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {
         if (slider == g_band[i]) {
             g_link.Staging().bandGainDb[i] = db;
             SetWindowTextW(g_bandVal[i], buf);
@@ -293,6 +383,7 @@ static void OnSliderChanged(HWND slider) {
     }
     if (slider == g_master) {
         g_link.Staging().masterGainDb = db;
+        FormatDb(buf, ARRAYSIZE(buf), db, false);
         SetWindowTextW(g_masterVal, buf);
         PushAndSave();
     }
@@ -304,7 +395,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwnd = hwnd;
         BuildControls(hwnd);
         RefreshDeviceList();
-        SyncControlsFromStaging();
+        ApplyStagingToUI(); // builds the band sliders if no device was selected
         return 0;
 
     case WM_VSCROLL:
@@ -328,10 +419,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (id == IDC_BYPASS) {
             g_link.Staging().bypass = (Button_GetCheck(g_bypass) == BST_CHECKED) ? 1 : 0;
             PushAndSave();
+        } else if (id == IDC_BANDS5 || id == IDC_BANDS10) {
+            SetBandCount(id == IDC_BANDS5 ? MINIEQ_NUM_BANDS : MINIEQ_MAX_BANDS);
         } else if (id >= IDC_PRESET_FLAT && id <= IDC_PRESET_BRIGHT) {
             const int p = id - IDC_PRESET_FLAT;
-            for (int i = 0; i < MINIEQ_NUM_BANDS; ++i) {
-                g_link.Staging().bandGainDb[i] = kPresets[p][i];
+            const int n = (g_numBandsShown > 0) ? g_numBandsShown : MINIEQ_NUM_BANDS;
+            const float* preset = (n == MINIEQ_MAX_BANDS) ? kPresets10[p] : kPresets5[p];
+            for (int i = 0; i < n; ++i) {
+                g_link.Staging().bandGainDb[i] = preset[i];
             }
             SyncControlsFromStaging();
             PushAndSave();
@@ -414,7 +509,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
 
     HWND hwnd = CreateWindowExW(0, L"MiniEQWnd", L"MiniEQ",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 516,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 544,
                                 nullptr, nullptr, hInst, nullptr);
     if (hwnd == nullptr) {
         CoUninitialize();
