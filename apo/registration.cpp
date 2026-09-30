@@ -212,6 +212,62 @@ static HRESULT FxPropertiesKey(const wchar_t* endpointId, wchar_t* out, size_t c
         guid);
 }
 
+// R2: registry home of the stashed child-APO CLSIDs, one value per endpoint
+// (bare GUID). Written elevated at attach time; read by the APO inside the
+// audio engine (world-readable under HKLM\SOFTWARE).
+static HRESULT ChildApoKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    wchar_t guid[64] = {};
+    HRESULT hr = EndpointGuid(endpointId, guid, ARRAYSIZE(guid));
+    if (FAILED(hr)) return hr;
+    return StringCchPrintfW(out, cch, L"SOFTWARE\\MiniEQ\\ChildAPO\\%s", guid);
+}
+
+HRESULT MiniEQ_StashChildApoClsid(const wchar_t* endpointId,
+                                 const wchar_t* childClsid) {
+    if (endpointId == nullptr || childClsid == nullptr) return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+    return SetSz(HKEY_LOCAL_MACHINE, key, nullptr, childClsid);
+}
+
+HRESULT MiniEQ_ReadChildApoClsid(const wchar_t* endpointId, wchar_t* out,
+                                size_t cch) {
+    if (out == nullptr || cch == 0) return E_POINTER;
+    out[0] = L'\0';
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+
+    HKEY h = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        return S_FALSE; // never stashed: no child
+    }
+    if (rc != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(rc);
+    }
+    DWORD size = (DWORD)(cch * sizeof(wchar_t)), type = 0;
+    rc = RegQueryValueExW(h, nullptr, nullptr, &type, (BYTE*)out, &size);
+    RegCloseKey(h);
+    if (rc != ERROR_SUCCESS || type != REG_SZ) {
+        out[0] = L'\0';
+        return S_FALSE;
+    }
+    return S_OK;
+}
+
+HRESULT MiniEQ_ClearChildApoClsid(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+    LONG rc = RegDeleteKeyW(HKEY_LOCAL_MACHINE, key);
+    if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
+}
+
 static bool EnablePrivilege(const wchar_t* privilegeName) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(),
@@ -348,6 +404,18 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     hr = OpenFxPropertiesForWrite(endpointId, &h);
     if (FAILED(hr)) return hr;
 
+    // R2: chain, don't just evict. Stash the incumbent SFX APO (if it is a
+    // real third-party CLSID and not us) so the engine keeps running it as
+    // our child. Best-effort: a stash failure must not block the attach.
+    wchar_t incumbent[64] = {};
+    DWORD qsize = sizeof(incumbent), qtype = 0;
+    LONG qrc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &qtype,
+                               (BYTE*)incumbent, &qsize);
+    if (qrc == ERROR_SUCCESS && qtype == REG_SZ && incumbent[0] != L'\0' &&
+        _wcsicmp(incumbent, clsid) != 0) {
+        MiniEQ_StashChildApoClsid(endpointId, incumbent);
+    }
+
     LONG rc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ, (const BYTE*)clsid,
                              (DWORD)((wcslen(clsid) + 1) * sizeof(wchar_t)));
     RegCloseKey(h);
@@ -360,18 +428,54 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
     HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
     if (FAILED(hr)) return hr;
 
+    wchar_t clsid[64] = {};
+    hr = ClsidString(clsid, ARRAYSIZE(clsid));
+    if (FAILED(hr)) return hr;
+
     HKEY h = nullptr;
-    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_SET_VALUE, &h);
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0,
+                            KEY_QUERY_VALUE | KEY_SET_VALUE, &h);
     if (rc == ERROR_FILE_NOT_FOUND) {
+        MiniEQ_ClearChildApoClsid(endpointId); // tidy any orphaned stash
         return S_OK; // FxProperties never created: nothing to detach.
     }
     if (rc != ERROR_SUCCESS) {
         return HRESULT_FROM_WIN32(rc);
     }
-    rc = RegDeleteValueW(h, kFxSfxSlot);
+    // Surgical detach: only remove the slot value when it is ours -- never
+    // clobber an APO someone else installed after us.
+    wchar_t current[64] = {};
+    DWORD size = sizeof(current), type = 0;
+    rc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &type, (BYTE*)current,
+                          &size);
+    const bool ours = (rc == ERROR_SUCCESS && type == REG_SZ &&
+                       _wcsicmp(current, clsid) == 0);
+    if (ours) {
+        rc = RegDeleteValueW(h, kFxSfxSlot);
+        // Deleting a value that isn't there is fine.
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+        if (rc == ERROR_SUCCESS) {
+            // R2: restore the displaced APO we stashed at attach time.
+            wchar_t stashed[64] = {};
+            if (MiniEQ_ReadChildApoClsid(endpointId, stashed,
+                                        ARRAYSIZE(stashed)) == S_OK &&
+                stashed[0] != L'\0') {
+                const DWORD wsize =
+                    (DWORD)((wcslen(stashed) + 1) * sizeof(wchar_t));
+                const LONG wrc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ,
+                                               (const BYTE*)stashed, wsize);
+                if (wrc == ERROR_SUCCESS) {
+                    MiniEQ_ClearChildApoClsid(endpointId);
+                }
+                // If the restore write failed, keep the stash for a retry.
+            } else {
+                MiniEQ_ClearChildApoClsid(endpointId); // no stash; tidy
+            }
+        }
+    } else {
+        rc = ERROR_SUCCESS; // not ours: leave the slot alone
+    }
     RegCloseKey(h);
-    // Deleting a value that isn't there is fine.
-    if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 

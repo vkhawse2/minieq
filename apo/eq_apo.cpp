@@ -12,6 +12,7 @@
 #include "eq_apo.h"
 #include "guids.h"
 #include "trace.h"
+#include "registration.h" // R2: MiniEQ_ReadChildApoClsid (chain the displaced APO)
 
 #include <mmdeviceapi.h>
 #include <ks.h>          // must come before ksmedia.h
@@ -130,6 +131,7 @@ CEqApo::~CEqApo() {
         m_hMap = nullptr;
     }
     m_dsp.ShutdownVirtualization();
+    ReleaseChild(); // R2: drop the chained APO, if any
     if (m_pFTM != nullptr) {
         m_pFTM->Release();
         m_pFTM = nullptr;
@@ -309,6 +311,78 @@ try {
     // it in LockForProcess -- it must be the creator, because only session 0
     // holds SeCreateGlobalPrivilege; the UI (user session) only opens it.
     MiniEQ_GlobalStateName(m_globalName, ARRAYSIZE(m_globalName));
+
+    // R2: chain the APO we displaced from this endpoint's SFX slot (stashed
+    // by MiniEQ_AttachToEndpoint). The child is a plain in-proc COM object
+    // (not aggregated); it gets the same init data the engine gave us. Every
+    // failure here just means "no child" -- never fail the init over it.
+    if (!m_endpointId.empty()) {
+        wchar_t childClsid[64] = {};
+        if (MiniEQ_ReadChildApoClsid(m_endpointId.c_str(), childClsid,
+                                    ARRAYSIZE(childClsid)) == S_OK &&
+            childClsid[0] != L'\0') {
+            wchar_t ourClsid[64] = {};
+            const bool isSelf =
+                StringFromGUID2(CLSID_MiniEQAPO, ourClsid,
+                                ARRAYSIZE(ourClsid)) != 0 &&
+                _wcsicmp(childClsid, ourClsid) == 0;
+            if (!isSelf) {
+                CLSID clsid = {};
+                if (SUCCEEDED(CLSIDFromString(childClsid, &clsid))) {
+                    IUnknown* pUnk = nullptr;
+                    HRESULT hrC = CoCreateInstance(clsid, nullptr,
+                                                 CLSCTX_INPROC_SERVER,
+                                                 IID_IUnknown, (void**)&pUnk);
+                    if (SUCCEEDED(hrC) && pUnk != nullptr) {
+                        IAudioProcessingObject* pApo = nullptr;
+                        IAudioProcessingObjectRT* pRT = nullptr;
+                        IAudioProcessingObjectConfiguration* pCfg = nullptr;
+                        hrC = pUnk->QueryInterface(
+                            __uuidof(IAudioProcessingObject), (void**)&pApo);
+                        if (SUCCEEDED(hrC)) {
+                            hrC = pUnk->QueryInterface(
+                                __uuidof(IAudioProcessingObjectRT),
+                                (void**)&pRT);
+                        }
+                        if (SUCCEEDED(hrC)) {
+                            hrC = pUnk->QueryInterface(
+                                __uuidof(IAudioProcessingObjectConfiguration),
+                                (void**)&pCfg);
+                        }
+                        if (SUCCEEDED(hrC) && pApo != nullptr &&
+                            pRT != nullptr && pCfg != nullptr) {
+                            hrC = pApo->Initialize(cbDataSize, pbyData);
+                            if (SUCCEEDED(hrC)) {
+                                m_childAPO = pApo;
+                                m_childRT = pRT;
+                                m_childConfig = pCfg;
+                                MiniEQ_Trace(L"MiniEQ_APO: child APO chained: %s",
+                                             childClsid);
+                            } else {
+                                MiniEQ_Trace(L"MiniEQ_APO: child Initialize failed hr=0x%08X; no child",
+                                             hrC);
+                            }
+                        } else {
+                            MiniEQ_Trace(L"MiniEQ_APO: child QI failed hr=0x%08X; no child",
+                                         hrC);
+                        }
+                        if (m_childAPO == nullptr) {
+                            if (pCfg != nullptr) pCfg->Release();
+                            if (pRT != nullptr) pRT->Release();
+                            if (pApo != nullptr) pApo->Release();
+                        }
+                        pUnk->Release();
+                    } else {
+                        MiniEQ_Trace(L"MiniEQ_APO: child CoCreateInstance failed hr=0x%08X; no child",
+                                     hrC);
+                    }
+                } else {
+                    MiniEQ_Trace(L"MiniEQ_APO: stashed child CLSID unparsable; no child");
+                }
+            }
+        }
+    }
+
     MiniEQ_Trace(L"MiniEQ_APO: Initialize -> S_OK device=\"%s\" mapping=\"%s\"",
                  m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
                  m_mappingName[0] ? m_mappingName : L"<none>");
@@ -323,7 +397,69 @@ try {
     return E_FAIL;
 }
 
-STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/,
+// R1: build a float32 IAudioMediaType twin of a non-float32 format (same
+// channels/rate). Returned with S_FALSE ("not the requested format, but this
+// one") so the engine inserts conversion and KEEPS the APO in the graph.
+// A hard APOERR_FORMAT_NOT_SUPPORTED here makes the engine silently build
+// the graph without this APO -- the "attached but zero APOProcess calls"
+// symptom seen on USB endpoints.
+HRESULT CEqApo::SuggestFloat32MediaType(const WAVEFORMATEX* wfx,
+                                       IAudioMediaType** ppOut) {
+    if (ppOut == nullptr) {
+        return E_POINTER;
+    }
+    *ppOut = nullptr;
+    if (wfx == nullptr || wfx->nChannels == 0) {
+        return E_INVALIDARG;
+    }
+
+    DWORD channelMask = 0;
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfx->cbSize >= 22) {
+        channelMask =
+            reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(wfx)->dwChannelMask;
+    } else if (wfx->nChannels == 1) {
+        channelMask = SPEAKER_FRONT_CENTER;
+    } else if (wfx->nChannels == 2) {
+        channelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    }
+
+    UNCOMPRESSEDAUDIOFORMAT uaf = {};
+    uaf.guidFormatType = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    uaf.dwSamplesPerFrame = wfx->nChannels;
+    uaf.dwBytesPerSampleContainer = 4;
+    uaf.dwValidBitsPerSample = 32;
+    uaf.fFramesPerSecond = static_cast<FLOAT32>(wfx->nSamplesPerSec);
+    uaf.dwChannelMask = channelMask;
+
+    const HRESULT hr =
+        CreateAudioMediaTypeFromUncompressedAudioFormat(&uaf, ppOut);
+    if (FAILED(hr)) {
+        *ppOut = nullptr;
+        return hr;
+    }
+    return S_FALSE;
+}
+
+// R1: our own format verdict, ignoring any chained child.
+HRESULT CEqApo::OwnFormatVerdict(const WAVEFORMATEX* wfx,
+                                 IAudioMediaType* pRequested,
+                                 IAudioMediaType** ppOut) {
+    *ppOut = nullptr;
+    // Our DSP state is sized for MINIEQ_MAX_CHANNELS channels: decline wider
+    // formats honestly instead of misprocessing them. This is the one thing
+    // we genuinely cannot process -- everything else gets a suggestion.
+    if (wfx->nChannels == 0 || wfx->nChannels > MINIEQ_MAX_CHANNELS) {
+        return APOERR_FORMAT_NOT_SUPPORTED;
+    }
+    if (IsFloat32Format(wfx)) {
+        *ppOut = pRequested;
+        (*ppOut)->AddRef();
+        return S_OK;
+    }
+    return SuggestFloat32MediaType(wfx, ppOut); // S_FALSE or a failed hr
+}
+
+STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* pOppositeFormat,
                                             IAudioMediaType* pRequestedInputFormat,
                                             IAudioMediaType** ppSupportedInputFormat) {
     if (ppSupportedInputFormat == nullptr) {
@@ -339,28 +475,74 @@ STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/
     if (wfx == nullptr) {
         return E_INVALIDARG;
     }
-    MiniEQ_Trace(L"MiniEQ_APO: IsInputFormatSupported tag=%u bits=%u ch=%u rate=%lu float32=%d",
+    MiniEQ_Trace(L"MiniEQ_APO: IsInputFormatSupported tag=%u bits=%u ch=%u rate=%lu float32=%d child=%d",
                  wfx->wFormatTag, wfx->wBitsPerSample, wfx->nChannels,
-                 wfx->nSamplesPerSec, IsFloat32Format(wfx) ? 1 : 0);
-    if (!IsFloat32Format(wfx)) {
-        return APOERR_FORMAT_NOT_SUPPORTED;
-    }
-    // Our DSP state is sized for MINIEQ_MAX_CHANNELS channels: decline wider
-    // formats honestly instead of misprocessing them.
-    if (wfx->nChannels == 0 || wfx->nChannels > MINIEQ_MAX_CHANNELS) {
-        return APOERR_FORMAT_NOT_SUPPORTED;
-    }
+                 wfx->nSamplesPerSec, IsFloat32Format(wfx) ? 1 : 0,
+                 m_childAPO != nullptr ? 1 : 0);
+
+    // Fresh negotiation round: re-arm the child; this round may drop it.
+    m_childDroppedForStream = false;
+
     // Negotiation policy: accept-and-adapt. Any engine-proposed sample rate
     // is accepted -- EqDsp::Configure derives its smoothing constants from
     // the real rate (absurd rates are clamped there, never here) -- and any
     // channel count our fixed RT-safe state supports (1..MINIEQ_MAX_CHANNELS,
-    // covering stereo / 5.1 / 7.1 spatial layouts). Rejecting a format makes
-    // the engine silently drop the APO, so we only decline what we genuinely
-    // cannot process: non-float32, zero channels, or wider than our state.
-    // In-place SFX: we accept the requested format as-is.
-    *ppSupportedInputFormat = pRequestedInputFormat;
-    (*ppSupportedInputFormat)->AddRef();
-    return S_OK;
+    // covering stereo / 5.1 / 7.1 spatial layouts). A non-float32 stream gets
+    // a float32 twin suggested via S_FALSE; only an unprocessable channel
+    // count is declined, because declining makes the engine silently drop
+    // the APO from the graph.
+    IAudioMediaType* pOurs = nullptr;
+    HRESULT hrUs = OwnFormatVerdict(wfx, pRequestedInputFormat, &pOurs);
+    if (hrUs != S_OK && hrUs != S_FALSE) {
+        return hrUs; // genuinely cannot process; no child can fix that
+    }
+
+    // R2: chain the displaced APO. Verify the child also accepts the format
+    // WE are about to promise the engine; if it cannot, drop it for this
+    // stream and continue solo rather than failing the user's audio.
+    if (m_childAPO != nullptr && pOurs != nullptr) {
+        IAudioMediaType* pChildOut = nullptr;
+        const HRESULT hrC = m_childAPO->IsInputFormatSupported(
+            pOppositeFormat, pOurs, &pChildOut);
+        if (hrC == S_OK) {
+            // Child accepts our format as-is. (On S_OK the contract does not
+            // guarantee a usable *ppSupportedInputFormat -- ignore it.)
+            if (pChildOut != nullptr) {
+                pChildOut->Release();
+            }
+            MiniEQ_Trace(L"MiniEQ_APO: child accepts negotiated format");
+        } else if (hrC == S_FALSE && pChildOut != nullptr) {
+            // Child wants a different format: adopt it only if WE can also
+            // process it, else drop the child for this stream.
+            const WAVEFORMATEX* wfxC = pChildOut->GetAudioFormat();
+            IAudioMediaType* pOurs2 = nullptr;
+            const HRESULT hrUs2 = (wfxC != nullptr)
+                ? OwnFormatVerdict(wfxC, pChildOut, &pOurs2) : E_INVALIDARG;
+            if (hrUs2 == S_OK && pOurs2 != nullptr) {
+                pOurs->Release();
+                pOurs = pOurs2; // transfer; child's suggestion adopted
+                hrUs = S_FALSE; // we did not accept the requested format as-is
+                MiniEQ_Trace(L"MiniEQ_APO: adopted child-suggested format");
+            } else {
+                if (pOurs2 != nullptr) {
+                    pOurs2->Release();
+                }
+                m_childDroppedForStream = true;
+                MiniEQ_Trace(L"MiniEQ_APO: child suggestion unusable by us; child dropped for stream");
+            }
+            pChildOut->Release();
+        } else {
+            if (pChildOut != nullptr) {
+                pChildOut->Release();
+            }
+            m_childDroppedForStream = true;
+            MiniEQ_Trace(L"MiniEQ_APO: child rejected negotiated format hr=0x%08X; child dropped for stream",
+                         hrC);
+        }
+    }
+
+    *ppSupportedInputFormat = pOurs; // transfer
+    return hrUs;
 }
 
 STDMETHODIMP CEqApo::IsOutputFormatSupported(IAudioMediaType* pOppositeFormat,
@@ -412,6 +594,12 @@ STDMETHODIMP CEqApo::GetLatency(HNSTIME* pTime) {
     if (pTime == nullptr) {
         return E_POINTER;
     }
+    // R2: report the chained child's latency (ours adds none); fail open.
+    if (m_childAPO != nullptr) {
+        if (SUCCEEDED(m_childAPO->GetLatency(pTime))) {
+            return S_OK;
+        }
+    }
     *pTime = 0; // minimum-phase IIR: no added block latency
     return S_OK;
 }
@@ -420,7 +608,28 @@ STDMETHODIMP CEqApo::Reset() {
     // The engine calls this between streams; drop filter state so the next
     // stream starts clean. Safe on the RT thread: no allocation, no syscalls.
     m_dsp.Reset();
+    // R2: the child holds filter state too.
+    if (m_childAPO != nullptr && !m_childDroppedForStream) {
+        m_childAPO->Reset();
+    }
     return S_OK;
+}
+
+// R2: release the chained child APO, if any. Idempotent.
+void CEqApo::ReleaseChild() {
+    if (m_childConfig != nullptr) {
+        m_childConfig->Release();
+        m_childConfig = nullptr;
+    }
+    if (m_childRT != nullptr) {
+        m_childRT->Release();
+        m_childRT = nullptr;
+    }
+    if (m_childAPO != nullptr) {
+        m_childAPO->Release();
+        m_childAPO = nullptr;
+    }
+    m_childDroppedForStream = false;
 }
 
 //------------------------------------------------------------------------------
@@ -485,6 +694,20 @@ try {
     MiniEQ_Trace(L"MiniEQ_APO: LockForProcess ch=%lu rate=%.0f",
                  channels, (double)rate);
 
+    // R2: lock the chained child with the same (negotiated) descriptors. A
+    // child that cannot lock is dropped for this stream -- our own lock
+    // already validated above, so the user's audio never fails because of it.
+    if (m_childConfig != nullptr && !m_childDroppedForStream) {
+        const HRESULT hrC = m_childConfig->LockForProcess(
+            u32NumInputConnections, ppInputConnections,
+            u32NumOutputConnections, ppOutputConnections);
+        if (FAILED(hrC)) {
+            MiniEQ_Trace(L"MiniEQ_APO: LockForProcess child failed hr=0x%08X; continuing solo",
+                         hrC);
+            m_childDroppedForStream = true;
+        }
+    }
+
     // Background worker: retries the settings mapping until the UI has
     // created it, and performs the crossfeed heap work off the RT thread.
     // (LockForProcess runs on an engine setup thread -- thread creation and
@@ -537,6 +760,12 @@ STDMETHODIMP CEqApo::UnlockForProcess() {
     if (!m_locked) {
         return S_OK;
     }
+    // R2: unlock the child (reverse of lock order), then re-arm for the next
+    // negotiation round.
+    if (m_childConfig != nullptr && !m_childDroppedForStream) {
+        m_childConfig->UnlockForProcess();
+    }
+    m_childDroppedForStream = false;
     StopWorker();
     CloseStatusMapping();
     CloseGlobalMapping();
@@ -853,7 +1082,7 @@ STDMETHODIMP_(UINT32) CEqApo::CalcOutputFrames(UINT32 u32InputFrameCount) {
     return u32InputFrameCount; // 1:1 in-place processing
 }
 
-STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
+STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 u32NumInputConnections,
                                       APO_CONNECTION_PROPERTY** ppInputConnections,
                                       UINT32 u32NumOutputConnections,
                                       APO_CONNECTION_PROPERTY** ppOutputConnections) noexcept
@@ -861,6 +1090,16 @@ try {
     if (ppInputConnections == nullptr || ppInputConnections[0] == nullptr) {
         return;
     }
+
+    // R2: the displaced APO processes first, in place; our EQ runs last.
+    // Inside our try/catch: a misbehaving child fails open like everything
+    // else on this thread. The child may update buffer flags / valid frame
+    // counts; everything below reads them after this call.
+    if (m_childRT != nullptr && !m_childDroppedForStream) {
+        m_childRT->APOProcess(u32NumInputConnections, ppInputConnections,
+                              u32NumOutputConnections, ppOutputConnections);
+    }
+
     APO_CONNECTION_PROPERTY* in = ppInputConnections[0];
 
     switch (in->u32BufferFlags) {

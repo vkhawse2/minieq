@@ -44,6 +44,17 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId);
 // True if the SFX slot of this endpoint already points at our APO.
 HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached);
 
+// R2: APO-chaining bookkeeping. Attach stashes the incumbent SFX-slot CLSID
+// (when it is a real third-party APO, not us) under
+// HKLM\SOFTWARE\MiniEQ\ChildAPO\<endpoint-guid>; the APO reads it at
+// Initialize to run the displaced APO as its child; detach restores it.
+// Writes require elevation; reads are world-readable.
+HRESULT MiniEQ_StashChildApoClsid(const wchar_t* endpointId,
+                                 const wchar_t* childClsid);
+HRESULT MiniEQ_ReadChildApoClsid(const wchar_t* endpointId, wchar_t* out,
+                                size_t cch); // S_OK = found, S_FALSE = absent
+HRESULT MiniEQ_ClearChildApoClsid(const wchar_t* endpointId);
+
 #ifdef __cplusplus
 }
 #endif

@@ -22,8 +22,9 @@ target_include_directories(MiniEQ_APO PRIVATE
     ${CMAKE_SOURCE_DIR}/shared
 )
 
-# ole32/uuid: COM. advapi32: registry (registration.cpp).
-target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32)
+# ole32/uuid: COM. advapi32: registry (registration.cpp). AudioEng:
+# CreateAudioMediaTypeFromUncompressedAudioFormat (R1 format suggestion).
+target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32 AudioEng)
 
 # Diagnostic trace of the APO load path (see trace.h). Compiled out when 0.
 target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=1)

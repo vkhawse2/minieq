@@ -126,6 +126,20 @@ private:
     // Returns true for the one format we process: interleaved IEEE float32.
     static bool IsFloat32Format(const WAVEFORMATEX* wfx);
 
+    // R1: build a float32 IAudioMediaType twin of a non-float32 format, so
+    // negotiation can answer S_FALSE ("not that, but this") instead of
+    // APOERR_FORMAT_NOT_SUPPORTED (which makes the engine silently drop us).
+    static HRESULT SuggestFloat32MediaType(const WAVEFORMATEX* wfx,
+                                          IAudioMediaType** ppOut);
+    // R1: our own format verdict, ignoring any chained child. S_OK accepts
+    // as-is; S_FALSE carries a float32 suggestion; APOERR is reserved for
+    // channel counts our fixed RT-safe state genuinely cannot process.
+    static HRESULT OwnFormatVerdict(const WAVEFORMATEX* wfx,
+                                    IAudioMediaType* pRequested,
+                                    IAudioMediaType** ppOut);
+    // R2: release the chained child APO, if any. Idempotent.
+    void ReleaseChild();
+
     // Worker thread helpers (non-RT): (re)create the channel mappings if the
     // initial creation in LockForProcess failed, service XFeed requests.
     static DWORD WINAPI WorkerThreadProc(LPVOID pParam);
@@ -187,6 +201,17 @@ private:
     std::atomic<const MiniEQGlobalState*> m_pGlobal{nullptr}; // mapped view, read-only
     int64_t        m_lastGlobalSeq = 0;       // last adopted global version
     bool           m_globalEnabled = true;    // RT-side cache; default enabled
+
+    // R2: chained child APO -- the incumbent this APO displaced from the
+    // endpoint's SFX slot (e.g. a vendor effect), stashed at attach time by
+    // MiniEQ_AttachToEndpoint under HKLM\SOFTWARE\MiniEQ\ChildAPO. Created
+    // in Initialize; every call is delegated (negotiate -> lock -> process
+    // -> unlock) and any failure drops the child for the stream instead of
+    // failing the user's audio.
+    IAudioProcessingObject* m_childAPO = nullptr;
+    IAudioProcessingObjectRT* m_childRT = nullptr;
+    IAudioProcessingObjectConfiguration* m_childConfig = nullptr;
+    bool           m_childDroppedForStream = false;
 
     HANDLE         m_hWorkerThread = nullptr; // background worker (non-RT)
     HANDLE         m_hWorkerStop = nullptr;   // manual-reset stop event
