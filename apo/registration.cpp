@@ -130,7 +130,7 @@ HRESULT MiniEQ_UnregisterApoDeclaration() {
 // carries a user-only DACL and the APO's trace writes silently fail, which
 // is exactly the "empty log, APO apparently dead" symptom. Called from
 // DllRegisterServer, which always runs elevated (installer / regsvr32).
-HRESULT MiniEQ_EnsureLogDir() {
+HRESULT MiniEQ_EnsureLogDirForInstall() {
     wchar_t dir[MAX_PATH] = {};
     DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", dir, ARRAYSIZE(dir));
     if (n == 0 || n >= ARRAYSIZE(dir)) {

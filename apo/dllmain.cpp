@@ -126,7 +126,7 @@ STDAPI DllRegisterServer() {
     // (service identity), not just the installing user -- otherwise the
     // APO's diagnostic trace silently fails. Best-effort: a log-dir
     // problem must not fail the install itself.
-    MiniEQ_EnsureLogDir();
+    MiniEQ_EnsureLogDirForInstall();
     return S_OK;
 }
 
