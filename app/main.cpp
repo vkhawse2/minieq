@@ -162,7 +162,7 @@ static void BuildBandControls(int numBands) {
         SendMessageW(g_bandName[i], WM_SETFONT, (WPARAM)font, TRUE);
         g_bandVal[i] = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER,
                                      x, 304, spacing, 18, g_hwnd,
-                                     (HMENU)(IDC_BANDVAL0 + i),
+                                     (HMENU)(INT_PTR)(IDC_BANDVAL0 + i),
                                      g_hInst, nullptr);
         SendMessageW(g_bandVal[i], WM_SETFONT, (WPARAM)font, TRUE);
     }
@@ -342,7 +342,7 @@ static void BuildControls(HWND hwnd) {
     for (int i = 0; i < 4; ++i) {
         HWND b = CreateWindowW(L"BUTTON", presetNames[i], WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                76 + i * 78, 402, 70, 26, hwnd,
-                               (HMENU)(IDC_PRESET_FLAT + i), g_hInst, nullptr);
+                               (HMENU)(INT_PTR)(IDC_PRESET_FLAT + i), g_hInst, nullptr);
         applyFont(b);
     }
 

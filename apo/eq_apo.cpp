@@ -8,6 +8,7 @@
 #include "guids.h"
 
 #include <mmdeviceapi.h>
+#include <ks.h>          // must come before ksmedia.h
 #include <ksmedia.h>   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 #include <strsafe.h>
 
@@ -213,6 +214,13 @@ STDMETHODIMP CEqApo::GetLatency(HNSTIME* pTime) {
     return S_OK;
 }
 
+STDMETHODIMP CEqApo::Reset() {
+    // The engine calls this between streams; drop filter state so the next
+    // stream starts clean. Safe on the RT thread: no allocation, no syscalls.
+    m_dsp.Reset();
+    return S_OK;
+}
+
 //------------------------------------------------------------------------------
 // IAudioProcessingObjectConfiguration
 //------------------------------------------------------------------------------
@@ -284,6 +292,14 @@ STDMETHODIMP CEqApo::UnlockForProcess() {
 // IAudioProcessingObjectRT -- real-time audio thread. No blocking, no syscalls,
 // no COM, no allocation here.
 //------------------------------------------------------------------------------
+
+STDMETHODIMP_(UINT32) CEqApo::CalcInputFrames(UINT32 u32OutputFrameCount) {
+    return u32OutputFrameCount; // 1:1 in-place processing
+}
+
+STDMETHODIMP_(UINT32) CEqApo::CalcOutputFrames(UINT32 u32InputFrameCount) {
+    return u32InputFrameCount; // 1:1 in-place processing
+}
 
 STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
                                       APO_CONNECTION_PROPERTY** ppInputConnections,

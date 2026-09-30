@@ -18,11 +18,26 @@ jobs:
       - name: Build (Release)
         run: cmake --build build --config Release
 
+      - name: Stage binaries
+        run: |
+          mkdir build\stage
+          copy build\app\Release\MiniEQ.exe build\stage\
+          copy build\apo\Release\MiniEQ_APO.dll build\stage\
+
+      - name: Install WiX Toolset v3
+        run: choco install wixtoolset --version=3.14.1 -y --no-progress
+
+      - name: Build MSI installer
+        run: |
+          $wixBin = Join-Path ([System.Environment]::GetEnvironmentVariable("WIX", "Machine")) "bin"
+          & "$wixBin\candle.exe" -arch x64 "-dBinDir=build\stage" installer\MiniEQ.wxs -out build\MiniEQ.wixobj
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$wixBin\light.exe" build\MiniEQ.wixobj -out build\stage\MiniEQ-0.1.0-x64.msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: minieq-windows-x64
-          path: |
-            build/Release/MiniEQ.exe
-            build/Release/MiniEQ_APO.dll
+          path: build\stage\*
           if-no-files-found: error

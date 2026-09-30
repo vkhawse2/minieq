@@ -79,6 +79,14 @@ This produces `build\apo\Release\MiniEQ_APO.dll` and `build\app\Release\MiniEQ.e
 
 ## Install & test
 
+**Easy path:** every push to `main` builds an MSI on GitHub Actions — download
+`MiniEQ-0.1.0-x64.msi` from the latest
+[build run's artifacts](https://github.com/vkhawse2/minieq/actions/workflows/build.yml)
+(requires GitHub login), run it, and skip straight to step 3. The installer
+puts both files in `C:\Program Files\MiniEQ\` and registers the APO DLL.
+
+Manual path:
+
 1. Copy both files somewhere permanent, e.g. `C:\Program Files\MiniEQ\`.
    (The registered DLL path must not move afterwards.)
 2. **Elevated** command prompt in that folder:

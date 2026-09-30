@@ -51,12 +51,15 @@ public:
     STDMETHODIMP GetRegistrationProperties(APO_REG_PROPERTIES** ppRegProps) override;
     STDMETHODIMP GetInputChannelCount(UINT32* pu32ChannelCount) override;
     STDMETHODIMP GetLatency(HNSTIME* pTime) override;
+    STDMETHODIMP Reset() override;
 
     // IAudioProcessingObjectRT
     STDMETHODIMP_(void) APOProcess(UINT32 u32NumInputConnections,
                                   APO_CONNECTION_PROPERTY** ppInputConnections,
                                   UINT32 u32NumOutputConnections,
                                   APO_CONNECTION_PROPERTY** ppOutputConnections) override;
+    STDMETHODIMP_(UINT32) CalcInputFrames(UINT32 u32OutputFrameCount) override;
+    STDMETHODIMP_(UINT32) CalcOutputFrames(UINT32 u32InputFrameCount) override;
 
     // IAudioProcessingObjectConfiguration
     STDMETHODIMP LockForProcess(UINT32 u32NumInputConnections,

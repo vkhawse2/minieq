@@ -12,7 +12,7 @@ void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
     for (size_t i = 0; prefix[i] != L'\0' && o + 1 < outNameChars; ++i) {
         outName[o++] = prefix[i];
     }
-    if (endpointId != nullptr) {
+    if (endpointId != NULL) {
         for (size_t i = 0; endpointId[i] != L'\0' && o + 1 < outNameChars; ++i) {
             wchar_t c = endpointId[i];
             const int ok = (c >= L'0' && c <= L'9') ||

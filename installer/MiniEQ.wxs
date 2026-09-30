@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MiniEQ.wxs -- WiX v3 installer source for MiniEQ.
+
+  Installs (per-machine, Program Files):
+    MiniEQ.exe        the tiny Win32 UI
+    MiniEQ_APO.dll    the system-effect APO, COM self-registered on
+                      install (DllRegisterServer) and unregistered on
+                      uninstall (DllUnregisterServer)
+
+  Per-endpoint attach (FxProperties) is NOT done by the installer: it is a
+  one-time, per-device, elevated step the app itself performs from its
+  "Attach" button. This keeps the MSI to files + COM registration.
+
+  Build (from repo root, WiX v3 on PATH):
+    candle -arch x64 -dBinDir=build\Release installer\MiniEQ.wxs -out build\MiniEQ.wixobj
+    light  build\MiniEQ.wixobj -out build\MiniEQ-0.1.0-x64.msi
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="MiniEQ"
+           Language="1033"
+           Version="0.1.0"
+           Manufacturer="vkhawse2"
+           UpgradeCode="A220824C-9C18-477E-92BB-1E0210B316DB">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="MiniEQ -- minimal system-wide equalizer for Windows"
+             Comments="Standalone sAPO + native Win32 UI. No Equalizer APO required." />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of MiniEQ is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="MiniEQ" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="MiniEQ" />
+      </Directory>
+    </Directory>
+
+    <Feature Id="ProductFeature" Title="MiniEQ" Level="1" Description="MiniEQ app and audio engine plug-in.">
+      <ComponentRef Id="Comp_MiniEQ_exe" />
+      <ComponentRef Id="Comp_MiniEQ_APO_dll" />
+    </Feature>
+
+    <Component Id="Comp_MiniEQ_exe"
+               Guid="5920F25B-69E7-4B33-B31A-6C7898F253A9"
+               Directory="INSTALLFOLDER">
+      <File Id="File_MiniEQ_exe"
+            Source="$(var.BinDir)\MiniEQ.exe"
+            KeyPath="yes">
+        <Shortcut Id="Shortcut_StartMenu"
+                  Directory="ApplicationProgramsFolder"
+                  Name="MiniEQ"
+                  Description="MiniEQ -- minimal system-wide equalizer"
+                  WorkingDirectory="INSTALLFOLDER" />
+      </File>
+    </Component>
+
+    <Component Id="Comp_MiniEQ_APO_dll"
+               Guid="148E2613-A394-44A6-BC49-FCC4EFD26B28"
+               Directory="INSTALLFOLDER">
+      <!--
+        SelfReg: Windows Installer calls the DLL's DllRegisterServer at
+        install time (registers COM CLSID {5E52BF50-F229-46A0-8B7D-AA805D47FB60})
+        and DllUnregisterServer at uninstall. Runs elevated: the package is
+        per-machine.
+      -->
+      <File Id="File_MiniEQ_APO_dll"
+            Source="$(var.BinDir)\MiniEQ_APO.dll"
+            KeyPath="yes"
+            SelfReg="yes" />
+    </Component>
+
+  </Product>
+</Wix>
