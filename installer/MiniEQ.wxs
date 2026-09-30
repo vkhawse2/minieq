@@ -45,6 +45,7 @@
     <Feature Id="ProductFeature" Title="MiniEQ" Level="1" Description="MiniEQ app and audio engine plug-in.">
       <ComponentRef Id="Comp_MiniEQ_exe" />
       <ComponentRef Id="Comp_MiniEQ_APO_dll" />
+      <ComponentRef Id="Comp_StartMenuShortcut" />
     </Feature>
 
     <Component Id="Comp_MiniEQ_exe"
@@ -52,13 +53,30 @@
                Directory="INSTALLFOLDER">
       <File Id="File_MiniEQ_exe"
             Source="$(var.BinDir)\MiniEQ.exe"
-            KeyPath="yes">
-        <Shortcut Id="Shortcut_StartMenu"
-                  Directory="ApplicationProgramsFolder"
-                  Name="MiniEQ"
-                  Description="MiniEQ -- minimal system-wide equalizer"
-                  WorkingDirectory="INSTALLFOLDER" />
-      </File>
+            KeyPath="yes" />
+    </Component>
+
+    <!--
+      Start Menu shortcut lives in its own component (the documented WiX
+      pattern for per-machine packages): a non-advertised shortcut must use
+      a registry KeyPath (ICE43/ICE57), and RemoveFolder cleans up the
+      Programs\MiniEQ folder on uninstall (ICE64).
+    -->
+    <Component Id="Comp_StartMenuShortcut"
+               Guid="17004A20-1A0C-47DF-968C-B22517BC63FD"
+               Directory="ApplicationProgramsFolder">
+      <Shortcut Id="Shortcut_StartMenu"
+                Name="MiniEQ"
+                Description="MiniEQ -- minimal system-wide equalizer"
+                Target="[INSTALLFOLDER]MiniEQ.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="Remove_ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\MiniEQ"
+                     Name="installed"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
     </Component>
 
     <Component Id="Comp_MiniEQ_APO_dll"
