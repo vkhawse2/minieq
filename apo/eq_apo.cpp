@@ -36,11 +36,11 @@ STDMETHODIMP CEqApo::QueryInterface(REFIID riid, void** ppv) {
     }
     if (riid == IID_IUnknown) {
         *ppv = static_cast<IAudioProcessingObject*>(this);
-    } else if (riid == IID_IAudioProcessingObject) {
+    } else if (riid == __uuidof(IAudioProcessingObject)) {
         *ppv = static_cast<IAudioProcessingObject*>(this);
-    } else if (riid == IID_IAudioProcessingObjectRT) {
+    } else if (riid == __uuidof(IAudioProcessingObjectRT)) {
         *ppv = static_cast<IAudioProcessingObjectRT*>(this);
-    } else if (riid == IID_IAudioProcessingObjectConfiguration) {
+    } else if (riid == __uuidof(IAudioProcessingObjectConfiguration)) {
         *ppv = static_cast<IAudioProcessingObjectConfiguration*>(this);
     } else {
         *ppv = nullptr;
@@ -204,7 +204,7 @@ STDMETHODIMP CEqApo::GetRegistrationProperties(APO_REG_PROPERTIES** ppRegProps) 
     p->u32MaxOutputConnections = 1;
     p->u32MaxInstances = UINT32_MAX; // one instance per endpoint
     p->u32NumAPOInterfaces = 1;
-    p->iidAPOInterfaceList[0] = IID_IAudioProcessingObject;
+    p->iidAPOInterfaceList[0] = __uuidof(IAudioProcessingObject);
 
     *ppRegProps = p;
     return S_OK;

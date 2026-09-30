@@ -7,9 +7,3 @@
 
 #include <initguid.h>
 #include "guids.h"
-
-// Instantiate the APO interface IIDs (IID_IAudioProcessingObject,
-// IID_IAudioProcessingObjectRT, IID_IAudioProcessingObjectConfiguration)
-// in this TU: audioenginebaseapo.h declares them via DEFINE_GUID, which only
-// emits definitions when INITGUID is already defined -- as it is here.
-#include <audioenginebaseapo.h>
