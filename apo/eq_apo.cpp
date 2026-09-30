@@ -106,6 +106,7 @@ CEqApo::CEqApo(IUnknown* pUnkOuter)
 
 CEqApo::~CEqApo() {
     StopWorker();
+    CloseStatusMapping();
     const EqSettings* settings = m_pSettings.exchange(nullptr);
     if (settings != nullptr) {
         UnmapViewOfFile(settings);
@@ -280,6 +281,8 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
     if (!m_endpointId.empty()) {
         MiniEQ_MappingNameForEndpoint(m_endpointId.c_str(), m_mappingName,
                                      ARRAYSIZE(m_mappingName));
+        MiniEQ_StatusNameForEndpoint(m_endpointId.c_str(), m_statusName,
+                                     ARRAYSIZE(m_statusName));
     }
     MiniEQ_Trace(L"MiniEQ_APO: Initialize -> S_OK device=\"%s\" mapping=\"%s\"",
                  m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
@@ -414,6 +417,7 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
 
     m_dsp.Configure(rate, channels);
     m_channels = channels;
+    m_sampleRate = wfx->nSamplesPerSec;
     MiniEQ_Trace(L"MiniEQ_APO: LockForProcess ch=%lu rate=%.0f",
                  channels, (double)rate);
 
@@ -439,6 +443,13 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
                  m_pSettings.load(std::memory_order_acquire) != nullptr
                      ? L"OPEN" : L"not yet");
 
+    // The heartbeat channel is opened by the worker (single-threaded there,
+    // so no open race); publish once here in case it is already present.
+    PublishStatus();
+    MiniEQ_Trace(L"MiniEQ_APO: LockForProcess status=\"%s\" heartbeat=%s",
+                 m_statusName[0] ? m_statusName : L"<none>",
+                 m_pStatus != nullptr ? L"OPEN" : L"not yet");
+
     m_locked = true;
     return S_OK;
 }
@@ -448,6 +459,7 @@ STDMETHODIMP CEqApo::UnlockForProcess() {
         return S_OK;
     }
     StopWorker();
+    CloseStatusMapping();
     const EqSettings* settings = m_pSettings.exchange(nullptr);
     if (settings != nullptr) {
         UnmapViewOfFile(settings);
@@ -477,6 +489,10 @@ void CEqApo::WorkerStep() {
     if (m_pSettings.load(std::memory_order_acquire) == nullptr) {
         OpenSettingsMapping();
     }
+    if (m_pStatus == nullptr) {
+        OpenStatusMapping();
+    }
+    PublishStatus();
     m_dsp.ServiceVirtualizationWorker();
 }
 
@@ -507,6 +523,65 @@ void CEqApo::OpenSettingsMapping() {
     } else {
         UnmapViewOfFile(v);
         CloseHandle(h);
+    }
+}
+
+void CEqApo::OpenStatusMapping() {
+    if (m_statusName[0] == L'\0') {
+        return;
+    }
+    HANDLE h = OpenFileMappingW(FILE_MAP_WRITE, FALSE, m_statusName);
+    if (h == nullptr) {
+        return; // UI hasn't created it yet (or isn't running); retry later
+    }
+    void* v = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, sizeof(MiniEQApoStatus));
+    if (v == nullptr) {
+        CloseHandle(h);
+        return;
+    }
+    MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(v);
+    if (st->structSize == 0) {
+        // First writer initializes the header (the UI does this too at
+        // creation; writing the same values twice is benign).
+        st->structSize = sizeof(MiniEQApoStatus);
+        st->version = MINIEQ_STATUS_VERSION;
+        LARGE_INTEGER freq;
+        if (QueryPerformanceFrequency(&freq)) {
+            m_qpcFreq = freq.QuadPart;
+        }
+        st->qpcFrequency = m_qpcFreq;
+        MiniEQ_Trace(L"MiniEQ_APO: status channel OPEN \"%s\"", m_statusName);
+    } else if (st->structSize != sizeof(MiniEQApoStatus) ||
+               st->version != MINIEQ_STATUS_VERSION) {
+        UnmapViewOfFile(v);
+        CloseHandle(h);
+        MiniEQ_Trace(L"MiniEQ_APO: status channel version mismatch, ignoring");
+        return;
+    }
+    m_pStatus = st;
+    m_hStatusMap = h;
+}
+
+void CEqApo::PublishStatus() {
+    if (m_pStatus == nullptr) {
+        return;
+    }
+    m_pStatus->processCalls = (int64_t)m_rtCalls.load(std::memory_order_relaxed);
+    m_pStatus->lastProcessQpc = m_rtLastQpc.load(std::memory_order_relaxed);
+    m_pStatus->locked = m_locked ? 1 : 0;
+    m_pStatus->channels = (int32_t)m_channels;
+    m_pStatus->sampleRate = (int32_t)m_sampleRate;
+    m_pStatus->initOk = m_initialized ? 1 : 0;
+}
+
+void CEqApo::CloseStatusMapping() {
+    if (m_pStatus != nullptr) {
+        UnmapViewOfFile(m_pStatus);
+        m_pStatus = nullptr;
+    }
+    if (m_hStatusMap != nullptr) {
+        CloseHandle(m_hStatusMap);
+        m_hStatusMap = nullptr;
     }
 }
 
@@ -557,6 +632,17 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
 
     FLOAT32* frames = reinterpret_cast<FLOAT32*>(in->pBuffer);
     const UINT32 validFrames = in->u32ValidFrameCount;
+
+    // Heartbeat for the UI's "is audio really passing through" status. The
+    // counter bumps every block; QPC is snapshotted every 64th block (cheap
+    // enough, and plenty for a 2-second freshness window). This thread is
+    // the only writer: plain relaxed atomics, no fences.
+    m_rtCalls.fetch_add(1, std::memory_order_relaxed);
+    if ((m_rtQpcTick++ & 63) == 0) {
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        m_rtLastQpc.store(qpc.QuadPart, std::memory_order_relaxed);
+    }
 
     {
         // Diagnostic only: one file write on the RT thread, first call only.

@@ -43,6 +43,29 @@ private:
     int64_t    m_seq = 0;
 };
 
+// StatusLink -- UI side of the APO->UI heartbeat.
+//
+// Creates the "Local\\MiniEQ_Status_{endpoint}" mapping (PAGE_READWRITE) so
+// the APO's worker thread can publish its heartbeat there. Read() copies a
+// snapshot for the status timer; false means the channel isn't up (yet).
+class StatusLink {
+public:
+    StatusLink();
+    ~StatusLink();
+
+    StatusLink(const StatusLink&) = delete;
+    StatusLink& operator=(const StatusLink&) = delete;
+
+    bool Open(const std::wstring& endpointId);
+    void Close();
+    bool IsOpen() const { return m_pView != nullptr; }
+    bool Read(MiniEQApoStatus* out);
+
+private:
+    HANDLE           m_hMap = nullptr;
+    MiniEQApoStatus* m_pView = nullptr;
+};
+
 std::wstring MiniEQ_IniPath();
 void MiniEQ_SaveDeviceSettings(const std::wstring& endpointId, const EqSettings& s);
 bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out);

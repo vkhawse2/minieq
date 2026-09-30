@@ -73,6 +73,61 @@ void SettingsLink::Push() {
     m_staging.sequence = m_seq;
 }
 
+StatusLink::StatusLink() {
+}
+
+StatusLink::~StatusLink() {
+    Close();
+}
+
+bool StatusLink::Open(const std::wstring& endpointId) {
+    Close();
+
+    wchar_t name[160] = {};
+    MiniEQ_StatusNameForEndpoint(endpointId.c_str(), name, ARRAYSIZE(name));
+
+    m_hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                0, sizeof(MiniEQApoStatus), name);
+    if (m_hMap == nullptr) {
+        return false;
+    }
+    m_pView = static_cast<MiniEQApoStatus*>(
+        MapViewOfFile(m_hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                      sizeof(MiniEQApoStatus)));
+    if (m_pView == nullptr) {
+        CloseHandle(m_hMap);
+        m_hMap = nullptr;
+        return false;
+    }
+    if (m_pView->structSize == 0) {
+        // We created it: publish the header so the APO can validate.
+        m_pView->structSize = sizeof(MiniEQApoStatus);
+        m_pView->version = MINIEQ_STATUS_VERSION;
+    }
+    return true;
+}
+
+void StatusLink::Close() {
+    if (m_pView != nullptr) {
+        UnmapViewOfFile(m_pView);
+        m_pView = nullptr;
+    }
+    if (m_hMap != nullptr) {
+        CloseHandle(m_hMap);
+        m_hMap = nullptr;
+    }
+}
+
+bool StatusLink::Read(MiniEQApoStatus* out) {
+    if (m_pView == nullptr || out == nullptr) {
+        return false;
+    }
+    // The APO worker writes aligned fields; a plain copy is a consistent
+    // enough snapshot for a 500 ms status poll.
+    memcpy(out, m_pView, sizeof(MiniEQApoStatus));
+    return true;
+}
+
 std::wstring MiniEQ_IniPath() {
     wchar_t appdata[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {

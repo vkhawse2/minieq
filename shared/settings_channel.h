@@ -1,14 +1,19 @@
 // settings_channel.h -- shared between the APO DLL and the UI app.
 //
-// The live settings channel between MiniEQ (UI) and MiniEQ_APO (DSP).
+// Two channels over named file mappings, both keyed by endpoint ID:
 //
-// Design: a named file-mapping object (shared memory) holding one EqSettings
-// struct, plus a 64-bit sequence counter. The UI is the single writer; the
-// APO is the single reader. The APO's real-time thread only ever performs an
-// atomic load of the sequence counter and, when it changes, a plain memcpy of
-// the struct -- no locks, no syscalls, no COM on the audio thread.
+//  1. Settings (UI -> APO): the live EQ settings. The UI is the single
+//     writer; the APO is the single reader. The APO's real-time thread only
+//     ever performs an atomic load of the sequence counter and, when it
+//     changes, a plain memcpy of the struct -- no locks, no syscalls, no COM
+//     on the audio thread.
 //
-// The mapping name is derived from the Windows audio endpoint ID, so each
+//  2. Status (APO -> UI): the heartbeat. The APO's background worker thread
+//     publishes APOProcess call counts and timestamps; the UI polls them on a
+//     timer to show whether audio is REALLY flowing through the APO instead
+//     of guessing from registry keys.
+//
+// The mapping names are derived from the Windows audio endpoint ID, so each
 // output device (e.g. WH-1000XM4 vs Tribit XSound Go) gets its own independent
 // EQ state: per-device EQ memory falls out naturally.
 
@@ -61,8 +66,30 @@ typedef struct EqSettings {
     int32_t          _reserved[5];
 } EqSettings;
 
+// APO -> UI heartbeat. Written by the APO's background worker thread; read by
+// the UI on a timer. processCalls advancing means APOProcess is really being
+// called by the engine -- the ground truth for "EQ is live".
+#define MINIEQ_STATUS_VERSION 1
+
+typedef struct MiniEQApoStatus {
+    uint32_t structSize;             // sizeof(MiniEQApoStatus): versioning
+    uint32_t version;                // MINIEQ_STATUS_VERSION
+    volatile int64_t processCalls;   // APOProcess invocations, all-time
+    volatile int64_t lastProcessQpc; // QPC value at the last APOProcess call
+    volatile int64_t qpcFrequency;   // QueryPerformanceFrequency() result
+    volatile int32_t locked;         // LockForProcess completed
+    volatile int32_t channels;       // locked format channel count
+    volatile int32_t sampleRate;     // locked format sample rate
+    volatile int32_t initOk;         // Initialize succeeded
+    volatile int32_t _reserved[4];
+} MiniEQApoStatus;
+
 // "MiniEQ_{sanitized-endpoint-id}" -- caller supplies a buffer.
 void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
+                                  wchar_t* outName, size_t outNameChars);
+
+// "MiniEQ_Status_{sanitized-endpoint-id}" -- caller supplies a buffer.
+void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
 
 // Fill an EqSettings with flat (no-op) values, sequence = 1.

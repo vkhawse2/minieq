@@ -5,9 +5,8 @@
 #include <string.h>
 #include <wchar.h>
 
-void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
-                                  wchar_t* outName, size_t outNameChars) {
-    static const wchar_t prefix[] = L"Local\\MiniEQ_";
+static void BuildMappingName(const wchar_t* prefix, const wchar_t* endpointId,
+                             wchar_t* outName, size_t outNameChars) {
     size_t o = 0;
     for (size_t i = 0; prefix[i] != L'\0' && o + 1 < outNameChars; ++i) {
         outName[o++] = prefix[i];
@@ -22,6 +21,18 @@ void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
         }
     }
     outName[o] = L'\0';
+}
+
+void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
+                                  wchar_t* outName, size_t outNameChars) {
+    static const wchar_t prefix[] = L"Local\\MiniEQ_";
+    BuildMappingName(prefix, endpointId, outName, outNameChars);
+}
+
+void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
+                                  wchar_t* outName, size_t outNameChars) {
+    static const wchar_t prefix[] = L"Local\\MiniEQ_Status_";
+    BuildMappingName(prefix, endpointId, outName, outNameChars);
 }
 
 void MiniEQ_SettingsInitFlat(EqSettings* s) {

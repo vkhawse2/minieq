@@ -130,6 +130,9 @@ private:
     static DWORD WINAPI WorkerThreadProc(LPVOID pParam);
     void WorkerStep();
     void OpenSettingsMapping(); // best-effort; worker retries on failure
+    void OpenStatusMapping();   // worker thread, best-effort with retry
+    void PublishStatus();       // worker thread: heartbeat -> UI
+    void CloseStatusMapping();  // UnlockForProcess / destructor
     void StopWorker();
 
     CInnerUnknown  m_inner;      // constructed first; outer falls back to it
@@ -149,6 +152,17 @@ private:
     std::atomic<const EqSettings*> m_pSettings{nullptr}; // mapped view, read-only
     int64_t        m_lastSequence = 0;        // last applied settings version
     EqSettings     m_localCopy;               // RT-side working copy
+
+    // Heartbeat (APO -> UI): the RT thread only bumps counters; the worker
+    // publishes them into the status mapping the UI created.
+    wchar_t        m_statusName[160] = {};    // MMF name for the status block
+    HANDLE         m_hStatusMap = nullptr;    // status mapping (worker only)
+    MiniEQApoStatus* m_pStatus = nullptr;     // mapped view (worker only)
+    std::atomic<uint64_t> m_rtCalls{0};       // RT thread (relaxed)
+    std::atomic<int64_t>  m_rtLastQpc{0};     // RT thread (relaxed)
+    uint32_t       m_rtQpcTick = 0;           // RT thread only
+    int64_t        m_qpcFreq = 0;             // worker only
+    uint32_t       m_sampleRate = 0;
 
     HANDLE         m_hWorkerThread = nullptr; // background worker (non-RT)
     HANDLE         m_hWorkerStop = nullptr;   // manual-reset stop event
