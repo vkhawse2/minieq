@@ -18,6 +18,9 @@
 #include "eq_apo.h"
 #include "guids.h"
 #include "registration.h"
+#include "trace.h"
+
+#include <strsafe.h>
 
 static volatile LONG g_lockCount = 0;
 static HMODULE g_hModule = nullptr;
@@ -47,6 +50,10 @@ public:
     STDMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (ppv == nullptr) return E_POINTER;
         *ppv = nullptr;
+        MiniEQ_Trace(L"MiniEQ_APO: CreateInstance outer=%s riidIsIUnknown=%d",
+                     pUnkOuter != nullptr ? L"non-null (engine aggregates)"
+                                          : L"null",
+                     IsEqualGUID(riid, IID_IUnknown));
         // The audio engine AGGREGATES system-effect APOs: CreateInstance
         // arrives with a non-null controlling unknown and IID_IUnknown.
         // Answering CLASS_E_NOAGGREGATION here makes the engine silently
@@ -57,6 +64,7 @@ public:
         if (apo == nullptr) return E_OUTOFMEMORY;
         HRESULT hr = apo->NonDelegatingQueryInterface(riid, ppv);
         apo->NonDelegatingRelease(); // balance the initial inner ref
+        MiniEQ_Trace(L"MiniEQ_APO: CreateInstance -> hr=0x%08lx", hr);
         return hr;
     }
     STDMETHODIMP LockServer(BOOL bLock) override {
@@ -74,16 +82,31 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
+        // Loader-lock safe: OutputDebugString only, no file I/O here.
+        wchar_t host[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, host, ARRAYSIZE(host));
+        wchar_t msg[640] = {};
+        StringCchPrintfW(msg, ARRAYSIZE(msg),
+                         L"MiniEQ_APO: DllMain PROCESS_ATTACH host=\"%s\" pid=%lu",
+                         host, GetCurrentProcessId());
+        MiniEQ_TraceNoFile(msg);
     }
     return TRUE;
 }
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
+    // Not under the loader lock: safe to resolve the log file here.
+    MiniEQ_TraceInit();
     if (ppv == nullptr) return E_POINTER;
     *ppv = nullptr;
-    if (!IsEqualGUID(rclsid, CLSID_MiniEQAPO)) return CLASS_E_CLASSNOTAVAILABLE;
+    if (!IsEqualGUID(rclsid, CLSID_MiniEQAPO)) {
+        MiniEQ_Trace(L"MiniEQ_APO: DllGetClassObject for foreign CLSID -> CLASS_E_CLASSNOTAVAILABLE");
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
     static CEqApoFactory factory;
-    return factory.QueryInterface(riid, ppv);
+    HRESULT hr = factory.QueryInterface(riid, ppv);
+    MiniEQ_Trace(L"MiniEQ_APO: DllGetClassObject (our CLSID) -> hr=0x%08lx", hr);
+    return hr;
 }
 
 STDAPI DllCanUnloadNow() {

@@ -4,6 +4,8 @@ add_library(MiniEQ_APO SHARED
     dllmain.cpp
     eq_apo.cpp
     eq_apo.h
+    trace.cpp
+    trace.h
     dsp.cpp
     dsp.h
     guids.cpp
@@ -22,6 +24,9 @@ target_include_directories(MiniEQ_APO PRIVATE
 
 # ole32/uuid: COM. advapi32: registry (registration.cpp).
 target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32)
+
+# Diagnostic trace of the APO load path (see trace.h). Compiled out when 0.
+target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=1)
 
 # Static CRT: audiodg.exe loads this DLL with no guarantee that the VC++
 # redistributable is reachable from its context. A dynamic-CRT dependency

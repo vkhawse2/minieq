@@ -11,6 +11,7 @@
 
 #include "eq_apo.h"
 #include "guids.h"
+#include "trace.h"
 
 #include <mmdeviceapi.h>
 #include <ks.h>          // must come before ksmedia.h
@@ -100,6 +101,7 @@ CEqApo::CEqApo(IUnknown* pUnkOuter)
     CoCreateFreeThreadedMarshaler(static_cast<IUnknown*>(&m_inner), &m_pFTM);
     MiniEQ_SettingsInitFlat(&m_localCopy);
     m_lastSequence = m_localCopy.sequence;
+    MiniEQ_Trace(L"MiniEQ_APO: CEqApo constructed");
 }
 
 CEqApo::~CEqApo() {
@@ -126,6 +128,7 @@ CEqApo::~CEqApo() {
 
 STDMETHODIMP CEqApo::GetEffectsList(GUID** ppEffectsIds, UINT* pcEffects,
                                    HANDLE /*hEvent*/) {
+    MiniEQ_Trace(L"MiniEQ_APO: GetEffectsList called");
     if (ppEffectsIds == nullptr || pcEffects == nullptr) {
         return E_POINTER;
     }
@@ -137,6 +140,7 @@ STDMETHODIMP CEqApo::GetEffectsList(GUID** ppEffectsIds, UINT* pcEffects,
 STDMETHODIMP CEqApo::GetControllableSystemEffectsList(AUDIO_SYSTEMEFFECT** ppEffects,
                                                      UINT* pcEffects,
                                                      HANDLE /*hEvent*/) {
+    MiniEQ_Trace(L"MiniEQ_APO: GetControllableSystemEffectsList called");
     if (ppEffects == nullptr || pcEffects == nullptr) {
         return E_POINTER;
     }
@@ -176,10 +180,14 @@ bool CEqApo::IsFloat32Format(const WAVEFORMATEX* wfx) {
 //------------------------------------------------------------------------------
 
 STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
+    MiniEQ_Trace(L"MiniEQ_APO: Initialize cbDataSize=%lu pbyData=%s", cbDataSize,
+                 pbyData != nullptr ? L"ok" : L"null");
     if (m_initialized) {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> already initialized");
         return MINIEQ_HR_ALREADY_INITIALIZED;
     }
     if (pbyData == nullptr || cbDataSize == 0) {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> E_INVALIDARG (null/empty data)");
         return E_INVALIDARG;
     }
 
@@ -195,10 +203,13 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
         IPropertyStore* pAPOEndpointProperties;
     };
     if (cbDataSize < sizeof(InitHead)) {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> E_INVALIDARG (cbDataSize %lu < InitHead %zu)",
+                     cbDataSize, sizeof(InitHead));
         return E_INVALIDARG;
     }
     const InitHead* head = reinterpret_cast<const InitHead*>(pbyData);
     if (head->pAPOEndpointProperties == nullptr) {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> E_INVALIDARG (null endpoint props)");
         return E_INVALIDARG;
     }
 
@@ -211,7 +222,9 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
         wcsncpy_s(epGuid, ARRAYSIZE(epGuid), var.pwszVal, _TRUNCATE);
     }
     PropVariantClear(&var);
+    MiniEQ_Trace(L"MiniEQ_APO: Initialize endpoint GUID from props = \"%s\"", epGuid);
     if (epGuid[0] == L'\0') {
+        MiniEQ_Trace(L"MiniEQ_APO: Initialize -> E_INVALIDARG (empty endpoint GUID)");
         return E_INVALIDARG;
     }
 
@@ -268,6 +281,9 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
         MiniEQ_MappingNameForEndpoint(m_endpointId.c_str(), m_mappingName,
                                      ARRAYSIZE(m_mappingName));
     }
+    MiniEQ_Trace(L"MiniEQ_APO: Initialize -> S_OK device=\"%s\" mapping=\"%s\"",
+                 m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
+                 m_mappingName[0] ? m_mappingName : L"<none>");
 
     m_initialized = true;
     return S_OK;
@@ -289,6 +305,9 @@ STDMETHODIMP CEqApo::IsInputFormatSupported(IAudioMediaType* /*pOppositeFormat*/
     if (wfx == nullptr) {
         return E_INVALIDARG;
     }
+    MiniEQ_Trace(L"MiniEQ_APO: IsInputFormatSupported tag=%u bits=%u ch=%u rate=%lu float32=%d",
+                 wfx->wFormatTag, wfx->wBitsPerSample, wfx->nChannels,
+                 wfx->nSamplesPerSec, IsFloat32Format(wfx) ? 1 : 0);
     if (!IsFloat32Format(wfx)) {
         return APOERR_FORMAT_NOT_SUPPORTED;
     }
@@ -395,6 +414,8 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
 
     m_dsp.Configure(rate, channels);
     m_channels = channels;
+    MiniEQ_Trace(L"MiniEQ_APO: LockForProcess ch=%lu rate=%.0f",
+                 channels, (double)rate);
 
     // Background worker: retries the settings mapping until the UI has
     // created it, and performs the crossfeed heap work off the RT thread.
@@ -413,6 +434,10 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
     // mapping yet -- the worker keeps retrying, so sliders start working as
     // soon as the UI appears (no stream restart needed).
     OpenSettingsMapping();
+    MiniEQ_Trace(L"MiniEQ_APO: LockForProcess mapping=\"%s\" settings=%s",
+                 m_mappingName[0] ? m_mappingName : L"<none>",
+                 m_pSettings.load(std::memory_order_acquire) != nullptr
+                     ? L"OPEN" : L"not yet");
 
     m_locked = true;
     return S_OK;
@@ -461,6 +486,11 @@ void CEqApo::OpenSettingsMapping() {
     }
     HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, m_mappingName);
     if (h == nullptr) {
+        static LONG s_waitLogged = 0;
+        if (InterlockedCompareExchange(&s_waitLogged, 1, 0) == 0) {
+            MiniEQ_Trace(L"MiniEQ_APO: settings channel not yet present, waiting for UI: \"%s\"",
+                         m_mappingName);
+        }
         return;
     }
     void* v = MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(EqSettings));
@@ -473,6 +503,7 @@ void CEqApo::OpenSettingsMapping() {
                                             static_cast<const EqSettings*>(v))) {
         m_hMap = h;
         m_lastSequence = 0; // force a settings pickup on the next RT block
+        MiniEQ_Trace(L"MiniEQ_APO: settings channel OPEN \"%s\"", m_mappingName);
     } else {
         UnmapViewOfFile(v);
         CloseHandle(h);
@@ -526,6 +557,18 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
 
     FLOAT32* frames = reinterpret_cast<FLOAT32*>(in->pBuffer);
     const UINT32 validFrames = in->u32ValidFrameCount;
+
+    {
+        // Diagnostic only: one file write on the RT thread, first call only.
+        static LONG s_firstLogged = 0;
+        if (InterlockedCompareExchange(&s_firstLogged, 1, 0) == 0) {
+            const EqSettings* st = m_pSettings.load(std::memory_order_acquire);
+            MiniEQ_Trace(L"MiniEQ_APO: APOProcess FIRST call frames=%lu ch=%lu settings=%s bypass=%d gain0=%.1f",
+                         validFrames, m_channels,
+                         st != nullptr ? L"open" : L"NULL",
+                         m_localCopy.bypass, m_localCopy.bandGainDb[0]);
+        }
+    }
 
     if (in->u32BufferFlags == BUFFER_SILENT) {
         // Keep filter state honest across silence.
