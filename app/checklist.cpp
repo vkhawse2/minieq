@@ -71,6 +71,33 @@ HWND      s_hSpatialFix = nullptr; // one-click "Turn off" on the spatial row
 bool      s_spatialFixFailed = false;
 HWND      s_hEnhFix = nullptr; // one-click "Turn on" on the enhancements row
 bool      s_enhFixFailed = false;
+// Set when a one-click fix chained an audio-service restart: BuildRows then
+// notes "change applied, audio restarted" on the fixed row for ~2 minutes.
+bool      s_chainedRestart = false;
+ULONGLONG s_chainedRestartTick = 0;
+
+// After a one-click property fix the engine keeps the old graph for already
+// running streams: a raw property write doesn't invalidate it. (The Settings
+// app routes through the audio service, which is why its own toggles apply
+// live.) Chain the same elevated service restart the main window offers, so
+// the fix takes effect without hunting for the button. UAC is the consent.
+static void ChainAudioRestart() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.hwnd = s_hDlg;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = L"--restart-audio";
+    sei.nShow = SW_NORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        MiniEQ_AppLogCat(L"UI", L"checklist chained restart: elevation cancelled");
+        return;
+    }
+    s_chainedRestart = true;
+    s_chainedRestartTick = GetTickCount64();
+    MiniEQ_AppLogCat(L"UI", L"checklist chained audio-service restart after fix");
+}
 HFONT     s_font = nullptr;
 HFONT     s_fontBold = nullptr;
 HFONT     s_fontName = nullptr; // larger device header; freed on destroy
@@ -177,9 +204,13 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 
     // 4 -- Audio Enhancements switch.
     s_rows[3].title = L"Audio enhancements";
+    const bool enhJustFixed = s_chainedRestart &&
+        (GetTickCount64() - s_chainedRestartTick < 120000);
     if (snap.enhancements == DiagEnhancements::On) {
         s_rows[3].state = CheckState::Ok;
-        s_rows[3].detail = L"Device Default Effects \u2014 system effects are allowed.";
+        s_rows[3].detail = enhJustFixed
+            ? L"Device Default Effects \u2014 change applied, audio restarted to rebuild the path."
+            : L"Device Default Effects \u2014 system effects are allowed.";
     } else if (snap.enhancements == DiagEnhancements::Off) {
         s_rows[3].state = CheckState::Error;
         s_rows[3].detail = L"Off \u2014 Windows skips every APO, MiniEQ included.";
@@ -209,7 +240,9 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
     s_rows[4].title = L"Spatial sound";
     if (spatial.state == DiagSpatial::Off) {
         s_rows[4].state = CheckState::Ok;
-        s_rows[4].detail = L"Off.";
+        s_rows[4].detail = enhJustFixed
+            ? L"Off \u2014 change applied, audio restarted to rebuild the path."
+            : L"Off.";
     } else if (spatial.state == DiagSpatial::On) {
         s_rows[4].state = CheckState::Error;
         const std::wstring name =
@@ -606,21 +639,29 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case IDC_CL_SPATIALFIX: {
             // One-click fix: clear the endpoint's spatial mode so the
-            // SysFx chain (MiniEQ's SFX APO) is back in the graph.
+            // SysFx chain (MiniEQ's SFX APO) is back in the graph, then
+            // restart the audio engine so the change takes effect now.
             const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
             s_spatialFixFailed = !ok;
             MiniEQ_AppLogCat(L"UI", ok ? L"spatial sound turned off from checklist"
                                        : L"checklist spatial turn-off failed");
+            if (ok) {
+                ChainAudioRestart();
+            }
             RefreshChecklist();
             return 0;
         }
         case IDC_CL_ENHFIX: {
             // One-click fix: switch enhancements back to device defaults
-            // so the SysFx chain (MiniEQ's SFX APO) runs again.
+            // so the SysFx chain (MiniEQ's SFX APO) runs again, then
+            // restart the audio engine so the change takes effect now.
             const bool ok = MiniEQ_SetAudioEnhancements(s_endpoint, true);
             s_enhFixFailed = !ok;
             MiniEQ_AppLogCat(L"UI", ok ? L"audio enhancements turned on from checklist"
                                        : L"checklist enhancements turn-on failed");
+            if (ok) {
+                ChainAudioRestart();
+            }
             RefreshChecklist();
             return 0;
         }
@@ -668,6 +709,8 @@ void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
     s_deviceName = deviceName;
     s_spatialFixFailed = false;
     s_enhFixFailed = false;
+    s_chainedRestart = false;
+    s_chainedRestartTick = 0;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
