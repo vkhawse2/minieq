@@ -108,6 +108,7 @@ CEqApo::CEqApo(IUnknown* pUnkOuter)
 CEqApo::~CEqApo() {
     StopWorker();
     CloseStatusMapping();
+    CloseGlobalMapping();
     const EqSettings* settings = m_pSettings.exchange(nullptr);
     if (settings != nullptr) {
         UnmapViewOfFile(settings);
@@ -291,6 +292,10 @@ STDMETHODIMP CEqApo::Initialize(UINT32 cbDataSize, BYTE* pbyData) {
         MiniEQ_StatusNameForEndpoint(m_endpointId.c_str(), m_statusName,
                                      ARRAYSIZE(m_statusName));
     }
+    // Global on/off flag: one flat name for every endpoint. The APO creates
+    // it in LockForProcess -- it must be the creator, because only session 0
+    // holds SeCreateGlobalPrivilege; the UI (user session) only opens it.
+    MiniEQ_GlobalStateName(m_globalName, ARRAYSIZE(m_globalName));
     MiniEQ_Trace(L"MiniEQ_APO: Initialize -> S_OK device=\"%s\" mapping=\"%s\"",
                  m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
                  m_mappingName[0] ? m_mappingName : L"<none>");
@@ -459,6 +464,15 @@ STDMETHODIMP CEqApo::LockForProcess(UINT32 u32NumInputConnections,
                  m_statusName[0] ? m_statusName : L"<none>",
                  m_pStatus != nullptr ? L"CREATED" : L"not yet");
 
+    // Create the global on/off channel (one for all endpoints). Multiple APO
+    // instances (different endpoints, same audiodg) race here -- the
+    // open-first order inside makes the loser adopt, never double-create.
+    CreateGlobalMapping();
+    MiniEQ_Trace(L"MiniEQ_APO: LockForProcess global=\"%s\" enabled-channel=%s",
+                 m_globalName[0] ? m_globalName : L"<none>",
+                 m_pGlobal.load(std::memory_order_acquire) != nullptr
+                     ? L"CREATED" : L"not yet");
+
     m_locked = true;
     return S_OK;
 }
@@ -469,6 +483,7 @@ STDMETHODIMP CEqApo::UnlockForProcess() {
     }
     StopWorker();
     CloseStatusMapping();
+    CloseGlobalMapping();
     const EqSettings* settings = m_pSettings.exchange(nullptr);
     if (settings != nullptr) {
         UnmapViewOfFile(settings);
@@ -500,6 +515,9 @@ void CEqApo::WorkerStep() {
     }
     if (m_pStatus == nullptr) {
         CreateStatusMapping();
+    }
+    if (m_pGlobal.load(std::memory_order_acquire) == nullptr) {
+        CreateGlobalMapping();
     }
     PublishStatus();
     m_dsp.ServiceVirtualizationWorker();
@@ -661,6 +679,61 @@ void CEqApo::CloseStatusMapping() {
     }
 }
 
+// Global on/off channel (UI -> APO). One flat name shared by every endpoint,
+// so the first APO instance across all of audiodg creates it and the rest
+// adopt it -- the open-first order in OpenOrCreateGlobalChannel makes the
+// loser adopt, never double-create. Fail-open: until this exists the RT
+// thread treats MiniEQ as enabled.
+void CEqApo::CreateGlobalMapping() {
+    if (m_globalName[0] == L'\0') {
+        return;
+    }
+    bool fresh = false;
+    HANDLE h = OpenOrCreateGlobalChannel(m_globalName,
+                                         (DWORD)sizeof(MiniEQGlobalState), &fresh);
+    if (h == nullptr) {
+        return; // worker retries; see CreateSettingsMapping for the why
+    }
+    void* v = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                            sizeof(MiniEQGlobalState));
+    if (v == nullptr) {
+        CloseHandle(h);
+        return;
+    }
+    MiniEQGlobalState* s = static_cast<MiniEQGlobalState*>(v);
+    if (fresh) {
+        // We created it: default to enabled (fail-open). The UI re-asserts
+        // its persisted choice on its status timer if it differs.
+        s->structSize = sizeof(MiniEQGlobalState);
+        s->version = MINIEQ_GLOBAL_VERSION;
+        s->enabled = 1;
+        MemoryBarrier();
+        s->sequence = 1;
+    }
+    const MiniEQGlobalState* expected = nullptr;
+    if (m_pGlobal.compare_exchange_strong(expected,
+                                          static_cast<const MiniEQGlobalState*>(v))) {
+        m_hGlobalMap = h;
+        m_lastGlobalSeq = 0; // force a pickup on the next RT block
+        MiniEQ_Trace(L"MiniEQ_APO: global channel %s \"%s\"",
+                     fresh ? L"CREATED" : L"adopted", m_globalName);
+    } else {
+        UnmapViewOfFile(v);
+        CloseHandle(h);
+    }
+}
+
+void CEqApo::CloseGlobalMapping() {
+    const MiniEQGlobalState* gs = m_pGlobal.exchange(nullptr);
+    if (gs != nullptr) {
+        UnmapViewOfFile(gs);
+    }
+    if (m_hGlobalMap != nullptr) {
+        CloseHandle(m_hGlobalMap);
+        m_hGlobalMap = nullptr;
+    }
+}
+
 void CEqApo::StopWorker() {
     if (m_hWorkerStop != nullptr) {
         SetEvent(m_hWorkerStop);
@@ -758,7 +831,29 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 /*u32NumInputConnections*/,
                 }
             }
         }
-        m_dsp.Process(frames, validFrames, m_localCopy.bypass != 0);
+        // Global on/off (UI -> APO): one flag shared by every endpoint.
+        // Fail-open -- an absent channel means enabled. The writer bumps
+        // `sequence` AFTER `enabled`; adopt the pair only when the two
+        // sequence reads match, so a racing UI write can't tear the read.
+        // Combined with the per-endpoint bypass below; both ride the same
+        // click-free crossfade in EqDsp::Process, and the heartbeat counter
+        // above keeps advancing while bypassed so the UI link looks alive.
+        const MiniEQGlobalState* gs = m_pGlobal.load(std::memory_order_acquire);
+        if (gs != nullptr) {
+            const int64_t gseq = gs->sequence; // aligned: atomic on x64
+            if (gseq != m_lastGlobalSeq) {
+                const int32_t gen = gs->enabled;
+                MemoryBarrier();
+                if (gs->sequence == gseq) { // untorn read
+                    m_globalEnabled = (gen != 0);
+                    m_lastGlobalSeq = gseq;
+                    MiniEQ_Trace(L"MiniEQ_APO: global enabled=%d (seq=%lld)",
+                                 m_globalEnabled ? 1 : 0, (long long)gseq);
+                }
+            }
+        }
+        const bool bypass = (m_localCopy.bypass != 0) || !m_globalEnabled;
+        m_dsp.Process(frames, validFrames, bypass);
     }
 
     // In-place SFX: output aliases input; still, honor the contract when the

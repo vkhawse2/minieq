@@ -88,9 +88,29 @@ typedef struct MiniEQApoStatus {
 void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
 
-// "MiniEQ_Status_{sanitized-endpoint-id}" -- caller supplies a buffer.
+// "Global\MiniEQ_Status_{sanitized-endpoint-id}" -- caller supplies a buffer.
 void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
+
+// Global on/off (UI -> APO): one flag shared by every endpoint. The APO
+// creates "Global\MiniEQ__Enabled" -- it must be the creator, because only
+// the audio engine process (session 0) holds SeCreateGlobalPrivilege; the
+// UI (user session) can only open it. Fail-open: an absent mapping means
+// enabled, so audio keeps working with older UI builds. `sequence` is
+// bumped AFTER `enabled` is written; the APO adopts the pair only when the
+// two sequence reads match (no torn updates).
+#define MINIEQ_GLOBAL_VERSION 1
+
+typedef struct MiniEQGlobalState {
+    uint32_t structSize;       // sizeof(MiniEQGlobalState): versioning
+    uint32_t version;          // MINIEQ_GLOBAL_VERSION
+    volatile int64_t sequence; // writer-owned version counter
+    volatile int32_t enabled;  // 1 = MiniEQ processes audio, 0 = bypass all
+    volatile int32_t _reserved[3];
+} MiniEQGlobalState;
+
+// "Global\MiniEQ__Enabled" -- caller supplies a buffer.
+void MiniEQ_GlobalStateName(wchar_t* outName, size_t outNameChars);
 
 // Fill an EqSettings with flat (no-op) values, sequence = 1.
 void MiniEQ_SettingsInitFlat(EqSettings* s);

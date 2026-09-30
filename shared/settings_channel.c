@@ -42,6 +42,14 @@ void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
     BuildMappingName(prefix, endpointId, outName, outNameChars);
 }
 
+void MiniEQ_GlobalStateName(wchar_t* outName, size_t outNameChars) {
+    // Same Global\ requirement as the per-endpoint channels: the APO
+    // (running in session 0) creates it; the UI (user session) only opens
+    // it. One flat name -- no endpoint GUID -- because the flag is global.
+    static const wchar_t name[] = L"Global\\MiniEQ__Enabled";
+    BuildMappingName(name, NULL, outName, outNameChars);
+}
+
 void MiniEQ_SettingsInitFlat(EqSettings* s) {
     memset(s, 0, sizeof(*s));
     for (int i = 0; i < MINIEQ_MAX_BANDS; ++i) {

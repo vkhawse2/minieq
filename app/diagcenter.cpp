@@ -12,6 +12,7 @@
 #include "../shared/settings_channel.h"
 
 #include <audiopolicy.h>
+#include <audioclient.h> // IAudioClient, AUDCLNT_E_DEVICE_IN_USE (exclusive probe)
 #include <commctrl.h>
 #include <endpointvolume.h>
 #include <inspectable.h> // IInspectable, for the WinRT spatial-sound ABI below
@@ -564,6 +565,46 @@ static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
     return d;
 }
 
+// Exclusive-mode probe: does an app hold this endpoint in WASAPI exclusive
+// mode? Attempt a shared-mode IAudioClient::Initialize on the endpoint's mix
+// format: AUDCLNT_E_DEVICE_IN_USE means something already holds the device
+// exclusively. On success the client is released immediately without ever
+// starting a stream, so the probe leaves no trace. Any other failure
+// (device gone, engine hiccup) reports "not held" rather than a false red.
+static bool EndpointHasExclusiveStream(const std::wstring& endpointId) {
+    if (endpointId.empty()) {
+        return false;
+    }
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return false;
+    }
+    IMMDevice* pDev = nullptr;
+    HRESULT hr = pEnum->GetDevice(endpointId.c_str(), &pDev);
+    pEnum->Release();
+    if (FAILED(hr) || pDev == nullptr) {
+        return false;
+    }
+    IAudioClient* pClient = nullptr;
+    hr = pDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                        reinterpret_cast<void**>(&pClient));
+    bool exclusive = false;
+    if (SUCCEEDED(hr) && pClient != nullptr) {
+        WAVEFORMATEX* pwfx = nullptr;
+        if (SUCCEEDED(pClient->GetMixFormat(&pwfx)) && pwfx != nullptr) {
+            hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0,
+                                     pwfx, nullptr);
+            exclusive = (hr == AUDCLNT_E_DEVICE_IN_USE);
+            CoTaskMemFree(pwfx);
+        }
+        pClient->Release();
+    }
+    pDev->Release();
+    return exclusive;
+}
+
 // Per-app sessions on this endpoint with live peak levels.
 static std::vector<DiagSessionInfo> EnumEndpointSessions(const std::wstring& endpointId) {
     std::vector<DiagSessionInfo> out;
@@ -731,6 +772,11 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
             break;
         }
     }
+
+    // Exclusive-mode layer: an app holding the endpoint exclusively bypasses
+    // the engine (and every APO) by Windows design -- the one bypass no
+    // MiniEQ setting can fix.
+    s.exclusiveHeld = EndpointHasExclusiveStream(endpointId);
     return s;
 }
 
@@ -744,6 +790,15 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
         v.severity = DiagSeverity::Neutral;
         v.title = L"No device selected.";
         v.detail = L"Pick an output device in the main window first.";
+        return v;
+    }
+    if (!MiniEQ_GlobalEnabledGet()) {
+        v.severity = DiagSeverity::Neutral;
+        v.title = L"MiniEQ is off.";
+        v.detail = L"Audio plays unprocessed \u2014 the APO passes every buffer "
+                   L"through untouched on all devices.";
+        v.nextStep = L"Click \u201CTurn on MiniEQ\u201D in the main window to "
+                     L"resume the EQ.";
         return v;
     }
     if (!snap.attached) {
@@ -772,6 +827,20 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
         v.title = L"Equalizer is live.";
         v.detail = L"MiniEQ_APO.dll is processing this device's audio right now "
                    L"\u2014 slider changes are audible.";
+        return v;
+    }
+    if (snap.exclusiveHeld && snap.anySessionActive) {
+        // Exclusive mode bypasses the engine (and every APO) by Windows
+        // design -- heartbeats can never arrive for such a stream, so this
+        // diagnosis outranks the generic "bypassing" one below.
+        v.severity = DiagSeverity::Bad;
+        v.title = L"An app is holding this device in exclusive mode.";
+        v.detail = L"WASAPI exclusive mode sends audio straight to the driver, "
+                   L"bypassing the audio engine and every APO, MiniEQ included. "
+                   L"No setting in MiniEQ can intercept it.";
+        v.nextStep = L"In that app, switch its output from \u201Cexclusive\u201D "
+                     L"to \u201Cshared\u201D (Qobuz: Settings \u2192 Audio \u2192 "
+                     L"WASAPI shared), then replay.";
         return v;
     }
     if (snap.anySessionActive) {
@@ -878,6 +947,10 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
     } else {
         r += L"not locked";
     }
+    r += L"\r\nMiniEQ enabled: ";
+    r += MiniEQ_GlobalEnabledGet() ? L"yes" : L"no (user bypass \u2014 audio passes through)";
+    r += L"\r\nExclusive-mode holder: ";
+    r += snap.exclusiveHeld ? L"yes \u2014 an app is bypassing the engine" : L"no";
 
     r += L"\r\n\r\nREGISTRATION\r\n";
     r += L"SFX slot points at MiniEQ: ";
@@ -967,6 +1040,7 @@ static int              s_loggedDll = -2;
 static DiagEnhancements s_loggedEnh = DiagEnhancements::Unknown;
 static bool             s_loggedHb = false;
 static std::wstring     s_loggedSessSig;
+static std::wstring     s_loggedExSig;
 static std::wstring     s_shownVerdictTitle;
 static ULONGLONG        s_lastLogSize = 0;
 
@@ -1038,6 +1112,12 @@ static void LogTransitions(const DiagSnapshot& snap, const DiagVerdict& v, bool 
             }
         }
         s_loggedSessSig = sig;
+    }
+    const std::wstring exSig = snap.exclusiveHeld ? L"held" : L"clear";
+    if (all || exSig != s_loggedExSig) {
+        MiniEQ_AppLogCat(L"ENGINE", L"exclusive-mode holder: %s",
+                         snap.exclusiveHeld ? L"YES (bypasses engine+APOs)" : L"none");
+        s_loggedExSig = exSig;
     }
     s_haveLogged = true;
 }
@@ -1385,6 +1465,7 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_loggedEnh = DiagEnhancements::Unknown;
         s_loggedHb = false;
         s_loggedSessSig.clear();
+        s_loggedExSig.clear();
         s_shownVerdictTitle.clear();
         s_lastLogSize = 0;
         return 0;

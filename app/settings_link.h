@@ -66,6 +66,40 @@ private:
     MiniEQApoStatus* m_pView = nullptr;
 };
 
+// GlobalStateLink -- the UI side of the global MiniEQ on/off flag.
+// The APO creates "Global\MiniEQ__Enabled" (only it can: the UI runs in the
+// user's session, which cannot create Global\ objects); this class only
+// opens it and writes the desired state. Fail-open: if the mapping doesn't
+// exist yet (APO not loaded), reads report the in-memory value and writes
+// are no-ops -- the status timer re-asserts the persisted choice once the
+// APO creates the channel.
+class GlobalStateLink {
+public:
+    GlobalStateLink();
+    ~GlobalStateLink();
+
+    GlobalStateLink(const GlobalStateLink&) = delete;
+    GlobalStateLink& operator=(const GlobalStateLink&) = delete;
+
+    bool Open();
+    void Close();
+    bool IsOpen() const { return m_pView != nullptr; }
+    bool Read(MiniEQGlobalState* out);
+    void WriteEnabled(bool enabled);
+
+private:
+    HANDLE            m_hMap = nullptr;
+    MiniEQGlobalState* m_pView = nullptr;
+    int64_t           m_seq = 0;
+};
+
+// Global MiniEQ on/off (all devices at once), persisted in
+// %APPDATA%\MiniEQ\devices.ini under [MiniEQ] Enabled=1/0. The in-memory
+// value is authoritative for the UI; the APO learns it through the
+// GlobalStateLink channel. Default: on.
+bool MiniEQ_GlobalEnabledGet();
+void MiniEQ_GlobalEnabledSet(bool on);
+
 std::wstring MiniEQ_IniPath();
 void MiniEQ_SaveDeviceSettings(const std::wstring& endpointId, const EqSettings& s);
 bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out);

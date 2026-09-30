@@ -134,6 +134,8 @@ private:
     void CreateStatusMapping();   // worker thread, best-effort with retry
     void PublishStatus();       // worker thread: heartbeat -> UI
     void CloseStatusMapping();  // UnlockForProcess / destructor
+    void CreateGlobalMapping(); // idempotent; worker retries on failure
+    void CloseGlobalMapping();  // UnlockForProcess / destructor
     void StopWorker();
 
     CInnerUnknown  m_inner;      // constructed first; outer falls back to it
@@ -164,6 +166,16 @@ private:
     uint32_t       m_rtQpcTick = 0;           // RT thread only
     int64_t        m_qpcFreq = 0;             // worker only
     uint32_t       m_sampleRate = 0;
+
+    // Global on/off (UI -> APO): one flag shared by every endpoint.
+    // The APO is the creator (only session 0 holds SeCreateGlobalPrivilege);
+    // the UI opens the same name and writes. Fail-open: no channel yet
+    // means enabled, so audio keeps working with older UI builds.
+    wchar_t        m_globalName[64] = {};     // "Global\MiniEQ__Enabled"
+    HANDLE         m_hGlobalMap = nullptr;    // global-state mapping (non-RT only)
+    std::atomic<const MiniEQGlobalState*> m_pGlobal{nullptr}; // mapped view, read-only
+    int64_t        m_lastGlobalSeq = 0;       // last adopted global version
+    bool           m_globalEnabled = true;    // RT-side cache; default enabled
 
     HANDLE         m_hWorkerThread = nullptr; // background worker (non-RT)
     HANDLE         m_hWorkerStop = nullptr;   // manual-reset stop event

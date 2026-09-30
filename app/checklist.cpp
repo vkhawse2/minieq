@@ -9,6 +9,7 @@
 
 #include "diagcenter.h"
 #include "diag.h"
+#include "settings_link.h"
 
 #include <windows.h>
 #include <strsafe.h>
@@ -43,7 +44,7 @@ enum {
     IDC_CL_ENHFIX,
 };
 
-constexpr int kRows = 8;
+constexpr int kRows = 9;
 
 const wchar_t* kClass = L"MiniEQChecklist";
 
@@ -200,9 +201,10 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
         s_rows[2].title = L"Attached to this device";
         s_rows[3].title = L"Audio enhancements";
         s_rows[4].title = L"Spatial sound";
-        s_rows[5].title = L"Audio playing on this device";
-        s_rows[6].title = L"APO processing audio";
-        s_rows[7].title = L"App \u2194 APO link";
+        s_rows[5].title = L"Exclusive-mode apps";
+        s_rows[6].title = L"Audio playing on this device";
+        s_rows[7].title = L"APO processing audio";
+        s_rows[8].title = L"App \u2194 APO link";
         return;
     }
     const std::wstring dev =
@@ -335,15 +337,37 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
         s_rows[4].detail = detail;
     }
 
-    // 6 -- Playback on this endpoint.
-    s_rows[5].title = L"Audio playing on this device";
+    // 6 -- Exclusive-mode apps: an app holding this endpoint exclusively
+    // bypasses the engine (and every APO) by Windows design -- the one
+    // bypass no MiniEQ setting can fix, so it gets its own row with the
+    // in-app fix. Probed with a shared-mode IAudioClient::Initialize;
+    // AUDCLNT_E_DEVICE_IN_USE means an exclusive holder is present.
+    s_rows[5].title = L"Exclusive-mode apps";
+    if (snap.exclusiveHeld) {
+        s_rows[5].state = CheckState::Error;
+        s_rows[5].detail = L"An app is holding this device in WASAPI exclusive mode "
+                           L"\u2014 Windows sends its audio straight to the driver, "
+                           L"bypassing the engine and every APO, MiniEQ included. "
+                           L"No setting in MiniEQ can intercept it.";
+        s_rows[5].fix = L"In that app, switch its output from \u201Cexclusive\u201D "
+                        L"to \u201Cshared\u201D (Qobuz: Settings \u2192 Audio \u2192 "
+                        L"WASAPI shared; Tidal/Roon/Foobar2000 have the same toggle), "
+                        L"then replay.";
+    } else {
+        s_rows[5].state = CheckState::Ok;
+        s_rows[5].detail = L"No app is holding this device in exclusive mode \u2014 "
+                           L"all shared-mode audio flows through the engine.";
+    }
+
+    // 7 -- Playback on this endpoint.
+    s_rows[6].title = L"Audio playing on this device";
     {
         const DiagSessionInfo* first = nullptr;
         for (const DiagSessionInfo& si : snap.sessions) {
             if (si.active) { first = &si; break; }
         }
         if (first != nullptr) {
-            s_rows[5].state = CheckState::Ok;
+            s_rows[6].state = CheckState::Ok;
             wchar_t detail[192] = {};
             if (first->peak >= 0.0f) {
                 StringCchPrintfW(detail, ARRAYSIZE(detail),
@@ -353,19 +377,25 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
                 StringCchPrintfW(detail, ARRAYSIZE(detail),
                     L"%s is active.", first->exe.c_str());
             }
-            s_rows[5].detail = detail;
+            s_rows[6].detail = detail;
         } else if (!snap.sessions.empty()) {
-            s_rows[5].state = CheckState::Idle;
-            s_rows[5].detail = L"Sessions are idle \u2014 play something on this device.";
+            s_rows[6].state = CheckState::Idle;
+            s_rows[6].detail = L"Sessions are idle \u2014 play something on this device.";
         } else {
-            s_rows[5].state = CheckState::Idle;
-            s_rows[5].detail = L"Nothing is playing \u2014 play something on this device.";
+            s_rows[6].state = CheckState::Idle;
+            s_rows[6].detail = L"Nothing is playing \u2014 play something on this device.";
         }
     }
 
-    // 7 -- The heartbeat: APOProcess calls advancing.
-    s_rows[6].title = L"APO processing audio";
-    {
+    // 8 -- The heartbeat: APOProcess calls advancing.
+    s_rows[7].title = L"APO processing audio";
+    if (!MiniEQ_GlobalEnabledGet()) {
+        // User choice, not a failure: the APO passes every buffer through
+        // untouched and the heartbeat still advances, so the link below
+        // stays green. Neutral (yellow) instead of red.
+        s_rows[7].state = CheckState::Idle;
+        s_rows[7].detail = L"MiniEQ is off \u2014 audio passing through unprocessed.";
+    } else {
         bool fresh = false;
         if (s_freshEp != s_endpoint) {
             s_freshEp = s_endpoint;
@@ -382,7 +412,7 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
             s_freshTick = now;
         }
         if (fresh) {
-            s_rows[6].state = CheckState::Ok;
+            s_rows[7].state = CheckState::Ok;
             wchar_t detail[192] = {};
             if (snap.apoLocked && snap.apoChannels > 0) {
                 StringCchPrintfW(detail, ARRAYSIZE(detail),
@@ -394,33 +424,33 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
                     L"%s APOProcess calls and counting.",
                     FormatCalls(snap.heartbeatCalls).c_str());
             }
-            s_rows[6].detail = detail;
+            s_rows[7].detail = detail;
         } else if (!snap.anySessionActive) {
-            s_rows[6].state = CheckState::Idle;
-            s_rows[6].detail = L"Waiting for audio \u2014 the counter starts with playback.";
+            s_rows[7].state = CheckState::Idle;
+            s_rows[7].detail = L"Waiting for audio \u2014 the counter starts with playback.";
         } else if (snap.statusChannelOk && snap.heartbeatCalls > 0) {
-            s_rows[6].state = CheckState::Idle;
+            s_rows[7].state = CheckState::Idle;
             wchar_t detail[192] = {};
             StringCchPrintfW(detail, ARRAYSIZE(detail),
                 L"%s calls so far \u2014 confirming they're advancing\u2026",
                 FormatCalls(snap.heartbeatCalls).c_str());
-            s_rows[6].detail = detail;
+            s_rows[7].detail = detail;
         } else {
-            s_rows[6].state = CheckState::Error;
-            s_rows[6].detail = L"0 APOProcess calls while audio is playing \u2014 "
+            s_rows[7].state = CheckState::Error;
+            s_rows[7].detail = L"0 APOProcess calls while audio is playing \u2014 "
                                L"sound is bypassing MiniEQ.";
-            s_rows[6].fix = L"Fix the red items above, then replay the audio.";
+            s_rows[7].fix = L"Fix the red items above, then replay the audio.";
         }
     }
 
-    // 8 -- UI <-> APO shared-memory link.
-    s_rows[7].title = L"App \u2194 APO link";
+    // 9 -- UI <-> APO shared-memory link.
+    s_rows[8].title = L"App \u2194 APO link";
     if (snap.statusChannelOk) {
-        s_rows[7].state = CheckState::Ok;
-        s_rows[7].detail = L"Shared memory open \u2014 EQ settings are flowing to the APO.";
+        s_rows[8].state = CheckState::Ok;
+        s_rows[8].detail = L"Shared memory open \u2014 EQ settings are flowing to the APO.";
     } else {
-        s_rows[7].state = CheckState::Idle;
-        s_rows[7].detail = L"No heartbeat channel yet \u2014 it appears once the APO "
+        s_rows[8].state = CheckState::Idle;
+        s_rows[8].detail = L"No heartbeat channel yet \u2014 it appears once the APO "
                            L"processes its first buffer.";
     }
 }
@@ -508,7 +538,7 @@ void LayoutRows() {
         y += rh;
     }
     place(s_hSect[2], 14, 472, sectH); y += sectH + 4;
-    for (int i = 5; i < 8; ++i) {
+    for (int i = 5; i < 9; ++i) {
         const int rh = RowHeight(s_rows[i]);
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
@@ -704,13 +734,13 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // took) and the heartbeat is advancing (the running graph
                 // picked it up with no restart).
                 if (s_rows[4].state == CheckState::Ok &&
-                    s_rows[6].state == CheckState::Ok) {
+                    s_rows[7].state == CheckState::Ok) {
                     s_fixNote = FixNote::AppliedLive;
                     s_fixNoteTick = GetTickCount64();
                     MiniEQ_AppLogCat(L"UI", L"checklist fix applied live, audio path healed");
                     RefreshChecklist();
                 } else if (GetTickCount64() - s_fixNoteTick >= kFixWatchMs) {
-                    if (s_rows[5].state == CheckState::Ok) {
+                    if (s_rows[6].state == CheckState::Ok) {
                         // Audio is playing but the old graph is still
                         // alive: fall back to the chained restart.
                         MiniEQ_AppLogCat(L"UI", L"checklist live fix timed out with audio playing, chaining restart");

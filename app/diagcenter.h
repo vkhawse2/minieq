@@ -94,6 +94,11 @@ struct DiagSnapshot {
     // Playback layer.
     std::vector<DiagSessionInfo> sessions;
     bool         anySessionActive = false;
+    // Exclusive layer: an app holding this endpoint in WASAPI exclusive mode
+    // bypasses the engine (and every APO) by Windows design. Probed by
+    // attempting a shared-mode IAudioClient::Initialize and checking for
+    // AUDCLNT_E_DEVICE_IN_USE -- quick, no stream is left running.
+    bool         exclusiveHeld = false;
 };
 
 enum class DiagSeverity { Neutral, Good, Warn, Bad };

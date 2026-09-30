@@ -122,6 +122,69 @@ bool StatusLink::Read(MiniEQApoStatus* out) {
     return true;
 }
 
+GlobalStateLink::GlobalStateLink() {
+}
+
+GlobalStateLink::~GlobalStateLink() {
+    Close();
+}
+
+bool GlobalStateLink::Open() {
+    Close();
+
+    wchar_t name[64] = {};
+    MiniEQ_GlobalStateName(name, ARRAYSIZE(name));
+
+    // OPEN only -- the APO is the creator of the Global\ channel; a
+    // user-session process cannot create Global\ objects. If the APO hasn't
+    // loaded yet (audio engine rebuilding), this fails and the caller retries
+    // later; meanwhile MiniEQ stays enabled (fail-open).
+    m_hMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
+    if (m_hMap == nullptr) {
+        return false;
+    }
+    m_pView = static_cast<MiniEQGlobalState*>(
+        MapViewOfFile(m_hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                      sizeof(MiniEQGlobalState)));
+    if (m_pView == nullptr) {
+        CloseHandle(m_hMap);
+        m_hMap = nullptr;
+        return false;
+    }
+    m_seq = m_pView->sequence;
+    return true;
+}
+
+void GlobalStateLink::Close() {
+    if (m_pView != nullptr) {
+        UnmapViewOfFile(m_pView);
+        m_pView = nullptr;
+    }
+    if (m_hMap != nullptr) {
+        CloseHandle(m_hMap);
+        m_hMap = nullptr;
+    }
+}
+
+bool GlobalStateLink::Read(MiniEQGlobalState* out) {
+    if (m_pView == nullptr || out == nullptr) {
+        return false;
+    }
+    memcpy(out, m_pView, sizeof(MiniEQGlobalState));
+    return true;
+}
+
+void GlobalStateLink::WriteEnabled(bool enabled) {
+    if (m_pView == nullptr) {
+        return;
+    }
+    // Same writer protocol as the settings channel: data first, sequence
+    // bump last, so the APO's torn-read guard sees a consistent pair.
+    m_pView->enabled = enabled ? 1 : 0;
+    MemoryBarrier();
+    m_pView->sequence = ++m_seq;
+}
+
 std::wstring MiniEQ_IniPath() {
     wchar_t appdata[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
@@ -190,4 +253,49 @@ bool MiniEQ_LoadDeviceSettings(const std::wstring& endpointId, EqSettings* out) 
     out->virtualization =
         GetPrivateProfileIntW(endpointId.c_str(), L"Virtualization", 0, ini.c_str()) ? 1 : 0;
     return true;
+}
+
+// Global MiniEQ on/off: one [MiniEQ] section, not per-device. The in-memory
+// value is authoritative for the UI; the APO learns it through the
+// GlobalStateLink channel (re-asserted on the status timer).
+static bool s_globalEnabled = true;
+static bool s_globalLoaded = false;
+
+static void MiniEQ_SaveGlobalEnabledIni(bool on) {
+    std::wstring ini = MiniEQ_IniPath();
+    if (ini.empty()) {
+        return;
+    }
+    WritePrivateProfileStringW(L"MiniEQ", L"Enabled", on ? L"1" : L"0", ini.c_str());
+}
+
+static bool MiniEQ_LoadGlobalEnabledIni(bool* out) {
+    std::wstring ini = MiniEQ_IniPath();
+    if (ini.empty() || out == nullptr) {
+        return false;
+    }
+    wchar_t buf[8] = {};
+    GetPrivateProfileStringW(L"MiniEQ", L"Enabled", L"", buf, ARRAYSIZE(buf), ini.c_str());
+    if (buf[0] == L'\0') {
+        return false; // never saved: default stays on
+    }
+    *out = (buf[0] != L'0');
+    return true;
+}
+
+bool MiniEQ_GlobalEnabledGet() {
+    if (!s_globalLoaded) {
+        bool v = true;
+        if (MiniEQ_LoadGlobalEnabledIni(&v)) {
+            s_globalEnabled = v;
+        }
+        s_globalLoaded = true;
+    }
+    return s_globalEnabled;
+}
+
+void MiniEQ_GlobalEnabledSet(bool on) {
+    s_globalEnabled = on;
+    s_globalLoaded = true;
+    MiniEQ_SaveGlobalEnabledIni(on);
 }
