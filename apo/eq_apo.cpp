@@ -505,13 +505,32 @@ void CEqApo::WorkerStep() {
     m_dsp.ServiceVirtualizationWorker();
 }
 
-// Creates (or adopts, if a previous stream already created it) a named file
+// Opens (or creates, if no APO instance has made it yet) a named file
 // mapping in the Global\ namespace with a DACL that lets the UI open it
 // from the user's session. The APO is the only side that can create these:
 // it runs inside the audio engine (session 0) as a service identity, which
 // holds SeCreateGlobalPrivilege; the UI runs in the user's session, where
 // creating Global\ objects is denied and Local\ objects are invisible here.
-static HANDLE CreateGlobalChannel(const wchar_t* name, DWORD byteSize) {
+//
+// The open-first order matters. CreateFileMappingW issued against an
+// EXISTING named object can fail with ERROR_ACCESS_DENIED -- observed
+// 2026-09-30: every second audiodg instance for an endpoint got gle=5, so
+// its APO ran with settings=NULL (audio processed with a flat, silent EQ
+// and no heartbeat), and the worker retry never recovered. OpenFileMappingW
+// with read+write -- the exact call the UI makes -- succeeds against the
+// same DACL, so open first and create only when the object is truly absent.
+static HANDLE OpenOrCreateGlobalChannel(const wchar_t* name, DWORD byteSize,
+                                        bool* fresh) {
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
+    if (h != nullptr) {
+        if (fresh != nullptr) {
+            *fresh = false;
+        }
+        return h;
+    }
+    if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+        return nullptr; // transient; the worker thread retries
+    }
     PSECURITY_DESCRIPTOR pSD = nullptr;
     // D: Everyone read+write. (EQ gains and a heartbeat are not sensitive;
     // the UI must be able to open this from another session.)
@@ -520,9 +539,19 @@ static HANDLE CreateGlobalChannel(const wchar_t* name, DWORD byteSize) {
         return nullptr;
     }
     SECURITY_ATTRIBUTES sa = { sizeof(sa), pSD, FALSE };
-    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
-                                  0, byteSize, name);
+    h = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+                           0, byteSize, name);
+    const DWORD gle = GetLastError();
     LocalFree(pSD);
+    if (h == nullptr) {
+        SetLastError(gle);
+        return nullptr;
+    }
+    if (fresh != nullptr) {
+        // A racing APO instance may have created it between our open and
+        // our create; ERROR_ALREADY_EXISTS means adopt, don't re-init.
+        *fresh = (gle != ERROR_ALREADY_EXISTS);
+    }
     return h;
 }
 
@@ -532,16 +561,17 @@ void CEqApo::CreateSettingsMapping() {
         // channel with, and retrying would be pointless.
         return;
     }
-    HANDLE h = CreateGlobalChannel(m_mappingName, (DWORD)sizeof(EqSettings));
+    bool fresh = false;
+    HANDLE h = OpenOrCreateGlobalChannel(m_mappingName,
+                                         (DWORD)sizeof(EqSettings), &fresh);
     if (h == nullptr) {
         static LONG s_failLogged = 0;
         if (InterlockedCompareExchange(&s_failLogged, 1, 0) == 0) {
-            MiniEQ_Trace(L"MiniEQ_APO: settings channel CREATE failed gle=%lu name=\"%s\"",
+            MiniEQ_Trace(L"MiniEQ_APO: settings channel open failed gle=%lu name=\"%s\"",
                          GetLastError(), m_mappingName);
         }
         return;
     }
-    const bool fresh = (GetLastError() != ERROR_ALREADY_EXISTS);
     void* v = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
                             sizeof(EqSettings));
     if (v == nullptr) {
@@ -574,7 +604,9 @@ void CEqApo::CreateStatusMapping() {
     if (m_statusName[0] == L'\0') {
         return;
     }
-    HANDLE h = CreateGlobalChannel(m_statusName, (DWORD)sizeof(MiniEQApoStatus));
+    bool fresh = false;
+    HANDLE h = OpenOrCreateGlobalChannel(m_statusName,
+                                         (DWORD)sizeof(MiniEQApoStatus), &fresh);
     if (h == nullptr) {
         return; // worker retries; see CreateSettingsMapping for the why
     }
@@ -585,19 +617,25 @@ void CEqApo::CreateStatusMapping() {
         return;
     }
     MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(v);
-    // (Re)initialize the header on every lock: a fresh stream means fresh
-    // counters, and the UI tolerates the reset (it watches for advancement).
-    memset(st, 0, sizeof(*st));
-    st->structSize = sizeof(MiniEQApoStatus);
-    st->version = MINIEQ_STATUS_VERSION;
+    if (fresh) {
+        // We created it: initialize the header. On adopt, another live
+        // instance owns the counters -- the worker republishes the live
+        // fields below on every step, so leave its header alone.
+        memset(st, 0, sizeof(*st));
+        st->structSize = sizeof(MiniEQApoStatus);
+        st->version = MINIEQ_STATUS_VERSION;
+    }
     LARGE_INTEGER freq;
     if (QueryPerformanceFrequency(&freq)) {
         m_qpcFreq = freq.QuadPart;
     }
-    st->qpcFrequency = m_qpcFreq;
+    if (fresh) {
+        st->qpcFrequency = m_qpcFreq;
+    }
     m_pStatus = st;
     m_hStatusMap = h;
-    MiniEQ_Trace(L"MiniEQ_APO: status channel CREATED \"%s\"", m_statusName);
+    MiniEQ_Trace(L"MiniEQ_APO: status channel %s \"%s\"",
+                 fresh ? L"CREATED" : L"adopted", m_statusName);
 }
 
 void CEqApo::PublishStatus() {

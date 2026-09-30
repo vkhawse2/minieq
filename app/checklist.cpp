@@ -71,17 +71,29 @@ HWND      s_hSpatialFix = nullptr; // one-click "Turn off" on the spatial row
 bool      s_spatialFixFailed = false;
 HWND      s_hEnhFix = nullptr; // one-click "Turn on" on the enhancements row
 bool      s_enhFixFailed = false;
-// Set when a one-click fix chained an audio-service restart: BuildRows then
-// notes "change applied, audio restarted" on the fixed row for ~2 minutes.
-bool      s_chainedRestart = false;
-ULONGLONG s_chainedRestartTick = 0;
+// What a one-click fix reports on its row afterwards. Switching: the WinRT
+// worker is running. Watching: the live write went through and we're
+// waiting for the heartbeat to prove the graph rebuilt. AppliedLive: it
+// did -- no restart needed. Restarted: the live path didn't heal in time,
+// so we chained the elevated service restart. The note shows for ~2
+// minutes, on the fixed row only (s_fixNoteRow: 3 = enhancements,
+// 4 = spatial).
+enum class FixNote { None, Switching, Watching, AppliedLive, Restarted };
+FixNote   s_fixNote = FixNote::None;
+int       s_fixNoteRow = -1;
+ULONGLONG s_fixNoteTick = 0;
+int       s_fixSeq = 0; // invalidates stale worker completions
+static constexpr ULONGLONG kFixWatchMs = 10000;
+static constexpr ULONGLONG kFixNoteMs = 120000;
+#define WM_APP_SPATIALDONE (WM_APP + 101)
 
-// After a one-click property fix the engine keeps the old graph for already
-// running streams: a raw property write doesn't invalidate it. (The Settings
-// app routes through the audio service, which is why its own toggles apply
-// live.) Chain the same elevated service restart the main window offers, so
-// the fix takes effect without hunting for the button. UAC is the consent.
-static void ChainAudioRestart() {
+// After a one-click property fix the engine can keep the old graph for
+// already-running streams: a raw property write doesn't invalidate it.
+// (The Settings app routes through the audio service, which is why its own
+// toggles apply live.) Chain the same elevated service restart the main
+// window offers, so the fix takes effect without hunting for the button.
+// UAC is the consent; cancelling it clears the note, never loops.
+static void ChainAudioRestart(int row) {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
@@ -92,12 +104,42 @@ static void ChainAudioRestart() {
     sei.nShow = SW_NORMAL;
     if (!ShellExecuteExW(&sei)) {
         MiniEQ_AppLogCat(L"UI", L"checklist chained restart: elevation cancelled");
+        s_fixNote = FixNote::None;
+        s_fixNoteRow = -1;
         return;
     }
-    s_chainedRestart = true;
-    s_chainedRestartTick = GetTickCount64();
+    s_fixNote = FixNote::Restarted;
+    s_fixNoteRow = row;
+    s_fixNoteTick = GetTickCount64();
     MiniEQ_AppLogCat(L"UI", L"checklist chained audio-service restart after fix");
 }
+
+// Marks the start of the live-apply watch: the WinRT switch completed, now
+// the heartbeat has to prove the running graph picked it up.
+static void BeginFixWatch(int row) {
+    s_fixNote = FixNote::Watching;
+    s_fixNoteRow = row;
+    s_fixNoteTick = GetTickCount64();
+}
+
+struct SpatialFixCtx {
+    HWND hwnd;
+    std::wstring endpoint;
+    int seq;
+};
+
+// Worker thread: the WinRT spatial switch blocks on the async operation,
+// so it must not run on the UI thread. Posts WM_APP_SPATIALDONE back.
+static DWORD WINAPI SpatialFixThread(LPVOID param) {
+    SpatialFixCtx* ctx = static_cast<SpatialFixCtx*>(param);
+    const bool ok = MiniEQ_SetSpatialSoundOffWinRT(ctx->endpoint);
+    const HWND hwnd = ctx->hwnd;
+    const int seq = ctx->seq;
+    delete ctx;
+    PostMessageW(hwnd, WM_APP_SPATIALDONE, ok ? 1 : 0, seq);
+    return 0;
+}
+
 HFONT     s_font = nullptr;
 HFONT     s_fontBold = nullptr;
 HFONT     s_fontName = nullptr; // larger device header; freed on destroy
@@ -204,11 +246,11 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 
     // 4 -- Audio Enhancements switch.
     s_rows[3].title = L"Audio enhancements";
-    const bool enhJustFixed = s_chainedRestart &&
-        (GetTickCount64() - s_chainedRestartTick < 120000);
+    const bool enhNote = s_fixNoteRow == 3 && s_fixNote == FixNote::Restarted &&
+        (GetTickCount64() - s_fixNoteTick < kFixNoteMs);
     if (snap.enhancements == DiagEnhancements::On) {
         s_rows[3].state = CheckState::Ok;
-        s_rows[3].detail = enhJustFixed
+        s_rows[3].detail = enhNote
             ? L"Device Default Effects \u2014 change applied, audio restarted to rebuild the path."
             : L"Device Default Effects \u2014 system effects are allowed.";
     } else if (snap.enhancements == DiagEnhancements::Off) {
@@ -238,17 +280,39 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 
     // 5 -- Spatial sound.
     s_rows[4].title = L"Spatial sound";
+    const bool spatNote = s_fixNoteRow == 4 &&
+        (s_fixNote == FixNote::Watching || s_fixNote == FixNote::AppliedLive ||
+         s_fixNote == FixNote::Restarted) &&
+        (GetTickCount64() - s_fixNoteTick < kFixNoteMs);
     if (spatial.state == DiagSpatial::Off) {
         s_rows[4].state = CheckState::Ok;
-        s_rows[4].detail = enhJustFixed
-            ? L"Off \u2014 change applied, audio restarted to rebuild the path."
-            : L"Off.";
+        if (spatNote) {
+            switch (s_fixNote) {
+            case FixNote::Watching:
+                s_rows[4].detail = L"Off \u2014 change applied, waiting for the audio path to rebuild\u2026";
+                break;
+            case FixNote::AppliedLive:
+                s_rows[4].detail = L"Off \u2014 change applied live, no restart needed.";
+                break;
+            case FixNote::Restarted:
+                s_rows[4].detail = L"Off \u2014 change applied, audio restarted to rebuild the path.";
+                break;
+            default:
+                s_rows[4].detail = L"Off.";
+                break;
+            }
+        } else {
+            s_rows[4].detail = L"Off.";
+        }
     } else if (spatial.state == DiagSpatial::On) {
         s_rows[4].state = CheckState::Error;
         const std::wstring name =
             spatial.name.empty() ? L"A spatial mode" : spatial.name;
         s_rows[4].detail = name + L" is on \u2014 the spatial graph can starve "
                            L"MiniEQ of audio.";
+        if (s_fixNote == FixNote::Switching && s_fixNoteRow == 4) {
+            s_rows[4].detail = name + L" is on \u2014 switching off\u2026";
+        }
         if (s_spatialFixFailed) {
             s_rows[4].fix = L"Couldn't switch it automatically \u2014 turn it off "
                             L"manually: Settings \u2192 System \u2192 Sound \u2192 "
@@ -487,6 +551,14 @@ void RefreshChecklist() {
     if (s_hDlg == nullptr) {
         return;
     }
+    // Expire the one-click-fix note (Switching/Watching are driven by the
+    // worker and the timer, not by time alone).
+    if (s_fixNote != FixNote::None && s_fixNote != FixNote::Switching &&
+        s_fixNote != FixNote::Watching &&
+        (GetTickCount64() - s_fixNoteTick >= kFixNoteMs)) {
+        s_fixNote = FixNote::None;
+        s_fixNoteRow = -1;
+    }
     const std::wstring dllPath = MiniEQ_ApoDllPath();
     const DiagSnapshot snap = MiniEQ_RunDiagnosis(s_endpoint);
     const DiagSpatialInfo spatial = MiniEQ_ReadSpatialSound(s_endpoint);
@@ -622,6 +694,37 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1) {
             RefreshChecklist();
+            // Live-apply watch: after the WinRT switch the APO heartbeat
+            // has to prove the running graph picked it up. If it heals on
+            // its own -- the Dolby-level path -- no restart is needed.
+            if (s_fixNote == FixNote::Watching && s_fixNoteRow >= 0 &&
+                s_fixNoteRow < kRows) {
+                // "Applied live" needs both halves of the proof: the
+                // endpoint reads back as spatial Off (the switch really
+                // took) and the heartbeat is advancing (the running graph
+                // picked it up with no restart).
+                if (s_rows[4].state == CheckState::Ok &&
+                    s_rows[6].state == CheckState::Ok) {
+                    s_fixNote = FixNote::AppliedLive;
+                    s_fixNoteTick = GetTickCount64();
+                    MiniEQ_AppLogCat(L"UI", L"checklist fix applied live, audio path healed");
+                    RefreshChecklist();
+                } else if (GetTickCount64() - s_fixNoteTick >= kFixWatchMs) {
+                    if (s_rows[5].state == CheckState::Ok) {
+                        // Audio is playing but the old graph is still
+                        // alive: fall back to the chained restart.
+                        MiniEQ_AppLogCat(L"UI", L"checklist live fix timed out with audio playing, chaining restart");
+                        ChainAudioRestart(s_fixNoteRow);
+                    } else {
+                        // Nothing playing: nothing to heal, the change is
+                        // in place for the next stream.
+                        MiniEQ_AppLogCat(L"UI", L"checklist fix applied while idle, no restart needed");
+                        s_fixNote = FixNote::AppliedLive;
+                        s_fixNoteTick = GetTickCount64();
+                    }
+                    RefreshChecklist();
+                }
+            }
         }
         return 0;
     case WM_COMMAND:
@@ -638,15 +741,35 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(hwnd);
             return 0;
         case IDC_CL_SPATIALFIX: {
-            // One-click fix: clear the endpoint's spatial mode so the
-            // SysFx chain (MiniEQ's SFX APO) is back in the graph, then
-            // restart the audio engine so the change takes effect now.
-            const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
-            s_spatialFixFailed = !ok;
-            MiniEQ_AppLogCat(L"UI", ok ? L"spatial sound turned off from checklist"
-                                       : L"checklist spatial turn-off failed");
-            if (ok) {
-                ChainAudioRestart();
+            // One-click fix, Dolby-level: switch spatial off through the
+            // public WinRT API -- the Sound settings page's own channel --
+            // on a worker thread, so the audio service rebuilds the running
+            // graph immediately with no restart. The heartbeat watch
+            // confirms the path healed; if the WinRT call fails we fall
+            // back to the direct write plus a chained service restart.
+            s_spatialFixFailed = false;
+            s_fixNote = FixNote::Switching;
+            s_fixNoteRow = 4;
+            s_fixNoteTick = GetTickCount64();
+            ++s_fixSeq;
+            EnableWindow(s_hSpatialFix, FALSE);
+            SpatialFixCtx* ctx = new SpatialFixCtx{ s_hDlg, s_endpoint, s_fixSeq };
+            MiniEQ_AppLogCat(L"UI", L"spatial turn-off: trying WinRT live switch");
+            DWORD tid = 0;
+            HANDLE hThread = CreateThread(nullptr, 0, SpatialFixThread, ctx, 0, &tid);
+            if (hThread != nullptr) {
+                CloseHandle(hThread);
+            } else {
+                // Thread creation failed: fall back synchronously.
+                delete ctx;
+                EnableWindow(s_hSpatialFix, TRUE);
+                s_fixNote = FixNote::None;
+                s_fixNoteRow = -1;
+                const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
+                s_spatialFixFailed = !ok;
+                if (ok) {
+                    ChainAudioRestart(4);
+                }
             }
             RefreshChecklist();
             return 0;
@@ -660,13 +783,33 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MiniEQ_AppLogCat(L"UI", ok ? L"audio enhancements turned on from checklist"
                                        : L"checklist enhancements turn-on failed");
             if (ok) {
-                ChainAudioRestart();
+                ChainAudioRestart(3);
             }
             RefreshChecklist();
             return 0;
         }
         }
         break;
+    case WM_APP_SPATIALDONE:
+        if (s_open && (int)lp == s_fixSeq) {
+            EnableWindow(s_hSpatialFix, TRUE);
+            if (wp != 0) {
+                MiniEQ_AppLogCat(L"UI", L"spatial turn-off: WinRT switch completed, watching path");
+                BeginFixWatch(4);
+            } else {
+                MiniEQ_AppLogCat(L"UI", L"spatial turn-off: WinRT failed, direct write + restart");
+                const bool ok = MiniEQ_SetSpatialSoundOff(s_endpoint);
+                s_spatialFixFailed = !ok;
+                if (ok) {
+                    ChainAudioRestart(4);
+                } else {
+                    s_fixNote = FixNote::None;
+                    s_fixNoteRow = -1;
+                }
+            }
+            RefreshChecklist();
+        }
+        return 0;
     case WM_CTLCOLORSTATIC: {
         const LRESULT r = ClOnCtlColorStatic((HDC)wp, (HWND)lp);
         if (r != 0) {
@@ -709,8 +852,10 @@ void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
     s_deviceName = deviceName;
     s_spatialFixFailed = false;
     s_enhFixFailed = false;
-    s_chainedRestart = false;
-    s_chainedRestartTick = 0;
+    s_fixNote = FixNote::None;
+    s_fixNoteRow = -1;
+    s_fixNoteTick = 0;
+    ++s_fixSeq; // invalidate any in-flight worker completion
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);

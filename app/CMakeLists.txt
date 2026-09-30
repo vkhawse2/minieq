@@ -28,5 +28,6 @@ target_include_directories(MiniEQ PRIVATE
 )
 
 # ole32/uuid: COM + MMDevice. advapi32: registry. comctl32: trackbars.
-# shell32: SHGetFolderPathW + elevated relaunch.
-target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32)
+# shell32: SHGetFolderPathW + elevated relaunch. runtimeobject: WinRT
+# (RoGetActivationFactory / HSTRING) for the live spatial-sound switch.
+target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 runtimeobject)
