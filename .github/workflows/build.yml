@@ -40,5 +40,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: minieq-windows-x64
-          path: build\stage\*
+          path: |
+            build\stage\MiniEQ.exe
+            build\stage\MiniEQ_APO.dll
+            build\stage\MiniEQ-0.1.0-x64.msi
           if-no-files-found: error
