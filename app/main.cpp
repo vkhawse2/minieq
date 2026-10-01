@@ -7,13 +7,16 @@
 // live when devices are plugged/unplugged. No frameworks, no runtime beyond
 // the Windows SDK: the whole app is well under a megabyte and a few MB of RAM.
 //
-// Usage: MiniEQ.exe [--attach <endpoint-id> | --detach <endpoint-id>
+// Usage: MiniEQ.exe [--attach <endpoint-id> [--force] | --detach <endpoint-id>
 //                    | --attach-all | --detach-all]
 // The --attach/--detach forms are used for the elevated self-relaunch and
 // exit after doing the registry work. The --attach-all/--detach-all forms
 // are the MSI's deferred custom actions: silent, no UI at all (the installer
 // runs them as SYSTEM with no interactive desktop, where a message box
-// would hang the setup), best-effort per endpoint.
+// would hang the setup), best-effort per endpoint. --attach-all forces the
+// slot rewrite + device re-enumeration on every endpoint so a fresh install
+// (or an upgrade that replaced the DLL) takes effect immediately instead of
+// leaving the engine on its stale chain.
 
 #define UNICODE
 #define _UNICODE
@@ -67,6 +70,8 @@ enum {
 };
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
+#define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
+#define IDT_DEVGHOST 3  // one-shot: a device still missing after 4 s is really gone
 
 
 static const wchar_t* kBandNames5[MINIEQ_NUM_BANDS] = {
@@ -119,6 +124,7 @@ static HWND                 g_masterLabel, g_presetLabel, g_settingsLabel;
 static HWND                 g_bandsLabel, g_note; // fixed labels repositioned by LayoutContent
 
 static void LayoutContent(); // forward: called before its definition below
+static bool DoElevatedAttach(bool attach, bool force); // forward: verify escalates
 static HWND                 g_btnChecklist; // "Checklist" button
 static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
@@ -133,6 +139,7 @@ enum class BannerKind {
     ReloadDone,    // engine reloaded + new build verified (green)
     AttachNote,    // post-attach note (plain)
     AttachOffer,   // new default device, offer one-click attach (plain)
+    VerifyNote,    // post-attach heartbeat verification (plain, custom text)
 };
 static BannerKind           g_bannerKind = BannerKind::None;
 // Auto-attach banner: shown when the Windows default render endpoint changed
@@ -140,9 +147,26 @@ static BannerKind           g_bannerKind = BannerKind::None;
 static std::wstring         g_lastDefaultId; // last seen system default endpoint
 static int                  g_contentDy = 0; // banner pushes content down by this
 static bool                 g_bannerVisible = false;
+// Device-change coalescing: a device restart (our own re-attach, a
+// Bluetooth reconnect) fires a burst of WM_DEVICECHANGE. Rebuilding the
+// device list + relaying out the window on every one tore the UI, so the
+// messages are folded into a single rebuild 750 ms after the last change.
+static int                  g_devChangeCoalesced = 0;
+static bool                 g_forceReselect = false; // ghost timer: drop stale sel
+static bool                 g_inLayout = false; // LayoutContent re-entrancy guard
 static bool                 g_bannerNote = false; // post-attach note showing
 static ULONGLONG            g_bannerNoteTick = 0;
 static constexpr ULONGLONG  kBannerNoteMs = 120000; // 2 min
+static std::wstring         g_verifyText; // custom text for BannerKind::VerifyNote
+// Post-attach verification: after an attach the engine must actually load
+// the APO. We watch for DIAG_LIVE; if it doesn't arrive in time we escalate
+// exactly once with a forced re-attach (slot rewrite + device re-enumeration,
+// one more UAC prompt). The banner explains each step before it happens, so
+// the escalation never surprises.
+static ULONGLONG            g_verifyUntil = 0; // 0 = not verifying
+static bool                 g_verifyEscalated = false;
+static bool                 g_verifyNudgePending = false;
+static constexpr ULONGLONG  kVerifyMs = 20000; // 20 s per verification round
 // Engine auto-reload: when the status channel reports a stale APO build, the
 // app flips the default format itself (no services, no UAC) and verifies the
 // new build. One attempt per (endpoint, stale build); never loops.
@@ -334,6 +358,7 @@ static void UpdateBanner() {
     const ULONGLONG now = GetTickCount64();
     if (g_bannerNote && now - g_bannerNoteTick >= kBannerNoteMs) {
         g_bannerNote = false;
+        g_verifyText.clear(); // custom verify/success text expires with the note
     }
     if ((g_reloadUi == ReloadUiState::DoneNote ||
          g_reloadUi == ReloadUiState::FailedNote) &&
@@ -376,6 +401,11 @@ static void UpdateBanner() {
             GetWindowTextW(g_bannerBtn, wantBtn, ARRAYSIZE(wantBtn));
             wantBtnVisible = IsWindowVisible(g_bannerBtn) == TRUE;
         }
+    } else if (g_verifyUntil != 0 || !g_verifyText.empty()) {
+        kind = BannerKind::VerifyNote;
+        StringCchCopyW(wantText, ARRAYSIZE(wantText),
+            g_verifyText.empty() ? L"Attached \u2014 waiting for the audio engine to pick up MiniEQ."
+                                 : g_verifyText.c_str());
     } else if (g_bannerNote) {
         kind = BannerKind::AttachNote;
         StringCchCopyW(wantText, ARRAYSIZE(wantText),
@@ -651,8 +681,9 @@ static void UpdateDiagStatus() {
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio is playing but NOT going through MiniEQ");
             StringCchCopyW(hint, ARRAYSIZE(hint),
-                L"Try replaying the audio. If it stays red, open Sound settings "
-                L"and flip the Default Format once, then check Diagnostics.");
+                L"Try replaying the audio. If it stays red, open the Audio Path "
+                L"Checklist and press Re-attach (Recovery section) \u2014 one click, "
+                L"no settings to hunt for.");
         } else {
             state = DIAG_WAITING;
             StringCchCopyW(text, ARRAYSIZE(text),
@@ -698,6 +729,79 @@ static void UpdateDiagStatus() {
     UpdateBanner();
 }
 
+// Post-attach verification, driven by the 500 ms status timer (called right
+// after UpdateDiagStatus). After an attach the engine must actually load the
+// APO: DIAG_LIVE within 20 s means done. Otherwise escalate exactly once
+// with a forced re-attach (slot rewrite + device re-enumeration, one more
+// UAC prompt) -- the banner warns before the prompt appears, so the
+// escalation never surprises. Never loops: after the escalation the outcome
+// is reported honestly and the user drives.
+static void ArmAttachVerify() {
+    g_verifyUntil = GetTickCount64() + kVerifyMs;
+    g_verifyEscalated = false;
+    g_verifyNudgePending = false;
+    g_verifyText.clear();
+    MiniEQ_AppLogCat(L"ENGINE", L"attach verify armed: watching for live heartbeat");
+}
+
+static void UpdateAttachVerify() {
+    if (g_verifyNudgePending) {
+        g_verifyNudgePending = false;
+        MiniEQ_AppLogCat(L"ENGINE", L"attach verify: escalating with forced re-attach");
+        MiniEQ_BreakerNoteUserAction();
+        if (DoElevatedAttach(true, /*force=*/true)) {
+            g_verifyUntil = GetTickCount64() + kVerifyMs;
+            g_verifyEscalated = true;
+            g_verifyText.clear();
+        } else {
+            g_verifyUntil = 0; // elevation cancelled: stop verifying quietly
+            g_verifyText.clear();
+            UpdateBanner();
+        }
+        return;
+    }
+    if (g_verifyUntil == 0 || g_endpointId.empty()) {
+        return;
+    }
+    if (g_diagState == DIAG_LIVE) {
+        g_verifyUntil = 0;
+        g_verifyText =
+            L"Attached \u2014 MiniEQ is processing audio on this device.";
+        g_bannerNote = true;
+        g_bannerNoteTick = GetTickCount64();
+        MiniEQ_AppLogCat(L"ENGINE", L"attach verify: heartbeat live, done");
+        UpdateBanner();
+        return;
+    }
+    if (g_reloadWorkerBusy) {
+        // The engine-reload worker is still working on it: don't time out
+        // while it runs; the deadline slides with the timer.
+        g_verifyUntil += 500;
+        return;
+    }
+    if (GetTickCount64() >= g_verifyUntil) {
+        if (!g_verifyEscalated) {
+            // Warn first; the nudge (and its UAC prompt) fires on the next
+            // tick so the user reads why it appears.
+            g_verifyText =
+                L"MiniEQ is attached, but the engine hasn't picked it up yet "
+                L"\u2014 nudging it (one more admin prompt)\u2026";
+            g_verifyNudgePending = true;
+            UpdateBanner();
+        } else {
+            g_verifyUntil = 0;
+            g_verifyText =
+                L"MiniEQ is attached, but the engine still isn't loading it. "
+                L"Open Diagnostics for the one-click fix.";
+            g_bannerNote = true;
+            g_bannerNoteTick = GetTickCount64();
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"attach verify: still not live after forced re-attach");
+            UpdateBanner();
+        }
+    }
+}
+
 static void SelectDevice(int index) {
     if (index < 0 || index >= (int)g_devices.size()) {
         return;
@@ -724,6 +828,9 @@ static void SelectDevice(int index) {
     g_enhState = DiagEnhancements::Unknown;
     // A manual device switch ends any post-attach note from another device.
     g_bannerNote = false;
+    g_verifyUntil = 0; // verification is per-endpoint; a switch ends it
+    g_verifyNudgePending = false;
+    g_verifyText.clear();
     // The Diagnostics Center watches the same device.
     MiniEQ_DiagCenterSetDevice(g_endpointId);
     ApplyStagingToUI();
@@ -731,11 +838,25 @@ static void SelectDevice(int index) {
     UpdateDiagStatus();
 }
 
+static bool EndpointInList(const std::wstring& id) {
+    for (const auto& d : g_devices) {
+        if (d.id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void CheckDefaultDevice(); // defined after RefreshDeviceList
 static void RefreshDeviceList() {
     int keep = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0);
     std::wstring keepId = (keep >= 0 && keep < (int)g_devices.size())
                           ? g_devices[(size_t)keep].id : L"";
+    if (keepId.empty()) {
+        // The combo selection may already be cleared (we clear it while the
+        // kept device is transiently absent): fall back to the live binding.
+        keepId = g_endpointId;
+    }
     if (keepId.empty()) {
         // Fresh open (or the list was empty): pre-select the system default
         // output -- the device the user is actually listening on.
@@ -751,14 +872,36 @@ static void RefreshDeviceList() {
             sel = (int)i;
         }
     }
-    if (sel < 0 && !g_devices.empty()) {
-        sel = 0;
-    }
     if (sel >= 0) {
         SendMessageW(g_combo, CB_SETCURSEL, (WPARAM)sel, 0);
         SelectDevice(sel);
+    } else if (g_forceReselect || keepId.empty()) {
+        // Fresh open with no default, or the ghost timer decided the kept
+        // device is really gone: fall back to the system default (the old
+        // behavior). Never strand the UI on a ghost device.
+        const std::wstring def = MiniEQ_GetDefaultRenderEndpointId();
+        for (size_t i = 0; i < g_devices.size(); ++i) {
+            if (g_devices[i].id == def) {
+                sel = (int)i;
+                break;
+            }
+        }
+        if (sel < 0 && !g_devices.empty()) {
+            sel = 0;
+        }
+        if (sel >= 0) {
+            SendMessageW(g_combo, CB_SETCURSEL, (WPARAM)sel, 0);
+            SelectDevice(sel);
+        } else {
+            SetWindowTextW(g_deviceName, L"No output device");
+        }
     } else {
-        SetWindowTextW(g_deviceName, L"No output device");
+        // The kept device is transiently absent (device restart / Bluetooth
+        // reconnect storm). Do NOT flap to another device and do NOT rebind
+        // channels: keep the selection stable until it reappears. The ghost
+        // timer (IDT_DEVGHOST) falls back to the default if it never does.
+        SendMessageW(g_combo, CB_SETCURSEL, (WPARAM)-1, 0);
+        UpdateAttachStatus(); // banner re-evaluates for the kept device
     }
     // A device change may have moved the system default (unplug, Bluetooth
     // reconnect, user switch in Settings). Follow it and offer the attach.
@@ -795,11 +938,16 @@ static void CheckDefaultDevice() {
     UpdateBanner();
 }
 
-static bool DoElevatedAttach(bool attach) {
+static bool DoElevatedAttach(bool attach, bool force) {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     std::wstring args = attach ? L"--attach \"" : L"--detach \"";
     args += g_endpointId + L"\"";
+    if (attach && force) {
+        // Forced: rewrite the slot and re-enumerate the device even when the
+        // slot already points at us (the engine never picked it up).
+        args += L" --force";
+    }
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.lpVerb = L"runas";
@@ -815,11 +963,21 @@ static bool DoElevatedAttach(bool attach) {
     // Attaching/detaching disturbs the engine on purpose -- the breaker's
     // passive detector must not mistake our own churn for a crash loop.
     MiniEQ_BreakerNoteUserAction();
-    return attach ? g_attached : !g_attached;
+    const bool ok = attach ? g_attached : !g_attached;
+    if (!attach) {
+        g_verifyUntil = 0; // a detach ends any pending attach verification
+        g_verifyNudgePending = false;
+        g_verifyText.clear();
+    } else if (ok) {
+        // The engine must actually load the APO now: watch for the live
+        // heartbeat and escalate once (forced re-attach) if it never comes.
+        ArmAttachVerify();
+    }
+    return ok;
 }
 
-static void RelaunchElevatedAttach(bool attach) {
-    if (!DoElevatedAttach(attach)) {
+static void RelaunchElevatedAttach(bool attach, bool force) {
+    if (!DoElevatedAttach(attach, force)) {
         MessageBoxW(g_hwnd, L"Elevation was cancelled.", L"MiniEQ", MB_ICONINFORMATION);
     }
 }
@@ -1002,6 +1160,10 @@ static void BuildControls(HWND hwnd) {
 // grows; when it hides, everything returns. Base Y coordinates are the
 // layout's; the shift is g_contentDy.
 static void LayoutContent() {
+    if (g_inLayout) {
+        return; // a layout pass never nests inside another
+    }
+    g_inLayout = true;
     const int dy = g_contentDy;
     auto place = [&](HWND h, int x, int baseY, int w, int hgt) {
         if (h != nullptr) {
@@ -1050,6 +1212,7 @@ static void LayoutContent() {
     place(g_note, 12, 554, 456, 30);
     SetWindowPos(g_hwnd, nullptr, 0, 0, 480, 632 + dy,
                  SWP_NOMOVE | SWP_NOZORDER);
+    g_inLayout = false;
 }
 
 static void OnSliderChanged(HWND slider) {
@@ -1112,12 +1275,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == IDT_DIAG) {
             UpdateDiagStatus();
+            UpdateAttachVerify(); // post-attach heartbeat watch, if armed
             // Circuit breaker: poll the passive crash-loop detector about
             // every 5 s. It fires non-blockingly and only on a genuine
             // restart loop; the outcome arrives as WM_APP_BREAKER_DONE.
             static int breakerTick = 0;
             if ((++breakerTick % 10) == 0) {
                 MiniEQ_BreakerPoll(hwnd);
+            }
+        } else if (wParam == IDT_DEVSETTLE) {
+            KillTimer(hwnd, IDT_DEVSETTLE);
+            if (g_devChangeCoalesced > 1) {
+                MiniEQ_AppLogCat(L"UI",
+                    L"device-change storm settled (%d notifications): rebuilding once",
+                    g_devChangeCoalesced);
+            }
+            g_devChangeCoalesced = 0;
+            RefreshDeviceList();
+            if (!g_forceReselect && !g_endpointId.empty() &&
+                !EndpointInList(g_endpointId)) {
+                // The kept device is still missing after the storm. It may
+                // be a slow re-enumeration (Bluetooth) or a real unplug:
+                // give it 4 s, then fall back instead of showing a ghost.
+                SetTimer(hwnd, IDT_DEVGHOST, 4000, nullptr);
+            }
+        } else if (wParam == IDT_DEVGHOST) {
+            KillTimer(hwnd, IDT_DEVGHOST);
+            if (!g_endpointId.empty() && !EndpointInList(g_endpointId)) {
+                MiniEQ_AppLogCat(L"UI",
+                    L"device still missing after 4 s: falling back to default");
+                g_forceReselect = true;
+                RefreshDeviceList();
+                g_forceReselect = false;
             }
         }
         return 0;
@@ -1179,7 +1368,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RefreshDeviceList();
         } else if (id == IDC_ATTACH) {
             if (!g_endpointId.empty()) {
-                RelaunchElevatedAttach(!g_attached);
+                RelaunchElevatedAttach(!g_attached, /*force=*/false);
             }
         } else if (id == IDC_POWER) {
             // Global MiniEQ on/off: persists across restarts (devices.ini
@@ -1204,7 +1393,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // registration takes effect now.
                 if (!g_endpointId.empty() && !g_attached) {
                     MiniEQ_AppLog(L"UI: attach banner accepted for new default device");
-                    if (DoElevatedAttach(true)) {
+                    if (DoElevatedAttach(true, /*force=*/false)) {
                         ChainReloadForBanner();
                     }
                     UpdateAttachStatus(); // re-evaluates the banner (note or hide)
@@ -1378,11 +1567,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DEVICECHANGE:
-        // Aux / USB-C / Bluetooth (un)plugged while the app is open: re-list
-        // endpoints and keep the current selection when it is still present.
-        // RefreshDeviceList also tracks the system default: if it moved,
-        // MiniEQ follows it and offers the one-click attach banner.
-        RefreshDeviceList();
+        // Aux / USB-C / Bluetooth (un)plugged while the app is open -- and,
+        // notably, our own device restart after an attach. A restart fires a
+        // burst of these; rebuilding the list, rebinding channels and
+        // relaying out the window on every one tore the UI. Coalesce: one
+        // rebuild, 750 ms after the last notification.
+        KillTimer(hwnd, IDT_DEVSETTLE);
+        KillTimer(hwnd, IDT_DEVGHOST); // storm continues, or the device is back
+        ++g_devChangeCoalesced;
+        SetTimer(hwnd, IDT_DEVSETTLE, 750, nullptr);
         return 0;
 
     case WM_CLOSE:
@@ -1428,7 +1621,8 @@ static int RunBulkEndpointHelper(bool attach) {
     const std::vector<AudioEndpoint> devices = MiniEQ_ListRenderEndpoints();
     int ok = 0, failed = 0;
     for (const AudioEndpoint& ep : devices) {
-        const HRESULT r = attach ? MiniEQ_AttachToEndpoint(ep.id.c_str())
+        const HRESULT r = attach ? MiniEQ_AttachToEndpointEx(ep.id.c_str(),
+                                                             /*force=*/true)
                                  : MiniEQ_DetachFromEndpoint(ep.id.c_str());
         if (SUCCEEDED(r)) {
             ++ok;
@@ -1507,20 +1701,21 @@ static int RunCircuitBreakerSweep() {
 }
 
 static int RunElevatedHelper(LPWSTR* argv, int argc) {
-    // argv: [exe, --attach|--detach, <endpoint-id>]
+    // argv: [exe, --attach|--detach, <endpoint-id>, [--force]]
     if (argc < 3) {
         return 1;
     }
     const bool attach = (_wcsicmp(argv[1], L"--attach") == 0);
-    HRESULT hr = attach ? MiniEQ_AttachToEndpoint(argv[2])
+    const bool force = attach && argc >= 4 && (_wcsicmp(argv[3], L"--force") == 0);
+    HRESULT hr = attach ? MiniEQ_AttachToEndpointEx(argv[2], force)
                         : MiniEQ_DetachFromEndpoint(argv[2]);
     if (SUCCEEDED(hr)) {
-        // Attach owns its restart decision now: MiniEQ_AttachToEndpoint
-        // restarts the endpoint device (disable + enable) only when the
-        // slot actually changed, and returns S_FALSE when the slot already
-        // held us (restart skipped -- no audio interruption at all).
-        // Detach still needs the explicit restart below; its function does
-        // not do it.
+        // Attach owns its restart decision now: MiniEQ_AttachToEndpointEx
+        // restarts the endpoint device (disable + enable) when the slot
+        // changed, or always with --force, and returns S_FALSE when the slot
+        // already held us and no force was given (restart skipped -- no
+        // audio interruption at all). Detach still needs the explicit
+        // restart below; its function does not do it.
         bool restarted = false;
         if (attach) {
             restarted = (hr == S_OK);

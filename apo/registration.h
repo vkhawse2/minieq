@@ -53,6 +53,15 @@ HRESULT MiniEQ_EnsureLogDirForInstall();
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId);
 HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId);
 
+// Forced attach: rewrites the slot and re-enumerates the endpoint device
+// even when the slot already points at us. For the "attached but Windows
+// never loaded it" case -- the registry is provably right, yet the running
+// engine never picked up the registration (e.g. after an upgrade that
+// replaced the DLL). Never used silently: every caller goes through a UAC
+// prompt or the installer's attach-all, and the device restart briefly moves
+// playing audio to another output.
+HRESULT MiniEQ_AttachToEndpointEx(const wchar_t* endpointId, bool force);
+
 // True if the active effect slot of this endpoint already points at our APO.
 HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached);
 

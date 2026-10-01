@@ -947,16 +947,19 @@ static void SpawnRecoveryJob(int action) {
     }
 }
 
-// Re-writes the SFX slot. The FxProperties value lives under HKLM, so this
-// needs elevation -- same self-relaunch pattern as the main window's
-// "Attach to this device" (UAC prompt, --attach helper). Runs on the UI
-// thread, like the existing attach flow.
+// Re-writes the SFX slot and re-enumerates the device, even when the slot
+// already points at us (--force). The FxProperties value lives under HKLM,
+// so this needs elevation -- same self-relaunch pattern as the main window's
+// "Attach to this device" (UAC prompt, --attach helper). Forced because this
+// button exists precisely for the "attached but Windows never loaded it"
+// case, where the plain attach would no-op with S_FALSE and change nothing.
+// Runs on the UI thread, like the existing attach flow.
 static bool RelaunchElevatedReattach(const std::wstring& endpoint) {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     std::wstring args = L"--attach \"";
     args += endpoint;
-    args += L"\"";
+    args += L"\" --force";
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.lpVerb = L"runas";
     sei.lpFile = exe;

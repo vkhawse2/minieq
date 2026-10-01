@@ -808,8 +808,10 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
                    L"and audio enhancements are on \u2014 but audiodg.exe never "
                    L"instantiated our APO for this stream. Windows skipped it "
                    L"silently, with no error.";
-        v.nextStep = L"Flip this device's Default Format once (Sound settings), then "
-                     L"replay. If it stays red, copy this report and send it over.";
+        v.nextStep = L"In the Audio Path Checklist, press Re-attach (Recovery "
+                     L"section): one click re-writes the effects slot and "
+                     L"re-enumerates the device. Then replay. If it stays red, "
+                     L"copy this report and send it over.";
         return v;
     }
     if (snap.anySessionActive) {
@@ -822,8 +824,10 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
             v.detail = L"Audio is flowing on the endpoint, but no processing "
                        L"heartbeat is coming back from our APO.";
         }
-        v.nextStep = L"Open Sound settings and flip the device's Default Format once, "
-                     L"then replay. If it stays red, copy this report and send it over.";
+        v.nextStep = L"In the Audio Path Checklist, press Re-attach (Recovery "
+                     L"section): one click re-writes the effects slot and "
+                     L"re-enumerates the device. Then replay. If it stays red, "
+                     L"copy this report and send it over.";
         return v;
     }
     v.severity = DiagSeverity::Neutral;

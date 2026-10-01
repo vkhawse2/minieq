@@ -489,6 +489,10 @@ static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
 }
 
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
+    return MiniEQ_AttachToEndpointEx(endpointId, /*force=*/false);
+}
+
+HRESULT MiniEQ_AttachToEndpointEx(const wchar_t* endpointId, bool force) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
 
     // 0. Probe first: if the active slot already points at us, the registry
@@ -499,10 +503,13 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     //    Skipping it also preserves a legitimate child-APO stash, which a
     //    blind rewrite would clear. Returns S_FALSE in that case so the
     //    caller can report "already attached, no restart needed".
+    //    force=true overrides the skip: the caller has evidence the engine
+    //    never picked up the registration, so the slot is rewritten and the
+    //    device is re-enumerated regardless.
     bool alreadyAttached = false;
     const bool probeOk = SUCCEEDED(
         MiniEQ_IsAttachedToEndpoint(endpointId, &alreadyAttached));
-    const bool skipRewrite = probeOk && alreadyAttached;
+    const bool skipRewrite = probeOk && alreadyAttached && !force;
 
     // 1. Repair layers 1+2 (COM class + APO declaration). The installer writes
     //    these via DllRegisterServer, but a failed/interrupted upgrade can
@@ -537,11 +544,15 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
 
     // 3. Clear any stale child-APO stash so we start clean; AttachToSlot
     //    re-stashes the real incumbent below. Skipped when the slot already
-    //    held us (step 0): the stash may be a legitimate displaced APO.
+    //    held us (step 0): the stash may be a legitimate displaced APO --
+    //    and on a forced re-attach AttachToSlot won't re-stash (the incumbent
+    //    is us), so a blind clear would lose it with no way to restore.
     if (skipRewrite) {
         return S_FALSE;
     }
-    MiniEQ_ClearChildApoClsid(endpointId);
+    if (!(force && alreadyAttached)) {
+        MiniEQ_ClearChildApoClsid(endpointId);
+    }
 
     // 4. Attach to the active slot (stashes the incumbent as our child).
     const HRESULT hr = AttachToSlot(endpointId, g_fxSlot);
@@ -552,7 +563,8 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     //    send change notifications, so without this the engine keeps using
     //    the list from when the device was last connected ("attached but
     //    never loaded"). Best-effort: the attach itself already succeeded.
-    //    Only reached when the slot actually changed (see step 0).
+    //    Only reached when the slot actually changed, or when forced
+    //    (see step 0).
     MiniEQ_ReenumerateEndpointDevice(endpointId);
 
     return S_OK;
