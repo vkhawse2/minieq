@@ -287,24 +287,36 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
     }
 
     // 5 -- Spatial sound. MiniEQ never changes this setting: it is the
-    // user's own choice (games, movies), so the row only reports it and
-    // explains the trade-off. While a spatial mode is on, Windows routes
-    // this endpoint through the spatial graph, which bypasses MiniEQ --
-    // the EQ has no effect until the user turns spatial off themselves.
+    // user's own choice (games, movies), so the row only reports it.
+    // Measured 2026-10-01 on MH139: MiniEQ's SFX APO keeps processing with
+    // a spatial mode on (live heartbeat, EQ audibly working) -- it EQs the
+    // stereo mix before Windows spatializes it. So the row only raises the
+    // bypass warning when the APO genuinely isn't processing; otherwise it
+    // reports the mode as working-as-expected.
     s_rows[4].title = L"Spatial sound";
     if (spatial.state == DiagSpatial::Off) {
         s_rows[4].state = CheckState::Ok;
         s_rows[4].detail = L"Off.";
     } else if (spatial.state == DiagSpatial::On) {
-        s_rows[4].state = CheckState::Idle;
         const std::wstring name =
             spatial.name.empty() ? L"A spatial mode" : spatial.name;
-        s_rows[4].detail = name + L" is on \u2014 your choice for games and movies. "
-                           L"While it's on, Windows bypasses MiniEQ, so the EQ "
-                           L"has no effect on this device. If you want the EQ "
-                           L"instead, turn spatial off yourself: Settings "
-                           L"\u2192 System \u2192 Sound \u2192 " + dev +
-                           L" \u2192 Spatial sound \u2192 Off, then replay.";
+        // The heartbeat is the ground truth: if the APO is demonstrably
+        // processing, spatial sound is not bypassing MiniEQ.
+        const bool apoLive = snap.statusChannelOk && snap.heartbeatFresh;
+        if (apoLive) {
+            s_rows[4].state = CheckState::Ok;
+            s_rows[4].detail = name + L" is on \u2014 your choice for games and movies. "
+                               L"MiniEQ is still processing this device's audio "
+                               L"(live APO heartbeat), so the EQ applies before "
+                               L"spatialization.";
+        } else {
+            s_rows[4].state = CheckState::Idle;
+            s_rows[4].detail = name + L" is on \u2014 your choice for games and movies. "
+                               L"The APO isn't processing right now, so if the EQ "
+                               L"has no audible effect, turn spatial off yourself: "
+                               L"Settings \u2192 System \u2192 Sound \u2192 " + dev +
+                               L" \u2192 Spatial sound \u2192 Off, then replay.";
+        }
     } else {
         s_rows[4].state = CheckState::Idle;
         wchar_t detail[256] = {};
