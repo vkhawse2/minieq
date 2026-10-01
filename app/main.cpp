@@ -166,6 +166,7 @@ static std::wstring         g_verifyText; // custom text for BannerKind::VerifyN
 static ULONGLONG            g_verifyUntil = 0; // 0 = not verifying
 static bool                 g_verifyEscalated = false;
 static bool                 g_verifyNudgePending = false;
+static ULONGLONG            g_lastEscalateTick = 0; // rate-limit for the UAC escalation
 static constexpr ULONGLONG  kVerifyMs = 20000; // 20 s per verification round
 // Engine auto-reload: when the status channel reports a stale APO build, the
 // app flips the default format itself (no services, no UAC) and verifies the
@@ -747,6 +748,14 @@ static void ArmAttachVerify() {
 static void UpdateAttachVerify() {
     if (g_verifyNudgePending) {
         g_verifyNudgePending = false;
+        const ULONGLONG nowEsc = GetTickCount64();
+        if (g_lastEscalateTick != 0 && nowEsc - g_lastEscalateTick < 60000) {
+            // Already escalated very recently: don't stack UAC prompts.
+            // The previous escalation already extended the deadline.
+            MiniEQ_AppLogCat(L"ENGINE", L"attach verify: escalation suppressed (rate-limited)");
+            return;
+        }
+        g_lastEscalateTick = nowEsc;
         MiniEQ_AppLogCat(L"ENGINE", L"attach verify: escalating with forced re-attach");
         MiniEQ_BreakerNoteUserAction();
         if (DoElevatedAttach(true, /*force=*/true)) {
@@ -791,8 +800,8 @@ static void UpdateAttachVerify() {
         } else {
             g_verifyUntil = 0;
             g_verifyText =
-                L"MiniEQ is attached, but the engine still isn't loading it. "
-                L"Open Diagnostics for the one-click fix.";
+                L"MiniEQ is attached, but Windows still isn't loading it. "
+                L"Turn this device off and back on (or unplug/replug it), then re-attach MiniEQ.";
             g_bannerNote = true;
             g_bannerNoteTick = GetTickCount64();
             MiniEQ_AppLogCat(L"ENGINE",
