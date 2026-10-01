@@ -41,27 +41,10 @@ struct DiagSpatialInfo {
 
 DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId);
 
-// Clears the active spatial-sound mode for one endpoint (writes the Off
-// state back to the endpoint property store). Returns false when the
-// property store can't be opened for write or the commit fails -- the
-// caller should then fall back to the manual Settings path.
-bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId);
-
-// Turns spatial sound off through the public WinRT API
-// (Windows.Media.Audio.SpatialAudioDeviceConfiguration) -- the same channel
-// the Sound settings page uses, so the audio service rebuilds the running
-// graph immediately with no service restart: the Dolby-level transition.
-// Runs its async wait on the calling thread, so call it from a worker
-// thread, never the UI thread. Returns true when the operation ran to
-// completion; the caller then watches the APO heartbeat to confirm the
-// path healed. Returns false when WinRT is unavailable or the call failed
-// -- the caller should fall back to MiniEQ_SetSpatialSoundOff plus a
-// chained format flip (MiniEQ_FlipDefaultFormat).
-bool MiniEQ_SetSpatialSoundOffWinRT(const std::wstring& endpointId);
-
 // Writes the "Audio enhancements" switch for one endpoint (on = device
-// default effects, off = the engine skips every APO). Same fallback
-// contract as MiniEQ_SetSpatialSoundOff.
+// default effects, off = the engine skips every APO). Returns false when
+// the property store can't be opened for write or the commit fails -- the
+// caller should then fall back to the manual Settings path.
 bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on);
 
 // Full COM-registration path of MiniEQ_APO.dll

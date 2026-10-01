@@ -15,15 +15,12 @@
 #include <audioclient.h> // IAudioClient, AUDCLNT_E_DEVICE_IN_USE (exclusive probe)
 #include <commctrl.h>
 #include <endpointvolume.h>
-#include <inspectable.h> // IInspectable, for the WinRT spatial-sound ABI below
 #include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
 #include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <propvarutil.h>
-#include <roapi.h> // RoInitialize, RoGetActivationFactory
 #include <tlhelp32.h>
 #include <strsafe.h>
-#include <winstring.h> // HSTRING, WindowsCreateString
 
 #include <string.h>
 #include <wchar.h>
@@ -293,50 +290,11 @@ DiagSpatialInfo MiniEQ_ReadSpatialSound(const std::wstring& endpointId) {
     return out;
 }
 
-bool MiniEQ_SetSpatialSoundOff(const std::wstring& endpointId) {
-    if (endpointId.empty()) {
-        return false;
-    }
-    IMMDeviceEnumerator* pEnum = nullptr;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                __uuidof(IMMDeviceEnumerator),
-                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
-        return false;
-    }
-    bool ok = false;
-    IMMDevice* pDev = nullptr;
-    if (SUCCEEDED(pEnum->GetDevice(endpointId.c_str(), &pDev)) && pDev != nullptr) {
-        IPropertyStore* pProps = nullptr;
-        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READWRITE, &pProps)) &&
-            pProps != nullptr) {
-            // Empty REG_SZ = spatial Off (mirrors what the Settings app writes
-            // when the user picks "Off"). Allocate with CoTaskMemAlloc so
-            // PropVariantClear can free it.
-            PROPVARIANT pv;
-            PropVariantInit(&pv);
-            pv.vt = VT_LPWSTR;
-            pv.pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc(sizeof(wchar_t)));
-            if (pv.pwszVal != nullptr) {
-                pv.pwszVal[0] = L'\0';
-                if (SUCCEEDED(pProps->SetValue(kPkeySpatialClsid, pv)) &&
-                    SUCCEEDED(pProps->Commit())) {
-                    ok = true;
-                }
-            }
-            PropVariantClear(&pv);
-            pProps->Release();
-        }
-        pDev->Release();
-    }
-    pEnum->Release();
-    return ok;
-}
-
 // Writes the "Audio enhancements" switch: on = 0 (device default
 // effects, the SysFx chain runs), off = 1 (the engine skips every
 // APO, MiniEQ included). Stored as REG_DWORD (VT_UI4) -- the native
 // format the Settings app itself uses, so both tools read each
-// other's writes. Mirrors MiniEQ_SetSpatialSoundOff above.
+// other's writes.
 bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on) {
     if (endpointId.empty()) {
         return false;
@@ -368,191 +326,6 @@ bool MiniEQ_SetAudioEnhancements(const std::wstring& endpointId, bool on) {
     }
     pEnum->Release();
     return ok;
-}
-
-// ---------------------------------------------------------------------------
-// Live spatial-sound switch through the public WinRT API.
-//
-// Windows.Media.Audio.SpatialAudioDeviceConfiguration is the same channel
-// the Sound settings page uses: the write goes through the audio service,
-// which rebuilds the running audio graph immediately -- no service restart,
-// no reinstallation, the Dolby-level transition. (Writing the endpoint
-// property store directly only touches the registry; the engine never picks
-// it up live, which is why the old one-click fix had to chain a restart.)
-//
-// The ABI is hand-declared (vtable slots verified against the windows-rs
-// bindings, which are generated from the official .winmd metadata).
-// ---------------------------------------------------------------------------
-namespace {
-
-// {3EC37F7B-936D-4E04-9728-2827D9F758C4}
-static const GUID kIID_SpatialStatics = {
-    0x3ec37f7b, 0x936d, 0x4e04, { 0x97, 0x28, 0x28, 0x27, 0xd9, 0xf7, 0x58, 0xc4 }
-};
-// {EE830034-61CF-5749-9DA4-10F0FE028199}
-static const GUID kIID_SpatialConfig = {
-    0xee830034, 0x61cf, 0x5749, { 0x9d, 0xa4, 0x10, 0xf0, 0xfe, 0x02, 0x81, 0x99 }
-};
-// IAsyncInfo {00000036-0000-0000-C000-000000000046}
-static const GUID kIID_AsyncInfo = {
-    0x00000036, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 }
-};
-
-struct ISpatialAudioStatics : public IInspectable {
-    // IInspectable occupies slots 3-5; GetForDeviceId is slot 6.
-    virtual HRESULT STDMETHODCALLTYPE GetForDeviceId(
-        HSTRING deviceId, IInspectable** config) = 0;
-};
-
-struct ISpatialAudioConfig : public IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_DeviceId(HSTRING* v) = 0;                  // 6
-    virtual HRESULT STDMETHODCALLTYPE get_IsSpatialAudioSupported(boolean* v) = 0;    // 7
-    virtual HRESULT STDMETHODCALLTYPE IsSpatialAudioFormatSupported(
-        HSTRING subtype, boolean* v) = 0;                                             // 8
-    virtual HRESULT STDMETHODCALLTYPE get_ActiveSpatialAudioFormat(HSTRING* v) = 0;    // 9
-    virtual HRESULT STDMETHODCALLTYPE get_DefaultSpatialAudioFormat(HSTRING* v) = 0;   // 10
-    virtual HRESULT STDMETHODCALLTYPE SetDefaultSpatialAudioFormatAsync(
-        HSTRING subtype, IInspectable** operation) = 0;                                // 11
-};
-
-struct IAsyncInfoLocal : public IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_Id(UINT32* v) = 0;         // 6
-    virtual HRESULT STDMETHODCALLTYPE get_Status(INT32* v) = 0;      // 7
-    virtual HRESULT STDMETHODCALLTYPE get_ErrorCode(HRESULT* v) = 0; // 8
-    virtual HRESULT STDMETHODCALLTYPE Cancel() = 0;                 // 9
-    virtual HRESULT STDMETHODCALLTYPE Close() = 0;                  // 10
-};
-
-static HSTRING MakeHString(const wchar_t* s) {
-    HSTRING h = nullptr;
-    if (s != nullptr && s[0] != L'\0') {
-        WindowsCreateString(s, static_cast<UINT32>(wcslen(s)), &h);
-    }
-    return h;
-}
-
-} // namespace
-
-bool MiniEQ_SetSpatialSoundOffWinRT(const std::wstring& endpointId) {
-    if (endpointId.empty()) {
-        return false;
-    }
-    // WinRT inits COM for this thread (MTA); the caller runs this on a
-    // worker thread, never on the UI thread.
-    const HRESULT hrInit = RoInitialize(RO_INIT_MULTITHREADED);
-    if (FAILED(hrInit)) {
-        return false;
-    }
-    const bool doUninit = (hrInit == S_OK);
-
-    bool applied = false;
-    HSTRING hClass = MakeHString(L"Windows.Media.Audio.SpatialAudioDeviceConfiguration");
-    // WinRT device id: \\?\SWD#MMDEVAPI#<endpoint-id>#{e6327cad-dcec-4949-ae8a-991e976a79d2}
-    // (audio-render device interface class).
-    const std::wstring winrtId = L"\\\\?\\SWD#MMDEVAPI#" + endpointId +
-        L"#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
-    HSTRING hDevId = MakeHString(winrtId.c_str());
-    // Guid.Empty = spatial sound Off.
-    HSTRING hOff = MakeHString(L"{00000000-0000-0000-0000-000000000000}");
-
-    ISpatialAudioStatics* pStatics = nullptr;
-    IInspectable* pConfigRaw = nullptr;
-    ISpatialAudioConfig* pConfig = nullptr;
-    IInspectable* pOpRaw = nullptr;
-    IAsyncInfoLocal* pInfo = nullptr;
-
-    // The WinRT API answers "unsupported" instead of failing for an id it
-    // can't resolve, so confirm Core Audio knows the endpoint first; then
-    // ask the service to switch the format off and wait for the async
-    // operation to run to completion (AsyncStatus: 0 Started, 1 Completed,
-    // 2 Canceled, 3 Error).
-    IMMDeviceEnumerator* pEnum = nullptr;
-    if (hClass != nullptr && hDevId != nullptr && hOff != nullptr &&
-        SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                   __uuidof(IMMDeviceEnumerator),
-                                   reinterpret_cast<void**>(&pEnum))) &&
-        pEnum != nullptr) {
-        IMMDevice* pDev = nullptr;
-        const HRESULT hrDev = pEnum->GetDevice(endpointId.c_str(), &pDev);
-        if (pDev != nullptr) {
-            pDev->Release();
-        }
-        pEnum->Release();
-        if (SUCCEEDED(hrDev) &&
-            SUCCEEDED(RoGetActivationFactory(hClass, kIID_SpatialStatics,
-                                             reinterpret_cast<void**>(&pStatics))) &&
-            pStatics != nullptr &&
-            SUCCEEDED(pStatics->GetForDeviceId(hDevId, &pConfigRaw)) &&
-            pConfigRaw != nullptr &&
-            SUCCEEDED(pConfigRaw->QueryInterface(kIID_SpatialConfig,
-                                                 reinterpret_cast<void**>(&pConfig))) &&
-            pConfig != nullptr &&
-            SUCCEEDED(pConfig->SetDefaultSpatialAudioFormatAsync(hOff, &pOpRaw)) &&
-            pOpRaw != nullptr &&
-            SUCCEEDED(pOpRaw->QueryInterface(kIID_AsyncInfo,
-                                             reinterpret_cast<void**>(&pInfo))) &&
-            pInfo != nullptr) {
-            for (int i = 0; i < 160; ++i) {
-                INT32 st = 0;
-                if (FAILED(pInfo->get_Status(&st))) {
-                    break;
-                }
-                if (st == 1) { // Completed
-                    // Completed alone isn't proof: the operation reports
-                    // semantic failures (format not supported on this
-                    // endpoint, license issues) through its result object,
-                    // not through the async status -- and that result's ABI
-                    // isn't worth hand-rolling for one boolean. Verify the
-                    // end state directly instead: the endpoint must now
-                    // read back as spatial Off. A transport error fails the
-                    // switch too.
-                    HRESULT errCode = S_OK;
-                    if (SUCCEEDED(pInfo->get_ErrorCode(&errCode)) &&
-                        errCode == S_OK) {
-                        const DiagSpatialInfo after =
-                            MiniEQ_ReadSpatialSound(endpointId);
-                        applied = (after.state == DiagSpatial::Off);
-                    }
-                    break;
-                }
-                if (st == 2 || st == 3) { // Canceled / Error
-                    break;
-                }
-                Sleep(50);
-            }
-        }
-    }
-
-    if (pInfo != nullptr) {
-        pInfo->Release();
-    }
-    if (pOpRaw != nullptr) {
-        pOpRaw->Release();
-    }
-    if (pConfig != nullptr) {
-        pConfig->Release();
-    }
-    if (pConfigRaw != nullptr) {
-        pConfigRaw->Release();
-    }
-    if (pStatics != nullptr) {
-        pStatics->Release();
-    }
-    if (hOff != nullptr) {
-        WindowsDeleteString(hOff);
-    }
-    if (hDevId != nullptr) {
-        WindowsDeleteString(hDevId);
-    }
-    if (hClass != nullptr) {
-        WindowsDeleteString(hClass);
-    }
-    if (doUninit) {
-        RoUninitialize();
-    }
-    MiniEQ_AppLogCat(L"DIAG", L"WinRT spatial-off: %s",
-                     applied ? L"verified spatial off" : L"failed, falling back");
-    return applied;
 }
 
 static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
