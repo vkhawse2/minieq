@@ -7,9 +7,13 @@
 // live when devices are plugged/unplugged. No frameworks, no runtime beyond
 // the Windows SDK: the whole app is well under a megabyte and a few MB of RAM.
 //
-// Usage: MiniEQ.exe [--attach <endpoint-id> | --detach <endpoint-id>]
+// Usage: MiniEQ.exe [--attach <endpoint-id> | --detach <endpoint-id>
+//                    | --attach-all | --detach-all]
 // The --attach/--detach forms are used for the elevated self-relaunch and
-// exit after doing the registry work.
+// exit after doing the registry work. The --attach-all/--detach-all forms
+// are the MSI's deferred custom actions: silent, no UI at all (the installer
+// runs them as SYSTEM with no interactive desktop, where a message box
+// would hang the setup), best-effort per endpoint.
 
 #define UNICODE
 #define _UNICODE
@@ -1343,6 +1347,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // Entry
 //------------------------------------------------------------------------------
 
+static int RunBulkEndpointHelper(bool attach) {
+    // MSI install/uninstall worker: attach (or detach) MiniEQ on every
+    // active render endpoint present right now. Silent by design -- see the
+    // Usage note above. Always exits 0: one stubborn device must never fail
+    // the whole setup; the in-app Attach button remains for devices plugged
+    // in later.
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) {
+        return 0;
+    }
+    const std::vector<AudioEndpoint> devices = MiniEQ_ListRenderEndpoints();
+    int ok = 0, failed = 0;
+    for (const AudioEndpoint& ep : devices) {
+        const HRESULT r = attach ? MiniEQ_AttachToEndpoint(ep.id.c_str())
+                                 : MiniEQ_DetachFromEndpoint(ep.id.c_str());
+        if (SUCCEEDED(r)) {
+            ++ok;
+        } else {
+            ++failed;
+        }
+    }
+    CoUninitialize();
+    MiniEQ_EnsureLogDir();
+    MiniEQ_AppLogCat(L"SETUP", L"%s: %d ok, %d failed (%d endpoints present)",
+                     attach ? L"attach-all" : L"detach-all",
+                     ok, failed, (int)devices.size());
+    return 0;
+}
+
 static int RunElevatedHelper(LPWSTR* argv, int argc) {
     // argv: [exe, --attach|--detach, <endpoint-id>]
     if (argc < 3) {
@@ -1378,7 +1411,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc >= 2 && (argv[1][0] == L'-')) {
-        const int rc = RunElevatedHelper(argv, argc);
+        int rc;
+        if (_wcsicmp(argv[1], L"--attach-all") == 0) {
+            rc = RunBulkEndpointHelper(true);
+        } else if (_wcsicmp(argv[1], L"--detach-all") == 0) {
+            rc = RunBulkEndpointHelper(false);
+        } else {
+            rc = RunElevatedHelper(argv, argc);
+        }
         LocalFree(argv);
         return rc;
     }

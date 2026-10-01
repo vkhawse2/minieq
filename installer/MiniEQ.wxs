@@ -8,9 +8,12 @@
                       install (DllRegisterServer) and unregistered on
                       uninstall (DllUnregisterServer)
 
-  Per-endpoint attach (FxProperties) is NOT done by the installer: it is a
-  one-time, per-device, elevated step the app itself performs from its
-  "Attach" button. This keeps the MSI to files plus COM registration.
+  Per-endpoint attach (FxProperties) IS done by the installer now: a
+  best-effort deferred custom action (CA_AttachAll, runs as SYSTEM)
+  attaches MiniEQ to every render endpoint present at install time, so a
+  fresh machine just works. Devices plugged in later are still attached
+  from the app's "Attach" button, and uninstall detaches every endpoint
+  (CA_DetachAll) so no SFX slot is left pointing at a deleted DLL.
 
   Build (from repo root, WiX v3 on PATH):
     candle -arch x64 -dBinDir=build\Release installer\MiniEQ.wxs -out build\MiniEQ.wixobj
@@ -93,6 +96,35 @@
             KeyPath="yes"
             SelfRegCost="1" />
     </Component>
+
+    <!--
+      Per-endpoint registry as part of installation. Both actions run
+      deferred as SYSTEM (Impersonate="no") and are best-effort
+      (Return="ignore"): MiniEQ.exe's attach-all / detach-all switches are
+      fully silent and always exit 0, so one stubborn device can never fail
+      or roll back the setup.
+    -->
+    <CustomAction Id="CA_AttachAll"
+                  FileKey="File_MiniEQ_exe"
+                  ExeCommand="--attach-all"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="CA_DetachAll"
+                  FileKey="File_MiniEQ_exe"
+                  ExeCommand="--detach-all"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- After the files land, attach every endpoint present right now. -->
+      <Custom Action="CA_AttachAll" After="InstallFiles">NOT Installed</Custom>
+      <!-- On uninstall (not on upgrade), detach every endpoint so no SFX
+           slot dangles at a deleted DLL. The exe still exists here because
+           this runs before RemoveFiles. -->
+      <Custom Action="CA_DetachAll" Before="RemoveFiles">Installed AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
 
   </Product>
 </Wix>

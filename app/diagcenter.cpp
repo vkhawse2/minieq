@@ -68,6 +68,34 @@ static DWORD FindAudiodgPid() {
     return pid;
 }
 
+// Passive audiodg crash-loop detection. Every snapshot feeds the engine PID
+// through here; three PID changes inside ten minutes means audiodg.exe is
+// dying and restarting in a loop (e.g. an APO crashing it on stream start).
+// Purely observational -- no service is touched.
+static DWORD     s_loopLastPid = 0;
+static ULONGLONG s_loopChangeTicks[4] = {};
+static int       s_loopChangeCount = 0;
+
+static bool NoteAudiodgPid(DWORD pid) {
+    const ULONGLONG now = GetTickCount64();
+    if (pid != 0 && pid != s_loopLastPid) {
+        if (s_loopLastPid != 0) {
+            // A genuine change, not the first sighting: remember when.
+            s_loopChangeTicks[s_loopChangeCount % 4] = now;
+            ++s_loopChangeCount;
+        }
+        s_loopLastPid = pid;
+    }
+    int recent = 0;
+    const int n = (s_loopChangeCount < 4) ? s_loopChangeCount : 4;
+    for (int i = 0; i < n; ++i) {
+        if (now - s_loopChangeTicks[i] <= 10ULL * 60 * 1000) {
+            ++recent;
+        }
+    }
+    return recent >= 3;
+}
+
 // 1 = module found in the process, 0 = snapshot worked but module absent,
 // -1 = unknown (access denied on a protected audiodg.exe, process gone, ...).
 static int IsModuleLoadedIn(DWORD pid, const wchar_t* moduleName) {
@@ -724,6 +752,7 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
 
     // Engine layer.
     s.audiodgPid = FindAudiodgPid();
+    s.audiodgRestartLoop = NoteAudiodgPid(s.audiodgPid);
     s.dllLoaded = IsModuleLoadedIn(s.audiodgPid, L"MiniEQ_APO.dll");
 
     // Heartbeat layer.
@@ -829,6 +858,21 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
                    L"\u2014 slider changes are audible.";
         return v;
     }
+    if (snap.audiodgRestartLoop) {
+        // The engine dying repeatedly explains every downstream symptom
+        // (no DLL load, no heartbeat), so this outranks them.
+        v.severity = DiagSeverity::Bad;
+        v.title = L"The audio engine keeps crashing and restarting.";
+        v.detail = L"audiodg.exe has restarted 3 or more times in the last 10 minutes. "
+                   L"Every restart drops MiniEQ from the engine before it can process "
+                   L"audio \u2014 that is why no heartbeat arrives. If Windows blames "
+                   L"our APO often enough, it can also switch Audio enhancements off "
+                   L"by itself for this device (the Disable_SysFx lockout).";
+        v.nextStep = L"Detach MiniEQ from this device, replay, and see whether the "
+                     L"crashing stops \u2014 that tells us if our APO is the trigger. "
+                     L"Then copy this report and send it over.";
+        return v;
+    }
     if (snap.exclusiveHeld && snap.anySessionActive) {
         // Exclusive mode bypasses the engine (and every APO) by Windows
         // design -- heartbeats can never arrive for such a stream, so this
@@ -843,14 +887,23 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
                      L"WASAPI shared), then replay.";
         return v;
     }
+    if (snap.anySessionActive && snap.dllLoaded == 0) {
+        // Honest "attached but not loaded": registration is provably right,
+        // yet the engine never instantiated our APO for this stream.
+        v.severity = DiagSeverity::Bad;
+        v.title = L"MiniEQ is attached, but Windows never loaded it.";
+        v.detail = L"Registration is correct \u2014 the SFX slot points at MiniEQ_APO "
+                   L"and audio enhancements are on \u2014 but audiodg.exe never "
+                   L"instantiated our APO for this stream. Windows skipped it "
+                   L"silently, with no error.";
+        v.nextStep = L"Flip this device's Default Format once (Sound settings), then "
+                     L"replay. If it stays red, copy this report and send it over.";
+        return v;
+    }
     if (snap.anySessionActive) {
         v.severity = DiagSeverity::Bad;
         v.title = L"Audio is playing, but it's bypassing MiniEQ.";
-        if (snap.dllLoaded == 0) {
-            v.detail = L"The audio engine (audiodg.exe) never loaded MiniEQ_APO.dll. "
-                       L"Registration is correct \u2014 Windows simply didn't "
-                       L"instantiate our APO for this stream.";
-        } else if (snap.dllLoaded == 1) {
+        if (snap.dllLoaded == 1) {
             v.detail = L"Our DLL is inside the audio engine, but no processing "
                        L"calls are arriving \u2014 the stream isn't reaching it.";
         } else {
@@ -927,6 +980,9 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
     }
     r += L"MiniEQ_APO.dll loaded in engine: ";
     r += DllStateText(snap.dllLoaded);
+    if (snap.audiodgRestartLoop) {
+        r += L"\r\nEngine restarts: 3+ in the last 10 min -- crash loop";
+    }
     r += L"\r\nHeartbeat: ";
     if (!snap.statusChannelOk) {
         r += L"no signal yet";
@@ -1037,6 +1093,7 @@ static DiagVerdict  s_lastVerdict;
 static bool             s_haveLogged = false;
 static std::wstring     s_loggedVerdict;
 static int              s_loggedDll = -2;
+static bool             s_loggedLoop = false;
 static DiagEnhancements s_loggedEnh = DiagEnhancements::Unknown;
 static bool             s_loggedHb = false;
 static std::wstring     s_loggedSessSig;
@@ -1084,6 +1141,13 @@ static void LogTransitions(const DiagSnapshot& snap, const DiagVerdict& v, bool 
         MiniEQ_AppLogCat(L"ENGINE", L"audiodg.exe pid=%lu, MiniEQ_APO.dll %s",
                          snap.audiodgPid, DllStateText(snap.dllLoaded));
         s_loggedDll = snap.dllLoaded;
+    }
+    if (all || snap.audiodgRestartLoop != s_loggedLoop) {
+        if (snap.audiodgRestartLoop) {
+            MiniEQ_AppLogCat(L"ENGINE", L"audiodg.exe restart loop detected "
+                             L"(3+ PID changes in 10 min) -- engine keeps dying");
+        }
+        s_loggedLoop = snap.audiodgRestartLoop;
     }
     if (all || snap.enhancements != s_loggedEnh) {
         MiniEQ_AppLogCat(L"REG", L"audio enhancements: %s", EnhText(snap.enhancements));
@@ -1267,6 +1331,9 @@ static void RefreshDiagCenter(bool forceLog) {
     }
     eng += L"\r\nMiniEQ_APO.dll in engine: ";
     eng += DllStateText(snap.dllLoaded);
+    if (snap.audiodgRestartLoop) {
+        eng += L"\r\nEngine restarts: 3+ in the last 10 min \u2014 crash loop!";
+    }
     eng += L"\r\nHeartbeat: ";
     if (!snap.statusChannelOk) {
         eng += L"no signal yet";

@@ -79,6 +79,10 @@ struct DiagSnapshot {
 
     // Engine layer.
     DWORD        audiodgPid = 0;
+    // Crash-loop: the engine PID changed 3+ times in the last 10 minutes
+    // (tracked passively across snapshots). Tells "audiodg keeps dying"
+    // apart from "the APO is merely bypassed".
+    bool         audiodgRestartLoop = false;
     int          dllLoaded = -1;      // 1 = yes, 0 = no, -1 = unknown
     bool         statusChannelOk = false;
     bool         heartbeatFresh = false; // heartbeat advanced between polls

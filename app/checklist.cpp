@@ -477,6 +477,12 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
                 L"%s calls so far \u2014 confirming they're advancing\u2026",
                 FormatCalls(snap.heartbeatCalls).c_str());
             s_rows[7].detail = detail;
+        } else if (snap.anySessionActive && snap.dllLoaded == 0) {
+            s_rows[7].state = CheckState::Error;
+            s_rows[7].detail = L"MiniEQ_APO.dll never loaded into audiodg.exe \u2014 "
+                               L"Windows skipped our APO for this stream (silent bypass).";
+            s_rows[7].fix = L"Flip the device's Default Format once, then replay. "
+                            L"If it stays red, copy the diagnostics report and send it over.";
         } else {
             s_rows[7].state = CheckState::Error;
             s_rows[7].detail = L"0 APOProcess calls while audio is playing \u2014 "
