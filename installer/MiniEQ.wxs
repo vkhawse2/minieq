@@ -113,7 +113,7 @@
       (CreateFolder); the Permission element grants Users full control so
       the non-elevated UI can write devices.ini and the audio engine can
       read it. Removed on uninstall only if empty (RemoveFolder On="uninstall"
-      is deliberately omitted -- another version's mirror may be in use).
+      is deliberately omitted; another version's mirror may be in use).
     -->
     <Component Id="Comp_CommonAppDataDir"
                Guid="248BDB29-5FF8-4919-8F86-AF721EFFB1D7"
