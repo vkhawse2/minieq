@@ -5,15 +5,49 @@
 
 #include <aclapi.h>
 #include <audioenginebaseapo.h> // APO_FLAG_INPLACE
-#include <cfgmgr32.h>
-#include <mmdeviceapi.h>
-#include <setupapi.h>
+#include <sddl.h> // ConvertStringSecurityDescriptorToSecurityDescriptorW
 #include <strsafe.h>
+#include <setupapi.h>  // SetupDi* for device re-enumeration
+#include <devguid.h>   // GUID_DEVCLASS_MEDIA
+#include <mmdeviceapi.h> // IMMDeviceEnumerator (friendly name lookup)
+#include <propsys.h>   // IPropertyStore, PROPVARIANT
+#include <propkey.h>   // PROPERTYKEY (must precede functiondiscoverykeys_devpkey.h)
+#include <wctype.h>    // towlower
+
+// PKEY_Device_FriendlyName -- defined TU-local (the SDK header only declares
+// it, which links LNK2019; see AGENTS.md).
+static const PROPERTYKEY kPkeyDeviceFriendlyName = {
+    { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA1, 0xE0, 0xE0 } },
+    14
+};
 
 // IID_IAudioProcessingObject -- the APO interface we implement.
 static const wchar_t* kApoInterface0 = L"{FD7F2B29-24D0-4B5C-B177-592C39F9CA10}";
 // PKEY_FX_StreamEffectClsid -- the SFX slot in an endpoint's FxProperties.
 static const wchar_t* kFxSfxSlot = L"{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5";
+// PKEY_FX_EndpointEffectClsid -- the EFX slot in an endpoint's FxProperties.
+// EFX runs after all mixing at the endpoint, downstream of the spatial-sound
+// render, so an EQ attached here is not bypassed when spatial sound is on.
+// (Route 1 experiment: does the EQ survive spatial/Atmos from the EFX slot?)
+static const wchar_t* kFxEfxSlot = L"{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},7";
+
+// Active effect slot. SFX by default; builds compiled with MINIEQ_EFX_SLOT
+// default to EFX (test builds). MiniEQ_SetEffectSlot overrides at runtime --
+// reserved for a future slot-choice UI; nothing calls it yet.
+static const wchar_t* g_fxSlot =
+#ifdef MINIEQ_EFX_SLOT
+    kFxEfxSlot;
+#else
+    kFxSfxSlot;
+#endif
+
+void MiniEQ_SetEffectSlot(bool useEfx) {
+    g_fxSlot = useEfx ? kFxEfxSlot : kFxSfxSlot;
+}
+
+const wchar_t* MiniEQ_EffectSlotShortName() {
+    return g_fxSlot == kFxEfxSlot ? L"EFX" : L"SFX";
+}
 
 static HRESULT ClsidString(wchar_t* out, size_t cch) {
     if (StringFromGUID2(CLSID_MiniEQAPO, out, (int)cch) == 0) {
@@ -125,6 +159,62 @@ HRESULT MiniEQ_UnregisterApoDeclaration() {
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
+// Creates %PROGRAMDATA%\MiniEQ and grants Everyone read/write (inherited by
+// the trace log file), so the audio engine -- which runs as a service
+// identity, not as the installing user -- can append to the diagnostic log
+// the UI tails. Without this, the log file (if created first by the UI)
+// carries a user-only DACL and the APO's trace writes silently fail, which
+// is exactly the "empty log, APO apparently dead" symptom. Called from
+// DllRegisterServer, which always runs elevated (installer / regsvr32).
+HRESULT MiniEQ_EnsureLogDirForInstall() {
+    wchar_t dir[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", dir, ARRAYSIZE(dir));
+    if (n == 0 || n >= ARRAYSIZE(dir)) {
+        return E_FAIL;
+    }
+    if (FAILED(StringCchCatW(dir, ARRAYSIZE(dir), L"\\MiniEQ"))) {
+        return E_FAIL;
+    }
+    CreateDirectoryW(dir, nullptr); // ERROR_ALREADY_EXISTS is fine
+
+    // D: SY/BA full; Everyone read+write, inherited by children (OICI).
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;WD)",
+            SDDL_REVISION_1, &pSD, nullptr)) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    PACL pDacl = nullptr;
+    BOOL present = FALSE, defaulted = FALSE;
+    HRESULT hr = S_OK;
+    if (GetSecurityDescriptorDacl(pSD, &present, &pDacl, &defaulted) && present) {
+        DWORD rc = SetNamedSecurityInfoW(dir, SE_FILE_OBJECT,
+                                         DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, pDacl, nullptr);
+        if (rc != ERROR_SUCCESS) {
+            hr = HRESULT_FROM_WIN32(rc);
+        } else {
+            // Also repair a pre-existing log file: it may have been created
+            // by the UI (user-only DACL) before this ran.
+            wchar_t log[MAX_PATH] = {};
+            if (SUCCEEDED(StringCchPrintfW(log, ARRAYSIZE(log),
+                                           L"%s\\apo-trace.log", dir))) {
+                rc = SetNamedSecurityInfoW(log, SE_FILE_OBJECT,
+                                           DACL_SECURITY_INFORMATION,
+                                           nullptr, nullptr, pDacl, nullptr);
+                // ERROR_FILE_NOT_FOUND just means no log yet; not a failure.
+                if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+                    hr = HRESULT_FROM_WIN32(rc);
+                }
+            }
+        }
+    } else {
+        hr = E_FAIL;
+    }
+    LocalFree(pSD);
+    return hr;
+}
+
 static HRESULT EndpointGuid(const wchar_t* endpointId, wchar_t* out, size_t cch) {
     // The MMDevice ID looks like "{0.0.0.00000000}.{endpoint-guid}", but the
     // MMDevices registry key is named with the bare endpoint GUID only --
@@ -156,6 +246,69 @@ static HRESULT FxPropertiesKey(const wchar_t* endpointId, wchar_t* out, size_t c
     return StringCchPrintfW(out, cch,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\%s\\FxProperties",
         guid);
+}
+
+// R2: registry home of the stashed child-APO CLSIDs, one value per endpoint
+// (bare GUID). Written elevated at attach time; read by the APO inside the
+// audio engine (world-readable under HKLM\SOFTWARE).
+static HRESULT ChildApoKey(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    wchar_t guid[64] = {};
+    HRESULT hr = EndpointGuid(endpointId, guid, ARRAYSIZE(guid));
+    if (FAILED(hr)) return hr;
+    return StringCchPrintfW(out, cch, L"SOFTWARE\\MiniEQ\\ChildAPO\\%s", guid);
+}
+
+HRESULT MiniEQ_StashChildApoClsid(const wchar_t* endpointId,
+                                 const wchar_t* childClsid) {
+    if (endpointId == nullptr || childClsid == nullptr) return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+    return SetSz(HKEY_LOCAL_MACHINE, key, nullptr, childClsid);
+}
+
+HRESULT MiniEQ_ReadChildApoClsid(const wchar_t* endpointId, wchar_t* out,
+                                size_t cch) {
+    if (out == nullptr || cch == 0) return E_POINTER;
+    out[0] = L'\0';
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+
+    HKEY h = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        return S_FALSE; // never stashed: no child
+    }
+    if (rc != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(rc);
+    }
+    DWORD size = (DWORD)(cch * sizeof(wchar_t)), type = 0;
+    rc = RegQueryValueExW(h, nullptr, nullptr, &type, (BYTE*)out, &size);
+    RegCloseKey(h);
+    if (rc != ERROR_SUCCESS || type != REG_SZ) {
+        out[0] = L'\0';
+        return S_FALSE;
+    }
+    // Defensive: strip a trailing ",N" slot suffix if some stash (or unusual
+    // slot data) carried it -- CLSIDFromString needs the bare CLSID. Bare
+    // CLSIDs pass through untouched.
+    wchar_t* comma = wcsrchr(out, L',');
+    if (comma != nullptr && comma > out && *(comma - 1) == L'}') {
+        *comma = L'\0';
+    }
+    return S_OK;
+}
+
+HRESULT MiniEQ_ClearChildApoClsid(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    wchar_t key[256] = {};
+    HRESULT hr = ChildApoKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+    LONG rc = RegDeleteKeyW(HKEY_LOCAL_MACHINE, key);
+    if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
 static bool EnablePrivilege(const wchar_t* privilegeName) {
@@ -282,7 +435,10 @@ static HRESULT OpenFxPropertiesForWrite(const wchar_t* endpointId, HKEY* out) {
     return S_OK;
 }
 
-HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
+// Forward: defined below MiniEQ_AttachToEndpoint.
+static HRESULT DetachFromSlot(const wchar_t* endpointId, const wchar_t* slot);
+
+static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
     wchar_t clsid[64] = {};
     HRESULT hr = ClsidString(clsid, ARRAYSIZE(clsid));
@@ -294,31 +450,142 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     hr = OpenFxPropertiesForWrite(endpointId, &h);
     if (FAILED(hr)) return hr;
 
-    LONG rc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ, (const BYTE*)clsid,
+    // R2: chain, don't just evict. Stash the incumbent APO (if it is a
+    // real third-party CLSID and not us) so the engine keeps running it as
+    // our child. Best-effort: a stash failure must not block the attach.
+    wchar_t incumbent[64] = {};
+    DWORD qsize = sizeof(incumbent), qtype = 0;
+    LONG qrc = RegQueryValueExW(h, slot, nullptr, &qtype,
+                               (BYTE*)incumbent, &qsize);
+    if (qrc == ERROR_SUCCESS && qtype == REG_SZ && incumbent[0] != L'\0' &&
+        _wcsicmp(incumbent, clsid) != 0) {
+        MiniEQ_StashChildApoClsid(endpointId, incumbent);
+    }
+
+    LONG rc = RegSetValueExW(h, slot, 0, REG_SZ, (const BYTE*)clsid,
                              (DWORD)((wcslen(clsid) + 1) * sizeof(wchar_t)));
     RegCloseKey(h);
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
-HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
+HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+
+    // 1. Repair layers 1+2 (COM class + APO declaration). The installer writes
+    //    these via DllRegisterServer, but a failed/interrupted upgrade can
+    //    leave them stale -- and the audio engine will not load the APO
+    //    without the AudioEngine declaration key. Best-effort: the DLL sits
+    //    next to the --attach helper (MiniEQ.exe).
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath)) > 0) {
+            wchar_t* slash = wcsrchr(exePath, L'\\');
+            if (slash != nullptr) {
+                *(slash + 1) = L'\0';
+                wchar_t dllPath[MAX_PATH] = {};
+                if (SUCCEEDED(StringCchCopyW(dllPath, ARRAYSIZE(dllPath), exePath)) &&
+                    SUCCEEDED(StringCchCatW(dllPath, ARRAYSIZE(dllPath), L"MiniEQ_APO.dll")) &&
+                    GetFileAttributesW(dllPath) != INVALID_FILE_ATTRIBUTES) {
+                    MiniEQ_RegisterComClass(dllPath);
+                    MiniEQ_RegisterApoDeclaration();
+                    MiniEQ_EnsureLogDirForInstall();
+                }
+            }
+        }
+    }
+
+    // 2. Sweep our CLSID from the INACTIVE slot. The EFX experiment left us
+    //    registered in both SFX and EFX on some machines; the engine must
+    //    never see us twice.
+    {
+        const wchar_t* inactiveSlot = (g_fxSlot == kFxEfxSlot) ? kFxSfxSlot : kFxEfxSlot;
+        DetachFromSlot(endpointId, inactiveSlot);
+    }
+
+    // 3. Clear any stale child-APO stash so we start clean; AttachToSlot
+    //    re-stashes the real incumbent below.
+    MiniEQ_ClearChildApoClsid(endpointId);
+
+    // 4. Attach to the active slot (stashes the incumbent as our child).
+    const HRESULT hr = AttachToSlot(endpointId, g_fxSlot);
+    if (FAILED(hr)) return hr;
+
+    // 5. Force the OS to re-enumerate the endpoint so the audio engine
+    //    re-reads the FxProperties effect list. Raw registry writes don't
+    //    send change notifications, so without this the engine keeps using
+    //    the list from when the device was last connected ("attached but
+    //    never loaded"). Best-effort: the attach itself already succeeded.
+    MiniEQ_ReenumerateEndpointDevice(endpointId);
+
+    return S_OK;
+}
+
+static HRESULT DetachFromSlot(const wchar_t* endpointId, const wchar_t* slot) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
     wchar_t key[512] = {};
     HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
     if (FAILED(hr)) return hr;
 
+    wchar_t clsid[64] = {};
+    hr = ClsidString(clsid, ARRAYSIZE(clsid));
+    if (FAILED(hr)) return hr;
+
     HKEY h = nullptr;
-    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_SET_VALUE, &h);
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0,
+                            KEY_QUERY_VALUE | KEY_SET_VALUE, &h);
     if (rc == ERROR_FILE_NOT_FOUND) {
+        MiniEQ_ClearChildApoClsid(endpointId); // tidy any orphaned stash
         return S_OK; // FxProperties never created: nothing to detach.
     }
     if (rc != ERROR_SUCCESS) {
         return HRESULT_FROM_WIN32(rc);
     }
-    rc = RegDeleteValueW(h, kFxSfxSlot);
+    // Surgical detach: only remove the slot value when it is ours -- never
+    // clobber an APO someone else installed after us.
+    wchar_t current[64] = {};
+    DWORD size = sizeof(current), type = 0;
+    rc = RegQueryValueExW(h, slot, nullptr, &type, (BYTE*)current,
+                          &size);
+    const bool ours = (rc == ERROR_SUCCESS && type == REG_SZ &&
+                       _wcsicmp(current, clsid) == 0);
+    if (ours) {
+        rc = RegDeleteValueW(h, slot);
+        // Deleting a value that isn't there is fine.
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+        if (rc == ERROR_SUCCESS) {
+            // R2: restore the displaced APO we stashed at attach time.
+            wchar_t stashed[64] = {};
+            if (MiniEQ_ReadChildApoClsid(endpointId, stashed,
+                                        ARRAYSIZE(stashed)) == S_OK &&
+                stashed[0] != L'\0') {
+                const DWORD wsize =
+                    (DWORD)((wcslen(stashed) + 1) * sizeof(wchar_t));
+                const LONG wrc = RegSetValueExW(h, slot, 0, REG_SZ,
+                                               (const BYTE*)stashed, wsize);
+                if (wrc == ERROR_SUCCESS) {
+                    MiniEQ_ClearChildApoClsid(endpointId);
+                }
+                // If the restore write failed, keep the stash for a retry.
+            } else {
+                MiniEQ_ClearChildApoClsid(endpointId); // no stash; tidy
+            }
+        }
+    } else {
+        rc = ERROR_SUCCESS; // not ours: leave the slot alone
+    }
     RegCloseKey(h);
-    // Deleting a value that isn't there is fine.
-    if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
+}
+
+HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
+    HRESULT hr = DetachFromSlot(endpointId, g_fxSlot);
+    // EFX test builds: also sweep the SFX slot, in case we are still there
+    // from an earlier install.
+    if (g_fxSlot == kFxEfxSlot) {
+        const HRESULT hrSfx = DetachFromSlot(endpointId, kFxSfxSlot);
+        if (SUCCEEDED(hr)) hr = hrSfx;
+    }
+    return hr;
 }
 
 HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
@@ -345,7 +612,7 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
     }
     wchar_t value[64] = {};
     DWORD size = sizeof(value), type = 0;
-    rc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &type, (BYTE*)value, &size);
+    rc = RegQueryValueExW(h, g_fxSlot, nullptr, &type, (BYTE*)value, &size);
     RegCloseKey(h);
     if (rc == ERROR_SUCCESS && type == REG_SZ) {
         *attached = (_wcsicmp(value, clsid) == 0);
@@ -353,119 +620,166 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
     return S_OK;
 }
 
-// ---- MiniEQ_RestartEndpointDevice ----
-// Forces the audio engine to re-read an endpoint's FxProperties by disabling
-// and re-enabling its device node (programmatic unplug/replug). This makes
-// attach/detach take effect immediately without a computer restart, and
-// without touching the Windows Audio service.
-//
-// We map the MMDevice endpoint ID to a SetupDi device by friendly name: the
-// endpoint's PKEY_Device_FriendlyName (e.g. "Headphones (MH139)") matches the
-// device's SPDRP_FRIENDLYNAME. If the device isn't found we return
-// HRESULT_FROM_WIN32(ERROR_NOT_FOUND) so the caller can suggest manual
-// unplug/replug.
-static HRESULT GetEndpointFriendlyName(const wchar_t* endpointId,
-                                       wchar_t* out, size_t cch) {
-    if (out == nullptr || cch == 0) return E_INVALIDARG;
+//------------------------------------------------------------------------------
+// Device re-enumeration: makes the audio engine re-read FxProperties.
+//------------------------------------------------------------------------------
+
+// Friendly name of an MMDevice endpoint (e.g. "Headphones (Airdopes 411ANC)").
+static bool EndpointFriendlyName(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    if (endpointId == nullptr || out == nullptr || cch == 0) return false;
     out[0] = L'\0';
-
-    IMMDeviceEnumerator* enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-                                  CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-                                  (void**)&enumerator);
-    if (FAILED(hr)) return hr;
-
-    IMMDevice* device = nullptr;
-    hr = enumerator->GetDevice(endpointId, &device);
-    enumerator->Release();
-    if (FAILED(hr)) return hr;
-
-    IPropertyStore* props = nullptr;
-    hr = device->OpenPropertyStore(STGM_READ, &props);
-    device->Release();
-    if (FAILED(hr)) return hr;
-
-    PROPVARIANT name;
-    PropVariantInit(&name);
-    hr = props->GetValue(PKEY_Device_FriendlyName, &name);
-    props->Release();
-    if (SUCCEEDED(hr) && name.vt == VT_LPWSTR && name.pwszVal != nullptr) {
-        StringCchCopyW(out, cch, name.pwszVal);
-    } else {
-        hr = E_FAIL;
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return false;
     }
-    PropVariantClear(&name);
-    return hr;
+    bool ok = false;
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId, &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps != nullptr) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(pProps->GetValue(kPkeyDeviceFriendlyName, &pv)) &&
+                pv.vt == VT_LPWSTR && pv.pwszVal != nullptr) {
+                StringCchCopyW(out, cch, pv.pwszVal);
+                ok = (out[0] != L'\0');
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return ok;
 }
 
-static HRESULT SetDeviceEnabled(HDEVINFO devs, SP_DEVINFO_DATA* devData,
-                                bool enable) {
+// Restarts one device node (disable + enable) via the Setup API. Returns true
+// if the device was found and the restart was issued.
+static bool RestartDevnode(HDEVINFO hDevInfo, PSP_DEVINFO_DATA pDevInfo) {
     SP_PROPCHANGE_PARAMS params = {};
     params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
     params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-    params.StateChange = enable ? DICS_ENABLE : DICS_DISABLE;
     params.Scope = DICS_FLAG_GLOBAL;
-    params.HwProfile = 0;
 
-    if (!SetupDiSetClassInstallParamsW(devs, devData,
-                                        (SP_CLASSINSTALL_HEADER*)&params,
-                                        sizeof(params))) {
+    params.StateChange = DICS_DISABLE;
+    if (!SetupDiSetClassInstallParamsW(hDevInfo, pDevInfo,
+                                       &params.ClassInstallHeader,
+                                       sizeof(params)) ||
+        !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, pDevInfo)) {
+        return false;
+    }
+    Sleep(1200); // let the stack settle before re-enabling
+    params.StateChange = DICS_ENABLE;
+    if (!SetupDiSetClassInstallParamsW(hDevInfo, pDevInfo,
+                                       &params.ClassInstallHeader,
+                                       sizeof(params)) ||
+        !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, pDevInfo)) {
+        return false;
+    }
+    return true;
+}
+
+HRESULT MiniEQ_ReenumerateEndpointDevice(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+
+    // Match the endpoint to its device node by friendly name. The MMDevice
+    // friendly name ("Headphones (Airdopes 411ANC)") matches the devnode's
+    // SPDRP_FRIENDLYNAME on typical audio devices.
+    wchar_t wantName[256] = {};
+    if (!EndpointFriendlyName(endpointId, wantName, ARRAYSIZE(wantName))) {
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_MEDIA, nullptr, nullptr,
+                                            DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
         return HRESULT_FROM_WIN32(GetLastError());
     }
-    if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devs, devData)) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    SP_DEVINFO_DATA devInfo = {};
+    devInfo.cbSize = sizeof(devInfo);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo); ++i) {
+        wchar_t devName[256] = {};
+        DWORD reqSize = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME,
+                                              nullptr, (BYTE*)devName,
+                                              sizeof(devName), &reqSize)) {
+            continue;
+        }
+        // Case-insensitive containment either way handles minor naming
+        // differences between the MMDevice and devnode names.
+        wchar_t wantLow[256] = {}, devLow[256] = {};
+        for (size_t k = 0; k < ARRAYSIZE(wantLow) - 1 && wantName[k] != L'\0'; ++k)
+            wantLow[k] = towlower(wantName[k]);
+        for (size_t k = 0; k < ARRAYSIZE(devLow) - 1 && devName[k] != L'\0'; ++k)
+            devLow[k] = towlower(devName[k]);
+        if (wcsstr(wantLow, devLow) == nullptr && wcsstr(devLow, wantLow) == nullptr) {
+            continue;
+        }
+        hr = RestartDevnode(hDevInfo, &devInfo) ? S_OK
+                                                : HRESULT_FROM_WIN32(GetLastError());
+        break; // first match wins
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return hr;
+}
+
+//------------------------------------------------------------------------------
+// Diagnostics queries (read-only, no elevation needed).
+//------------------------------------------------------------------------------
+
+HRESULT MiniEQ_QueryApoDeclaration(bool* present) {
+    if (present == nullptr) return E_POINTER;
+    *present = false;
+    wchar_t clsid[64] = {};
+    HRESULT hr = ClsidString(clsid, ARRAYSIZE(clsid));
+    if (FAILED(hr)) return hr;
+    wchar_t key[160] = {};
+    hr = StringCchPrintfW(key, ARRAYSIZE(key),
+                          L"SOFTWARE\\Classes\\AudioEngine\\AudioProcessingObjects\\%s",
+                          clsid);
+    if (FAILED(hr)) return hr;
+    HKEY h = nullptr;
+    const LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc == ERROR_SUCCESS) {
+        // The engine cross-checks these two against GetRegistrationProperties.
+        wchar_t iface[64] = {};
+        DWORD size = sizeof(iface), type = 0;
+        const LONG irc = RegQueryValueExW(h, L"APOInterface0", nullptr, &type,
+                                         (BYTE*)iface, &size);
+        DWORD flags = 0;
+        DWORD fsize = sizeof(flags), ftype = 0;
+        const LONG frc = RegQueryValueExW(h, L"Flags", nullptr, &ftype,
+                                         (BYTE*)&flags, &fsize);
+        RegCloseKey(h);
+        *present = (irc == ERROR_SUCCESS && type == REG_SZ &&
+                    _wcsicmp(iface, kApoInterface0) == 0 &&
+                    frc == ERROR_SUCCESS && ftype == REG_DWORD);
     }
     return S_OK;
 }
 
-HRESULT MiniEQ_RestartEndpointDevice(const wchar_t* endpointId) {
+HRESULT MiniEQ_QuerySlotValue(const wchar_t* endpointId, bool efx,
+                             wchar_t* out, size_t cch) {
+    if (out == nullptr || cch == 0) return E_POINTER;
+    out[0] = L'\0';
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
-
-    wchar_t friendly[256] = {};
-    HRESULT hr = GetEndpointFriendlyName(endpointId, friendly, ARRAYSIZE(friendly));
+    wchar_t key[512] = {};
+    HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
     if (FAILED(hr)) return hr;
-
-    // Enumerate present audio devices (MEDIA class covers audio endpoints).
-    HDEVINFO devs = SetupDiGetClassDevsW(&GUID_DEVCLASS_MEDIA, nullptr, nullptr,
-                                         DIGCF_PRESENT);
-    if (devs == INVALID_HANDLE_VALUE) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    HKEY h = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc != ERROR_SUCCESS) {
+        return rc == ERROR_FILE_NOT_FOUND ? S_FALSE : HRESULT_FROM_WIN32(rc);
     }
-
-    SP_DEVINFO_DATA devData = {};
-    devData.cbSize = sizeof(devData);
-    bool found = false;
-    HRESULT result = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(devs, i, &devData); ++i) {
-        wchar_t name[256] = {};
-        if (!SetupDiGetDeviceRegistryPropertyW(devs, &devData, SPDRP_FRIENDLYNAME,
-                                                nullptr, (BYTE*)name,
-                                                sizeof(name), nullptr)) {
-            // Fall back to the device description.
-            if (!SetupDiGetDeviceRegistryPropertyW(devs, &devData, SPDRP_DEVICEDESC,
-                                                    nullptr, (BYTE*)name,
-                                                    sizeof(name), nullptr)) {
-                continue;
-            }
-        }
-        if (_wcsicmp(name, friendly) != 0) {
-            continue;
-        }
-        found = true;
-        // Disable, wait a beat, re-enable. This is the programmatic
-        // equivalent of unplugging and replugging the device.
-        hr = SetDeviceEnabled(devs, &devData, false);
-        if (FAILED(hr)) {
-            result = hr;
-            break;
-        }
-        Sleep(1000);
-        hr = SetDeviceEnabled(devs, &devData, true);
-        result = hr;
-        break;
-    }
-
-    SetupDiDestroyDeviceInfoList(devs);
-    return found ? result : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    const wchar_t* slot = efx ? kFxEfxSlot : kFxSfxSlot;
+    DWORD size = (DWORD)(cch * sizeof(wchar_t)), type = 0;
+    rc = RegQueryValueExW(h, slot, nullptr, &type, (BYTE*)out, &size);
+    RegCloseKey(h);
+    if (rc == ERROR_FILE_NOT_FOUND) return S_FALSE; // slot value absent
+    if (rc != ERROR_SUCCESS) return HRESULT_FROM_WIN32(rc);
+    if (type != REG_SZ) return S_FALSE;
+    return S_OK;
 }

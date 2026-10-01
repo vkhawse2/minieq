@@ -6,6 +6,14 @@ add_executable(MiniEQ WIN32
     audio_devices.h
     settings_link.cpp
     settings_link.h
+    diag.cpp
+    diag.h
+    diagcenter.cpp
+    diagcenter.h
+    checklist.cpp
+    checklist.h
+    engine_reload.cpp
+    engine_reload.h
     # Reused as-is: endpoint attach/detach registry writes.
     ../apo/registration.cpp
     ../apo/registration.h
@@ -22,6 +30,10 @@ target_include_directories(MiniEQ PRIVATE
 )
 
 # ole32/uuid: COM + MMDevice. advapi32: registry. comctl32: trackbars.
-# shell32: SHGetFolderPathW + elevated relaunch. setupapi: device restart
-# (MiniEQ_RestartEndpointDevice in registration.cpp).
-target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 setupapi)
+# shell32: SHGetFolderPathW + elevated relaunch. runtimeobject: WinRT
+# (RoGetActivationFactory / HSTRING) for the live spatial-sound switch.
+# setupapi: device re-enumeration (disable/enable) after FxProperties attach.
+target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 runtimeobject setupapi)
+
+# Build id the UI expects the loaded APO to report (see root CMakeLists).
+target_compile_definitions(MiniEQ PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")
