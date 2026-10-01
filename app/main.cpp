@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <mmdeviceapi.h> // RunCircuitBreakerSweep enumerates endpoints directly
 #include <shellapi.h>
 #include <strsafe.h>
 
@@ -59,7 +60,7 @@ enum {
     IDC_DIAG_CENTER  = 183,
     IDC_DIAG_SOUND   = 184, // "Open Sound settings" (enhancements-off state)
     IDC_DIAG_HINT    = 185, // one-line contextual fix guidance under the pill
-    IDC_CHECKLIST    = 186, // "Checklist" button next to Virtualization
+    IDC_CHECKLIST    = 186, // "Checklist" button next to Crossfeed
     IDC_POWER        = 187, // global MiniEQ on/off button (pill row)
     IDC_BANNERTEXT   = 188, // auto-attach banner text
     IDC_BANNERBTN    = 189, // auto-attach banner "Attach MiniEQ" button
@@ -192,7 +193,7 @@ static void PushAndSave() {
 
 // Global MiniEQ on/off UI: button label + dimming/disabling every EQ
 // control (sliders, master, per-device bypass, presets, band-count radios,
-// Virtualization). Called at startup, on toggle, and after any slider
+// Crossfeed). Called at startup, on toggle, and after any slider
 // rebuild (a rebuild re-enables fresh controls).
 static void ApplyPowerUI() {
     const bool on = MiniEQ_GlobalEnabledGet();
@@ -494,6 +495,9 @@ static void SpawnReloadWorker(bool force) {
     if (g_reloadWorkerBusy || g_endpointId.empty() || g_hwnd == nullptr) {
         return;
     }
+    // The format flip restarts the stream on purpose -- keep the breaker's
+    // passive detector from reading that as a crash loop.
+    MiniEQ_BreakerNoteUserAction();
     g_reloadWorkerBusy = true;
     g_reloadUi = ReloadUiState::Working;
     const std::wstring endpoint = g_endpointId;
@@ -515,6 +519,19 @@ static void SpawnReloadWorker(bool force) {
 static void TryOpenChannels() {
     if (g_endpointId.empty()) {
         return;
+    }
+    // Upgrade window: the links may sit on legacy (pre-hash) channels
+    // because the engine still ran the old APO when they opened. Once the
+    // hashed channels appear, the new APO is up -- switch so the heartbeat
+    // doesn't freeze on the old APO's abandoned channel. The settings link
+    // re-pushes the staged EQ (the new channel holds flat defaults).
+    if (g_link.IsOpen() && g_link.UsingLegacyName()) {
+        if (g_link.MaybeUpgrade(g_endpointId)) {
+            MiniEQ_AppLog(L"settings channel upgraded to hashed name; EQ re-pushed");
+        }
+    }
+    if (g_statusLink.IsOpen() && g_statusLink.UsingLegacyName()) {
+        g_statusLink.MaybeUpgrade(g_endpointId);
     }
     if (!g_link.IsOpen() && g_link.Open(g_endpointId)) {
         // The channel just appeared: the APO published flat defaults (or
@@ -795,6 +812,9 @@ static bool DoElevatedAttach(bool attach) {
     // Give the elevated helper a moment, then re-read the state.
     Sleep(800);
     UpdateAttachStatus();
+    // Attaching/detaching disturbs the engine on purpose -- the breaker's
+    // passive detector must not mistake our own churn for a crash loop.
+    MiniEQ_BreakerNoteUserAction();
     return attach ? g_attached : !g_attached;
 }
 
@@ -953,9 +973,9 @@ static void BuildControls(HWND hwnd) {
                               160, 526, 40, 20, hwnd, (HMENU)IDC_BANDS10,
                               g_hInst, nullptr);
     applyFont(g_bands10);
-    // Optional headphone virtualization (bs2b-style crossfeed). Costs nothing
+    // Optional headphone crossfeed (bs2b-style). Costs nothing
     // until turned on: the APO allocates its tiny state lazily.
-    g_virtCheck = CreateWindowW(L"BUTTON", L"Virtualization",
+    g_virtCheck = CreateWindowW(L"BUTTON", L"Crossfeed",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                                 210, 526, 120, 20, hwnd,
                                 (HMENU)IDC_VIRTUALIZATION, g_hInst, nullptr);
@@ -1092,6 +1112,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == IDT_DIAG) {
             UpdateDiagStatus();
+            // Circuit breaker: poll the passive crash-loop detector about
+            // every 5 s. It fires non-blockingly and only on a genuine
+            // restart loop; the outcome arrives as WM_APP_BREAKER_DONE.
+            static int breakerTick = 0;
+            if ((++breakerTick % 10) == 0) {
+                MiniEQ_BreakerPoll(hwnd);
+            }
         }
         return 0;
 
@@ -1309,6 +1336,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     }
 
+    case WM_APP_BREAKER_DONE: {
+        // The circuit breaker's elevated sweep finished (wParam: outcome
+        // code -- see diagcenter.h).
+        const int outcome = (int)wParam;
+        if (outcome == BreakerOutcomeLaunched) {
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"sweep done -- telling the user the EQ was sacrificed for stability");
+            MessageBoxW(hwnd,
+                L"MiniEQ detected the Windows audio engine restarting in a loop "
+                L"and detached itself from all your audio devices to keep your "
+                L"sound stable.\n\n"
+                L"Your audio should be working again now, without the EQ. You "
+                L"can re-attach MiniEQ to a device whenever you're ready.",
+                L"MiniEQ circuit breaker", MB_ICONWARNING);
+        } else if (outcome == BreakerOutcomeLaunchFailed ||
+                   outcome == BreakerOutcomeSweepFailed) {
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"sweep could not detach -- asking the user to detach manually");
+            MessageBoxW(hwnd,
+                L"MiniEQ detected the Windows audio engine restarting in a loop, "
+                L"but could not detach itself automatically.\n\n"
+                L"Please detach MiniEQ from your devices (Devices list \u2192 "
+                L"Detach) to restore stable audio.",
+                L"MiniEQ circuit breaker", MB_ICONWARNING);
+        } else if (outcome == BreakerOutcomePartial) {
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"sweep only partly detached -- asking the user to finish manually");
+            MessageBoxW(hwnd,
+                L"MiniEQ detected the Windows audio engine restarting in a loop "
+                L"and detached itself from some of your devices, but a few "
+                L"could not be detached.\n\n"
+                L"Please detach MiniEQ from the remaining devices (Devices "
+                L"list \u2192 Detach) to restore stable audio.",
+                L"MiniEQ circuit breaker", MB_ICONWARNING);
+        }
+        // Outcome 1 (UAC declined): the user already said no -- stay silent.
+        UpdateAttachStatus();
+        UpdateDiagStatus();
+        return 0;
+    }
+
     case WM_DEVICECHANGE:
         // Aux / USB-C / Bluetooth (un)plugged while the app is open: re-list
         // endpoints and keep the current selection when it is still present.
@@ -1376,6 +1444,68 @@ static int RunBulkEndpointHelper(bool attach) {
     return 0;
 }
 
+static int RunCircuitBreakerSweep() {
+    // Circuit-breaker worker: runs ELEVATED and SILENT (no message boxes --
+    // the main UI explains what happened). Detaches MiniEQ from every
+    // endpoint that is attached -- active or not -- and re-enumerates each
+    // affected device node so the engine drops our APO from the chain. Never
+    // touches the audio service; one stubborn device must never fail the
+    // whole sweep.
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) {
+        return 0;
+    }
+    int detached = 0, failed = 0;
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                   (void**)&pEnum)) && pEnum != nullptr) {
+        IMMDeviceCollection* pColl = nullptr;
+        // All states, not just active: an attached-but-unplugged device
+        // leaves a stale registration behind too.
+        if (SUCCEEDED(pEnum->EnumAudioEndpoints(
+                eRender, DEVICE_STATEMASK_ALL, &pColl)) && pColl != nullptr) {
+            UINT count = 0;
+            pColl->GetCount(&count);
+            for (UINT i = 0; i < count; ++i) {
+                IMMDevice* pDev = nullptr;
+                LPWSTR id = nullptr;
+                if (FAILED(pColl->Item(i, &pDev)) || pDev == nullptr) {
+                    continue;
+                }
+                if (SUCCEEDED(pDev->GetId(&id)) && id != nullptr) {
+                    bool attached = false;
+                    if (SUCCEEDED(MiniEQ_IsAttachedToEndpoint(id, &attached)) &&
+                        attached) {
+                        if (SUCCEEDED(MiniEQ_DetachFromEndpoint(id))) {
+                            ++detached;
+                            // Re-enumerate so the engine re-reads the chain
+                            // now; a missing devnode just fails quietly.
+                            MiniEQ_ReenumerateEndpointDevice(id);
+                        } else {
+                            ++failed;
+                        }
+                    }
+                    CoTaskMemFree(id);
+                }
+                pDev->Release();
+            }
+            pColl->Release();
+        }
+        pEnum->Release();
+    }
+    CoUninitialize();
+    MiniEQ_EnsureLogDir();
+    MiniEQ_AppLogCat(L"BREAKER",
+        L"sweep finished: detached %d endpoint(s), %d failure(s)",
+        detached, failed);
+    // The exit code IS the result for the parent: 0 = clean (or nothing was
+    // attached), 1 = partial (some detached, some failed), 2 = total failure.
+    // The parent waits on the process and reads this -- a sweep that failed
+    // everywhere must not claim "your audio should be working again".
+    return (failed == 0) ? 0 : (detached > 0 ? 1 : 2);
+}
+
 static int RunElevatedHelper(LPWSTR* argv, int argc) {
     // argv: [exe, --attach|--detach, <endpoint-id>]
     if (argc < 3) {
@@ -1439,6 +1569,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
             rc = RunBulkEndpointHelper(true);
         } else if (_wcsicmp(argv[1], L"--detach-all") == 0) {
             rc = RunBulkEndpointHelper(false);
+        } else if (_wcsicmp(argv[1], L"--breaker") == 0) {
+            rc = RunCircuitBreakerSweep();
         } else {
             rc = RunElevatedHelper(argv, argc);
         }

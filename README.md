@@ -28,7 +28,8 @@ device. MiniEQ is exactly two pieces:
 ```
 ┌─────────────┐   sliders/presets    ┌──────────────────────┐
 │  MiniEQ.exe │ ──────────────────► │  named shared memory  │
-│  (tiny UI,  │   per-device state   │  "Local\MiniEQ_<dev>" │
+│  (tiny UI,  │   per-device state   │ "Global\MiniEQ_<fnv1a>│
+│   ~MBs RAM) │   + heartbeat back   │  + _Status_ variant"  │
 │   ~MBs RAM) │                      └──────────┬───────────┘
 └─────────────┘                                 │ lock-free read
                                                 ▼
@@ -113,7 +114,7 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 - **Bands:** settings toggle for 5 bands (60 / 230 / 910 / 3.6k / 14k Hz) or
   10 bands (31 Hz – 16 kHz), Q = 1.0, ±12 dB, plus master trim ±12 dB and a
   bypass switch. Change in `shared/settings_channel.h` + `apo/dsp.cpp`.
-- **Virtualization (optional, off by default):** bs2b-style Bauer crossfeed
+- **Crossfeed (optional, off by default):** bs2b-style Bauer crossfeed
   for headphone listening (default 700 Hz / 4.5 dB setting, derived per the
   bs2b theory). It runs before the EQ bands and only on stereo streams.
   Implemented with lazy allocation — the APO keeps zero extra state and
@@ -124,7 +125,12 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 - **Real-time safety:** `APOProcess` never blocks, allocates, touches COM, or
   performs I/O; coefficient recomputation on settings change is pure
   arithmetic. UI→APO settings use a seqlock protocol (odd/even 64-bit
-  counter, `Interlocked*` atomics) with bounded reader retries; the heartbeat
+  counter, `Interlocked*` atomics) with bounded reader retries; the
+  APO→UI status channel (heartbeat) is seqlock-bracketed the same way from
+  status version 3, with explicit struct-size/version checks so old and new
+  builds fail safe instead of misreading each other. Channel names are
+  `Global\MiniEQ_<16-hex FNV-1a of the endpoint ID>` (plus a `_Status_`
+  variant) — fixed length, no truncation collisions; the heartbeat
   counter is a relaxed atomic and all clock sampling/tracing is deferred to
   the APO's worker thread.
 - **Persistence:** per-device curves live in `%APPDATA%\MiniEQ\devices.ini`;
@@ -136,6 +142,9 @@ To remove: detach from the UI, then elevated `regsvr32 /u MiniEQ_APO.dll`.
 - [x] WiX MSI installer (per-push artifacts from CI)
 - [ ] Verify attach/detach across device reconnects (BT endpoints can re-enumerate)
 - [ ] Consider auto-attach for newly seen devices (opt-in)
+- [ ] Key per-device settings by container ID (PKEY_Device_ContainerId) so a
+      re-enumerated Bluetooth device keeps its EQ instead of starting flat
+      (endpoint IDs can change on re-pair; A2DP/HFP are separate endpoints)
 - [ ] UI polish pass (custom-drawn sliders, dark mode) — structure is ready
 
 ## License

@@ -26,6 +26,12 @@ public:
     void Close();
     bool IsOpen() const { return m_pView != nullptr; }
 
+    // True when Open fell back to the legacy (pre-hash) channel name: the
+    // engine still runs the old APO. MaybeUpgrade switches to the hashed
+    // channel once the new APO creates it, preserving the staged EQ.
+    bool UsingLegacyName() const { return m_legacy; }
+    bool MaybeUpgrade(const std::wstring& endpointId);
+
     // Current staged settings (what the sliders show).
     const EqSettings& Current() const { return m_staging; }
 
@@ -41,12 +47,14 @@ private:
     EqSettings* m_pView = nullptr;
     EqSettings m_staging;
     int64_t    m_seq = 0;
+    // True when the open fell back to the legacy channel name.
+    bool       m_legacy = false;
 };
 
 // StatusLink -- UI side of the APO->UI heartbeat.
 //
-// Creates the "Local\\MiniEQ_Status_{endpoint}" mapping (PAGE_READWRITE) so
-// the APO's worker thread can publish its heartbeat there. Read() copies a
+// Opens the APO-created "Global\\MiniEQ_Status_<hash>" mapping (read-only;
+// the APO's worker thread publishes its heartbeat there). Read() copies a
 // snapshot for the status timer; false means the channel isn't up (yet).
 class StatusLink {
 public:
@@ -61,9 +69,19 @@ public:
     bool IsOpen() const { return m_pView != nullptr; }
     bool Read(MiniEQApoStatus* out);
 
+    // Same upgrade-window story as SettingsLink: true while on the legacy
+    // status channel, and MaybeUpgrade switches to the hashed one once the
+    // new APO publishes it.
+    bool UsingLegacyName() const { return m_legacy; }
+    bool MaybeUpgrade(const std::wstring& endpointId);
+
 private:
     HANDLE           m_hMap = nullptr;
     MiniEQApoStatus* m_pView = nullptr;
+    // Section bytes validated at Open(); Read() never copies past it.
+    uint32_t         m_sectionSize = 0;
+    // True when the open fell back to the legacy channel name.
+    bool             m_legacy = false;
 };
 
 // GlobalStateLink -- the UI side of the global MiniEQ on/off flag.

@@ -335,25 +335,18 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 
     // 6 -- Exclusive-mode apps: an app holding this endpoint exclusively
     // bypasses the engine (and every APO) by Windows design -- the one
-    // bypass no MiniEQ setting can fix, so it gets its own row with the
-    // in-app fix. Probed with a shared-mode IAudioClient::Initialize;
-    // AUDCLNT_E_DEVICE_IN_USE means an exclusive holder is present.
+    // bypass no MiniEQ setting can fix, so it keeps its own row. This is
+    // STATIC information now: detecting it required a live IAudioClient
+    // probe that created a real stream and churned audiodg, so it was
+    // removed. It never claims green; yellow by design.
     s_rows[5].title = L"Exclusive-mode apps";
-    if (snap.exclusiveHeld) {
-        s_rows[5].state = CheckState::Error;
-        s_rows[5].detail = L"An app is holding this device in WASAPI exclusive mode "
-                           L"\u2014 Windows sends its audio straight to the driver, "
-                           L"bypassing the engine and every APO, MiniEQ included. "
-                           L"No setting in MiniEQ can intercept it.";
-        s_rows[5].fix = L"In that app, switch its output from \u201Cexclusive\u201D "
-                        L"to \u201Cshared\u201D (Qobuz: Settings \u2192 Audio \u2192 "
-                        L"WASAPI shared; Tidal/Roon/Foobar2000 have the same toggle), "
-                        L"then replay.";
-    } else {
-        s_rows[5].state = CheckState::Ok;
-        s_rows[5].detail = L"No app is holding this device in exclusive mode \u2014 "
-                           L"all shared-mode audio flows through the engine.";
-    }
+    s_rows[5].state = CheckState::Warning;
+    s_rows[5].detail = L"An app in WASAPI exclusive mode sends audio straight to the driver, "
+                       L"bypassing the engine and every APO, MiniEQ included. MiniEQ no longer "
+                       L"checks for this live (the check itself destabilized the audio engine).";
+    s_rows[5].fix = L"If the EQ seems to do nothing in one app only, look for an "
+                    L"\u201Cexclusive\u201D or \u201Cexclusive mode\u201D toggle in that app "
+                    L"and switch it to shared output, then replay.";
 
     // 7 -- Playback on this endpoint.
     s_rows[6].title = L"Audio playing on this device";
@@ -836,9 +829,6 @@ void ClOnCreate(HWND hwnd) {
 
     SetTimer(hwnd, 1, 1500, nullptr);
     MiniEQ_DiagAsyncStart(&s_clDiag, hwnd, WM_CL_DIAGDONE, s_endpoint);
-    // Fresh exclusive-mode probe for this window lifetime; the 1.5 s timer
-    // ticks below reuse the cached result (the raw probe churns audiodg).
-    MiniEQ_InvalidateExclusiveProbe(s_endpoint);
     RefreshChecklist();
 }
 
@@ -938,6 +928,10 @@ static DWORD WINAPI RecoveryThread(LPVOID param) {
 }
 
 static void SpawnRecoveryJob(int action) {
+    // Any recovery deliberately disturbs the engine -- start the breaker's
+    // stand-down so its passive detector doesn't mistake our own churn for
+    // a crash loop.
+    MiniEQ_BreakerNoteUserAction();
     s_recBusy = true;
     ++s_recSeq;
     RecoveryJob* job = new RecoveryJob{ s_hDlg, s_endpoint, action, s_recSeq };
@@ -1217,8 +1211,6 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // re-verifies from this instant.
             s_freshCalls = 0;
             s_freshTick = 0;
-            // Manual refresh: re-probe exclusive mode too (timer ticks don't).
-            MiniEQ_InvalidateExclusiveProbe(s_endpoint);
             RefreshChecklist();
             MiniEQ_AppLogCat(L"UI", L"checklist refreshed");
             return 0;
@@ -1293,10 +1285,17 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 } // namespace
 
+void MiniEQ_ChecklistDisarmWatch() {
+    if (s_recWatchArmed) {
+        s_recWatchArmed = false;
+        MiniEQ_AppLogCat(L"BREAKER",
+            L"checklist Watch engine disarmed by the circuit breaker");
+    }
+}
+
 void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
                           const std::wstring& endpointId,
-                          const std::wstring& deviceName) {
-    if (s_open && s_hDlg != nullptr) {
+                          const std::wstring& deviceName) {    if (s_open && s_hDlg != nullptr) {
         ShowWindow(s_hDlg, SW_SHOW);
         SetForegroundWindow(s_hDlg);
         RefreshChecklist();

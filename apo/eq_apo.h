@@ -185,6 +185,11 @@ private:
     wchar_t        m_statusName[160] = {};    // MMF name for the status block
     HANDLE         m_hStatusMap = nullptr;    // status mapping (worker only)
     MiniEQApoStatus* m_pStatus = nullptr;     // mapped view (worker only)
+    // True when the mapped status section is big enough for the v3 seqlock
+    // field: PublishStatus brackets its writes then. On a smaller adopted
+    // section (older build's channel) it publishes the v2 way instead --
+    // never writing past the mapping.
+    bool           m_statusSeqlock = false;
     std::atomic<uint64_t> m_rtCalls{0};       // RT thread (relaxed)
     // Deferred RT diagnostics: the audio thread only records facts into
     // these relaxed atomics -- no QPC, no file tracing there. The worker

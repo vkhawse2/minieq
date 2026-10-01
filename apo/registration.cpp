@@ -452,14 +452,34 @@ static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
 
     // R2: chain, don't just evict. Stash the incumbent APO (if it is a
     // real third-party CLSID and not us) so the engine keeps running it as
-    // our child. Best-effort: a stash failure must not block the attach.
+    // our child. TRANSACTIONAL: the slot is overwritten only after the
+    // incumbent's CLSID is verified on disk. A stash failure fails the
+    // attach -- silently losing a third-party APO with no way to restore
+    // it is worse than not attaching.
     wchar_t incumbent[64] = {};
     DWORD qsize = sizeof(incumbent), qtype = 0;
     LONG qrc = RegQueryValueExW(h, slot, nullptr, &qtype,
                                (BYTE*)incumbent, &qsize);
     if (qrc == ERROR_SUCCESS && qtype == REG_SZ && incumbent[0] != L'\0' &&
         _wcsicmp(incumbent, clsid) != 0) {
-        MiniEQ_StashChildApoClsid(endpointId, incumbent);
+        // Normalize the same way the restore path reads it (strip a
+        // trailing ",N" slot suffix) so the verify below compares like
+        // with like, and the stash holds exactly what detach restores.
+        wchar_t* comma = wcsrchr(incumbent, L',');
+        if (comma != nullptr && comma > incumbent && *(comma - 1) == L'}') {
+            *comma = L'\0';
+        }
+        hr = MiniEQ_StashChildApoClsid(endpointId, incumbent);
+        if (FAILED(hr)) {
+            RegCloseKey(h);
+            return hr; // stash failed: leave the slot untouched
+        }
+        wchar_t verify[64] = {};
+        if (MiniEQ_ReadChildApoClsid(endpointId, verify, ARRAYSIZE(verify)) != S_OK ||
+            _wcsicmp(verify, incumbent) != 0) {
+            RegCloseKey(h);
+            return E_FAIL; // stash didn't land: leave the slot untouched
+        }
     }
 
     LONG rc = RegSetValueExW(h, slot, 0, REG_SZ, (const BYTE*)clsid,

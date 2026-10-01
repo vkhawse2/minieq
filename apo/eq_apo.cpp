@@ -955,6 +955,20 @@ static HANDLE OpenOrCreateGlobalChannel(const wchar_t* name, DWORD byteSize,
     PSECURITY_DESCRIPTOR pSD = nullptr;
     // D: Everyone read+write. (EQ gains and a heartbeat are not sensitive;
     // the UI must be able to open this from another session.)
+    //
+    // ACL HARDENING ASSESSMENT (2026-10-01 audit): a tighter DACL such as
+    //   D:(A;;GRGW;;;IU)(A;;GRGW;;;SY)(A;;GRGW;;;BA)
+    // (Interactive Users + Local System + Administrators) looks sufficient
+    // on paper -- the UI runs as the interactive user, the APO in session 0
+    // -- but audiodg.exe's actual token/SIDs were not verified on hardware,
+    // and a wrong guess here silently bricks ALL UI<->APO communication
+    // (the app's core function), while the current exposure is only that a
+    // local process could scribble EQ gains. Per the audit's own rule
+    // ("tighten only after proving cross-session access still works"), the
+    // Everyone DACL stays until both process tokens are inspected on the
+    // test machine and the tighter SDDL is validated end-to-end. When that
+    // validation exists, swap the string below -- the open-first/create-
+    // fallback logic above needs no other change.
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"D:(A;;GRGW;;;WD)", SDDL_REVISION_1, &pSD, nullptr)) {
         return nullptr;
@@ -1001,12 +1015,32 @@ void CEqApo::CreateSettingsMapping() {
     }
     EqSettings* s = static_cast<EqSettings*>(v);
     if (fresh) {
-        // We created it: publish flat defaults so a UI opening later sees a
-        // valid channel immediately. (LockForProcess runs before the first
-        // APOProcess call, so the RT thread cannot race this write.)
-        EqSettings flat;
-        MiniEQ_SettingsInitFlat(&flat);
-        memcpy(s, &flat, sizeof(flat));
+        // We created it: publish the user's saved EQ so a UI opening later
+        // sees a valid channel immediately -- and so the APO doesn't play
+        // flat when the UI isn't running. The machine-wide mirror
+        // (CSIDL_COMMON_APPDATA) is used because the audio-engine context
+        // cannot reach the interactive user's %APPDATA%. Falls back to flat
+        // defaults when nothing was ever saved. (LockForProcess runs before
+        // the first APOProcess call, so the RT thread cannot race this
+        // write.)
+        EqSettings cold;
+        bool haveCold = false;
+        if (!m_endpointId.empty()) {
+            wchar_t machineIni[MAX_PATH] = {};
+            if (MiniEQ_MachineIniPath(machineIni, ARRAYSIZE(machineIni)) &&
+                MiniEQ_LoadDeviceSettingsFromIni(machineIni,
+                                                 m_endpointId.c_str(),
+                                                 &cold)) {
+                haveCold = true;
+            }
+        }
+        if (haveCold) {
+            memcpy(s, &cold, sizeof(cold));
+        } else {
+            EqSettings flat;
+            MiniEQ_SettingsInitFlat(&flat);
+            memcpy(s, &flat, sizeof(flat));
+        }
     }
     const EqSettings* expected = nullptr;
     if (m_pSettings.compare_exchange_strong(expected,
@@ -1031,21 +1065,48 @@ void CEqApo::CreateStatusMapping() {
     if (h == nullptr) {
         return; // worker retries; see CreateSettingsMapping for the why
     }
-    void* v = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
-                            sizeof(MiniEQApoStatus));
-    if (v == nullptr) {
+    // Map the whole section: a channel left behind by an older build may be
+    // smaller than this build's struct. The header (structSize/version)
+    // tells us what is really there, and every field access below is
+    // bounded by it -- a v3 APO adopting a v2 channel can never write past
+    // the mapping.
+    MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(
+        MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0));
+    if (st == nullptr) {
         CloseHandle(h);
         return;
     }
-    MiniEQApoStatus* st = static_cast<MiniEQApoStatus*>(v);
-    if (fresh || st->version < MINIEQ_STATUS_VERSION) {
-        // We created it, or a newer build is adopting a channel left behind
-        // by an older one: (re)initialize the header. On a same-version
-        // adopt, another live instance owns the counters -- the worker
-        // republishes the live fields below on every step, so leave its
-        // header alone. Never memset on adopt: that would wipe live counters.
-        st->structSize = sizeof(MiniEQApoStatus);
+    // Minimum we can work with: the full v2 layout (through buildId). The
+    // v3 seqlock field needs the full v3 size on top of that.
+    const size_t kMinStatusSize =
+        offsetof(MiniEQApoStatus, buildId) + sizeof(st->buildId);
+    const size_t kSeqlockSize =
+        offsetof(MiniEQApoStatus, sequence) + sizeof(st->sequence);
+    uint32_t secSize = 0;
+    if (fresh) {
+        // We created it at this build's size: stamp the full v3 header.
+        // (The OS zeroes the section; sequence = 0 = even = consistent.)
+        st->structSize = (uint32_t)sizeof(MiniEQApoStatus);
         st->version = MINIEQ_STATUS_VERSION;
+        StringCchCopyA(st->buildId, ARRAYSIZE(st->buildId), MiniEQ_ApoBuildId());
+        secSize = (uint32_t)sizeof(MiniEQApoStatus);
+    } else {
+        // Adopted: validate the header before trusting it. A zero version
+        // means a racing creator hasn't stamped it yet -- back off and let
+        // the worker retry.
+        const uint32_t v = st->version;
+        const uint32_t sz = st->structSize;
+        if (v < 1 || v > MINIEQ_STATUS_VERSION ||
+            sz < kMinStatusSize || sz > 65536) {
+            UnmapViewOfFile(st);
+            CloseHandle(h);
+            return;
+        }
+        secSize = sz;
+        // A newer build adopting an older channel refreshes the build stamp
+        // (never memsets: that would wipe live counters). The version stays
+        // whatever the section supports -- claiming v3 on a v2-size section
+        // would make the UI read a sequence field that isn't there.
         StringCchCopyA(st->buildId, ARRAYSIZE(st->buildId), MiniEQ_ApoBuildId());
     }
     LARGE_INTEGER freq;
@@ -1057,13 +1118,42 @@ void CEqApo::CreateStatusMapping() {
     }
     m_pStatus = st;
     m_hStatusMap = h;
-    MiniEQ_Trace(L"MiniEQ_APO: status channel %s \"%s\"",
-                 fresh ? L"CREATED" : L"adopted", m_statusName);
+    m_statusSeqlock = (secSize >= kSeqlockSize);
+    MiniEQ_Trace(L"MiniEQ_APO: status channel %s \"%s\" (seqlock %s)",
+                 fresh ? L"CREATED" : L"adopted", m_statusName,
+                 m_statusSeqlock ? L"on" : L"off");
 }
 
 void CEqApo::PublishStatus() {
     if (m_pStatus == nullptr) {
         return;
+    }
+    // Seqlock writer (v3+ section): bracket the field writes so the UI's
+    // status poll takes a coherent snapshot. On a smaller adopted section
+    // the fields are published unbracketed (v2 behavior) -- never touch the
+    // sequence field past the mapping.
+    volatile LONG64* seqAddr =
+        reinterpret_cast<volatile LONG64*>(&m_pStatus->sequence);
+    if (m_statusSeqlock) {
+        // Crash recovery: if a previous writer died mid-update (its host
+        // audiodg.exe crashed -- the exact scenario this app exists for),
+        // the sequence is stuck odd and every publish we bracket would end
+        // odd too, so readers could never take a snapshot again. Repair the
+        // parity to even first. (Two live instances briefly publishing to
+        // the same endpoint channel -- engine rebuild overlap -- remains a
+        // best-effort race, same as the pre-seqlock design; the heartbeat
+        // fields are advisory, never load-bearing.)
+        for (;;) {
+            const int64_t seq = InterlockedCompareExchange64(seqAddr, 0, 0);
+            if (!(seq & 1)) {
+                break; // even: healthy
+            }
+            if (InterlockedCompareExchange64(seqAddr, seq + 1, seq) == seq) {
+                break; // repaired
+            }
+            // Lost a race with another writer; re-read.
+        }
+        InterlockedIncrement64(seqAddr); // -> odd: write in flight
     }
     const uint64_t calls = m_rtCalls.load(std::memory_order_relaxed);
     m_pStatus->processCalls = (int64_t)calls;
@@ -1082,6 +1172,9 @@ void CEqApo::PublishStatus() {
     // Idempotent per instance: keeps the build stamp correct even when this
     // instance adopted a channel created by an older build.
     StringCchCopyA(m_pStatus->buildId, ARRAYSIZE(m_pStatus->buildId), MiniEQ_ApoBuildId());
+    if (m_statusSeqlock) {
+        InterlockedIncrement64(seqAddr); // -> even: consistent snapshot
+    }
 
     // Deferred RT diagnostics: the audio thread only set flags; the actual
     // file-trace lines are written here, on the worker thread.
@@ -1109,6 +1202,7 @@ void CEqApo::CloseStatusMapping() {
         UnmapViewOfFile(m_pStatus);
         m_pStatus = nullptr;
     }
+    m_statusSeqlock = false;
     if (m_hStatusMap != nullptr) {
         CloseHandle(m_hStatusMap);
         m_hStatusMap = nullptr;
@@ -1210,7 +1304,13 @@ STDMETHODIMP_(void) CEqApo::APOProcess(UINT32 u32NumInputConnections,
                                       UINT32 u32NumOutputConnections,
                                       APO_CONNECTION_PROPERTY** ppOutputConnections) noexcept
 try {
-    if (ppInputConnections == nullptr || ppInputConnections[0] == nullptr) {
+    // Validate the connection contract before touching slot 0: the engine
+    // promises at least one input connection for an SFX APO, but a zero
+    // count with a non-null array would make ppInputConnections[0] an
+    // out-of-bounds read. (The output side is guarded where it is used
+    // below; the child APO gets exactly what the engine gave us.)
+    if (u32NumInputConnections == 0 || ppInputConnections == nullptr ||
+        ppInputConnections[0] == nullptr) {
         return;
     }
 

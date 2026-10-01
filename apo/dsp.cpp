@@ -13,10 +13,13 @@
 EqDsp::EqDsp() {
     memset(m_bands, 0, sizeof(m_bands));
     memset(m_state, 0, sizeof(m_state));
+    memset(m_oldBands, 0, sizeof(m_oldBands));
+    memset(m_oldState, 0, sizeof(m_oldState));
     // Default to flat (unity) coefficients so a zeroed struct is a no-op.
     // (m_liveGainDb / m_targetGainDb are zero-initialized in the header.)
     for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
         m_bands[b].b0 = 1.0f;
+        m_oldBands[b].b0 = 1.0f;
     }
 }
 
@@ -52,6 +55,19 @@ void EqDsp::Configure(float sampleRateHz, uint32_t numChannels) {
     SnapCoeffs();
     m_mix = m_mixTarget = 1.0f;
     m_xfMix = m_xfMixTarget = 0.0f;
+    // A format change is a fresh stream: drop any in-flight layout
+    // crossfade and re-park the frozen bank at flat.
+    m_layoutMix = 1.0f;
+    m_layoutMixStep = 0.0f;
+    m_layoutXfadeLeft = 0;
+    m_oldNumBands = 0;
+    m_oldMaster = 1.0f;
+    for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+        m_oldBands[b].b0 = 1.0f;
+        m_oldBands[b].b1 = m_oldBands[b].b2 =
+            m_oldBands[b].a1 = m_oldBands[b].a2 = 0.0f;
+    }
+    memset(m_oldState, 0, sizeof(m_oldState));
     Reset();
 }
 
@@ -85,6 +101,34 @@ void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
     if (numBands != MINIEQ_MAX_BANDS) {
         numBands = MINIEQ_NUM_BANDS; // only 5 or 10 are valid
     }
+    if (numBands != m_numBands) {
+        // Layout change (5<->10): freeze the live bank so it can keep
+        // filtering during the crossfade, then rebuild the main bank for
+        // the new layout with fresh state. The fade (started at 100% old
+        // in Process) masks the new bank's startup transient; the gain
+        // sweep below then moves the new bank to its targets click-free.
+        // Pure arithmetic + fixed-size copies: RT-safe.
+        for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+            m_oldBands[b] = m_bands[b];
+        }
+        for (uint32_t c = 0; c < MINIEQ_MAX_CHANNELS; ++c) {
+            for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+                m_oldState[c][b] = m_state[c][b];
+            }
+        }
+        m_oldNumBands = m_numBands;
+        m_oldMaster = m_masterLinear;
+        memset(m_state, 0, sizeof(m_state)); // new bank starts clean
+        const float fadeFrames = 0.020f * m_sampleRate; // ~20 ms
+        m_layoutMixStep = (fadeFrames > 1.0f) ? (1.0f / fadeFrames) : 1.0f;
+        m_layoutMix = 0.0f;
+        m_layoutXfadeLeft = (uint32_t)fadeFrames;
+        if (m_layoutXfadeLeft == 0) {
+            m_layoutXfadeLeft = 1;
+        }
+        m_coeffTick = 0;
+        m_coeffsDirty = true;
+    }
     m_numBands = numBands;
     for (int b = 0; b < numBands; ++b) {
         float g = bandGainDb[b];
@@ -110,7 +154,7 @@ void EqDsp::SnapCoeffs() {
     for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
         m_liveGainDb[b] = m_targetGainDb[b];
         PeakingCoeffs(MiniEQ_BandFreq(m_numBands, b), MINIEQ_BAND_Q,
-                      m_liveGainDb[b], m_sampleRate, &m_bands[b]);
+                      BandEffectiveGain(b), m_sampleRate, &m_bands[b]);
     }
     m_masterLinear = m_targetMaster;
     m_coeffsDirty = false;
@@ -136,7 +180,7 @@ void EqDsp::AdvanceCoeffs() {
     if (m_coeffsDirty && ((m_coeffTick++ & 63) == 0)) {
         for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
             PeakingCoeffs(MiniEQ_BandFreq(m_numBands, b), MINIEQ_BAND_Q,
-                          m_liveGainDb[b], m_sampleRate, &m_bands[b]);
+                          BandEffectiveGain(b), m_sampleRate, &m_bands[b]);
         }
         m_coeffsDirty = false;
     }
@@ -286,7 +330,7 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
         memcpy(dry, interleaved, (size_t)numFrames * ch * sizeof(float));
     }
 
-    // (1) Optional headphone virtualization: bs2b-style Bauer crossfeed.
+    // (1) Optional headphone crossfeed: bs2b-style Bauer.
     // Runs BEFORE the EQ bands -- crossfeed rebuilds a speaker-like stereo
     // image, the EQ then shapes the final tonality. Stereo only. The whole
     // stage is skipped (one branch) when the toggle is off.
@@ -363,7 +407,9 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
     // (2) EQ bands + master gain. The live coefficients sweep toward their
     // targets once per frame (shared across channels): a short one-pole
     // ramp instead of an instant jump, so slider drags and preset switches
-    // never crackle.
+    // never crackle. A 5<->10 layout change additionally crossfades from
+    // the frozen pre-switch bank (see UpdateGains): the new bank's fresh
+    // state would otherwise start up audibly.
     const int nb = m_numBands;
 
     for (uint32_t f = 0; f < numFrames; ++f) {
@@ -372,8 +418,24 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
         }
         float* frame = interleaved + (size_t)f * ch;
         const float master = m_masterLinear;
+        const bool layoutXfade = (m_layoutXfadeLeft > 0);
+        float oldOut[MINIEQ_MAX_CHANNELS];
         for (uint32_t c = 0; c < ch; ++c) {
             float x = frame[c];
+            if (layoutXfade) {
+                // Frozen pre-switch bank, from the same dry input.
+                float xo = x;
+                for (int b = 0; b < m_oldNumBands; ++b) {
+                    const Biquad* k = &m_oldBands[b];
+                    Tdf2State* st = &m_oldState[c][b];
+                    // Transposed Direct Form II.
+                    const float y = k->b0 * xo + st->s1;
+                    st->s1 = k->b1 * xo + st->s2 - k->a1 * y;
+                    st->s2 = k->b2 * xo - k->a2 * y;
+                    xo = y;
+                }
+                oldOut[c] = xo * m_oldMaster;
+            }
             for (int b = 0; b < nb; ++b) {
                 const Biquad* k = &m_bands[b];
                 Tdf2State* st = &m_state[c][b];
@@ -383,7 +445,19 @@ void EqDsp::Process(float* interleaved, uint32_t numFrames, bool bypass) {
                 st->s2 = k->b2 * x - k->a2 * y;
                 x = y;
             }
-            frame[c] = x * master;
+            float wet = x * master;
+            if (layoutXfade) {
+                wet = oldOut[c] + m_layoutMix * (wet - oldOut[c]);
+            }
+            frame[c] = wet;
+        }
+        if (layoutXfade) {
+            // Advance the fade once per frame (shared across channels).
+            m_layoutMix += m_layoutMixStep;
+            if (m_layoutMix >= 1.0f || --m_layoutXfadeLeft == 0) {
+                m_layoutMix = 1.0f;
+                m_layoutXfadeLeft = 0;
+            }
         }
         // Bypass crossfade (~5 ms): dry <-> wet, no clicks.
         if (!steadyWet) {

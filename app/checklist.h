@@ -1,6 +1,6 @@
 // checklist.h -- MiniEQ "Audio Path Checklist" popup.
 //
-// A modal popup, opened from the "Checklist" button next to Virtualization.
+// A modal popup, opened from the "Checklist" button next to Crossfeed.
 // It runs every prerequisite check for "audio goes through MiniEQ" and shows
 // each as green (working), yellow (not active yet) or red (error), with the
 // exact fix on red rows. The checks reuse MiniEQ_RunDiagnosis(), so the
@@ -17,3 +17,8 @@
 void MiniEQ_ShowChecklist(HINSTANCE hInst, HWND hParent,
                           const std::wstring& endpointId,
                           const std::wstring& deviceName);
+
+// Disarms the checklist's "Watch engine" auto-recovery, if armed. The
+// circuit breaker calls this when it fires so the watch doesn't fight the
+// breaker over the engine.
+void MiniEQ_ChecklistDisarmWatch();

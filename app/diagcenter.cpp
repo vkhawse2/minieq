@@ -6,26 +6,28 @@
 
 #include "diagcenter.h"
 
+#include "checklist.h" // MiniEQ_ChecklistDisarmWatch (circuit breaker)
 #include "diag.h"
 #include "settings_link.h"
 #include "../apo/registration.h"
 #include "../shared/settings_channel.h"
 
 #include <audiopolicy.h>
-#include <audioclient.h> // IAudioClient, AUDCLNT_E_DEVICE_IN_USE (exclusive probe)
 #include <commctrl.h>
 #include <endpointvolume.h>
 #include <propkey.h> // DEFINE_PROPERTYKEY, needed by functiondiscoverykeys_devpkey.h
 #include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <propvarutil.h>
+#include <shellapi.h> // ShellExecuteExW (circuit-breaker elevated sweep)
+#include <shlobj.h>   // SHGetFolderPathW (forensics report goes to the Desktop)
 #include <tlhelp32.h>
+#include <winevt.h>   // EvtQuery (forensics: Application Error events)
 #include <strsafe.h>
 
 #include <string.h>
 #include <wchar.h>
 
-#include <map>
 #include <mutex>
 
 // PKEY_AudioEndpoint_Disable_SysFx -- the "Audio enhancements" switch.
@@ -71,13 +73,17 @@ static DWORD FindAudiodgPid() {
 // Passive audiodg crash-loop detection. Every snapshot feeds the engine PID
 // through here; three PID changes inside ten minutes means audiodg.exe is
 // dying and restarting in a loop (e.g. an APO crashing it on stream start).
-// Purely observational -- no service is touched.
-static DWORD     s_loopLastPid = 0;
-static ULONGLONG s_loopChangeTicks[4] = {};
-static int       s_loopChangeCount = 0;
+// Purely observational -- no service is touched. Called from both the main
+// window's timer (UI thread) and the diagnostics worker thread, so the
+// little history ring is guarded by a lock.
+static SRWLOCK    s_loopLock = SRWLOCK_INIT;
+static DWORD      s_loopLastPid = 0;
+static ULONGLONG  s_loopChangeTicks[4] = {};
+static int        s_loopChangeCount = 0;
 
 static bool NoteAudiodgPid(DWORD pid) {
     const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&s_loopLock);
     if (pid != 0 && pid != s_loopLastPid) {
         if (s_loopLastPid != 0) {
             // A genuine change, not the first sighting: remember when.
@@ -93,7 +99,131 @@ static bool NoteAudiodgPid(DWORD pid) {
             ++recent;
         }
     }
-    return recent >= 3;
+    const bool loop = (recent >= 3);
+    ReleaseSRWLockExclusive(&s_loopLock);
+    return loop;
+}
+
+// ---------------------------------------------------------------------------
+// Circuit breaker: when the audio engine is dying in a crash loop, sacrifice
+// the EQ to keep audio alive. Detection is purely passive (NoteAudiodgPid
+// above); the response is an elevated --breaker sweep that detaches MiniEQ
+// from every endpoint and re-enumerates the device nodes. The audio service
+// is never touched. The sweep runs on a worker thread -- the UI thread never
+// blocks or sleeps.
+// ---------------------------------------------------------------------------
+
+// Cross-thread state: MiniEQ_BreakerPoll runs on the UI thread while
+// BreakerSweepThread runs on a worker thread, so every flag here is atomic.
+static std::atomic<ULONGLONG> s_breakerStandDownUntil{0};   // 60 s after a deliberate user action
+static std::atomic<ULONGLONG> s_breakerUacCooldownUntil{0}; // 30 min after a declined UAC prompt
+static std::atomic<bool>      s_breakerTripped{false};      // one UAC prompt per loop episode
+static std::atomic<bool>      s_breakerSweepActive{false};  // elevated sweep currently in flight
+
+// Deliberate user action (attach / detach / path rebuild): the engine may
+// legitimately restart right after, so don't mistake that churn for a crash
+// loop. Call from every code path that intentionally disturbs the engine.
+void MiniEQ_BreakerNoteUserAction() {
+    s_breakerStandDownUntil.store(GetTickCount64() + 60ULL * 1000,
+                                 std::memory_order_release);
+}
+
+// Outcome codes posted with WM_APP_BREAKER_DONE (see diagcenter.h).
+
+static DWORD WINAPI BreakerSweepThread(LPVOID param) {
+    const HWND owner = static_cast<HWND>(param);
+    s_breakerSweepActive.store(true, std::memory_order_release);
+    int outcome = BreakerOutcomeLaunchFailed;
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.hwnd = owner;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = L"--breaker";
+    sei.nShow = SW_HIDE;
+    MiniEQ_AppLogCat(L"BREAKER",
+        L"restart loop confirmed -- relaunching elevated to detach MiniEQ everywhere");
+    if (ShellExecuteExW(&sei)) {
+        outcome = BreakerOutcomeLaunched;
+        if (sei.hProcess != nullptr) {
+            // Deterministic handoff: wait for the sweep to finish (bounded),
+            // so the "all clear" message never precedes the actual detach.
+            // The sweep's exit code carries the real result (see
+            // RunCircuitBreakerSweep): 0 = clean, 1 = partial, 2 = failed.
+            const DWORD wr = WaitForSingleObject(sei.hProcess, 90000);
+            if (wr == WAIT_TIMEOUT) {
+                MiniEQ_AppLogCat(L"BREAKER",
+                    L"sweep still running after 90 s -- leaving it to finish");
+            } else {
+                DWORD code = 0;
+                if (GetExitCodeProcess(sei.hProcess, &code)) {
+                    if (code == 1) {
+                        outcome = BreakerOutcomePartial;
+                    } else if (code == 2) {
+                        outcome = BreakerOutcomeSweepFailed;
+                    }
+                }
+            }
+            CloseHandle(sei.hProcess);
+        }
+    } else {
+        const DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) {
+            // The user declined the UAC prompt: respect that, don't nag.
+            // Cool down for 30 minutes; the episode latch is released so the
+            // poll may ask again afterwards if the loop is still going.
+            outcome = BreakerOutcomeUacDeclined;
+            s_breakerUacCooldownUntil.store(GetTickCount64() + 30ULL * 60 * 1000,
+                                           std::memory_order_release);
+            s_breakerTripped.store(false, std::memory_order_release);
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"UAC prompt declined by user -- cooling down 30 minutes");
+        } else {
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"elevated relaunch failed (err=%u)", (unsigned)err);
+        }
+    }
+    s_breakerSweepActive.store(false, std::memory_order_release);
+    PostMessageW(owner, WM_APP_BREAKER_DONE, (WPARAM)outcome, 0);
+    return 0;
+}
+
+// Poll entry, called from the main window's status timer about every 5 s.
+// Feeds the passive detector with the current engine PID; fires the breaker
+// (non-blocking) only when a genuine restart loop is confirmed.
+void MiniEQ_BreakerPoll(HWND owner) {
+    if (owner == nullptr || s_breakerSweepActive.load(std::memory_order_acquire)) {
+        return;
+    }
+    const bool loop = NoteAudiodgPid(FindAudiodgPid());
+    const ULONGLONG now = GetTickCount64();
+    if (!loop) {
+        s_breakerTripped.store(false, std::memory_order_release); // engine calm: re-arm
+        return;
+    }
+    if (s_breakerTripped.load(std::memory_order_acquire)) {
+        return; // one UAC prompt per episode
+    }
+    if (now < s_breakerStandDownUntil.load(std::memory_order_acquire)) {
+        return; // user just attached/detached/rebuilt -- their churn, not a crash
+    }
+    if (now < s_breakerUacCooldownUntil.load(std::memory_order_acquire)) {
+        return; // user declined the prompt -- don't nag
+    }
+    s_breakerTripped.store(true, std::memory_order_release);
+    MiniEQ_ChecklistDisarmWatch(); // the watch's auto-recovery must not fight the breaker
+    MiniEQ_AppLogCat(L"BREAKER",
+        L"audiodg.exe restart loop detected -- firing the circuit breaker");
+    HANDLE h = CreateThread(nullptr, 0, BreakerSweepThread, owner, 0, nullptr);
+    if (h != nullptr) {
+        CloseHandle(h);
+    } else {
+        s_breakerTripped.store(false, std::memory_order_release); // let the next poll retry
+        MiniEQ_AppLogCat(L"BREAKER", L"could not start the sweep thread");
+    }
 }
 
 // 1 = module found in the process, 0 = snapshot worked but module absent,
@@ -377,94 +507,14 @@ static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
 //
 // 2026-10-01 -- CRITICAL: IAudioClient::Initialize creates a REAL audio stream
 // on the endpoint, and releasing it tears the stream down again. Run on the
-// 1 s / 1.5 s diagnosis timers (Diagnostics Center + Audio Path Checklist)
-// this visibly churns the Windows audio engine: audiodg.exe was observed
-// restarting every ~3 s in lockstep with the probes (96 restarts in ~6 min,
-// each one dropping playback and reloading our APO), and a probe racing the
-// engine teardown can fault the UI's diagnosis worker thread hard enough to
-// take the whole UI process down with it. The old "leaves no trace" comment
-// was wrong. The raw probe below therefore NEVER runs on a timer tick -- see
-// CachedExclusiveProbe. Timer ticks reuse the last result; only window-open
-// and manual Refresh re-probe.
-static bool ExclusiveProbeInner(const wchar_t* endpointId) {
-    IMMDeviceEnumerator* pEnum = nullptr;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                __uuidof(IMMDeviceEnumerator),
-                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
-        return false;
-    }
-    IMMDevice* pDev = nullptr;
-    HRESULT hr = pEnum->GetDevice(endpointId, &pDev);
-    pEnum->Release();
-    if (FAILED(hr) || pDev == nullptr) {
-        return false;
-    }
-    IAudioClient* pClient = nullptr;
-    hr = pDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                        reinterpret_cast<void**>(&pClient));
-    bool exclusive = false;
-    if (SUCCEEDED(hr) && pClient != nullptr) {
-        WAVEFORMATEX* pwfx = nullptr;
-        if (SUCCEEDED(pClient->GetMixFormat(&pwfx)) && pwfx != nullptr) {
-            hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0,
-                                     pwfx, nullptr);
-            exclusive = (hr == AUDCLNT_E_DEVICE_IN_USE);
-            CoTaskMemFree(pwfx);
-        }
-        pClient->Release();
-    }
-    pDev->Release();
-    return exclusive;
-}
-
-// SEH shield: the probe runs on the diagnosis worker thread while the audio
-// engine may be mid-teardown; an access violation there must not kill the UI
-// process. Deliberately free of C++ objects so __try is legal under /EHsc.
-static bool EndpointHasExclusiveStream(const wchar_t* endpointId) {
-    if (endpointId == nullptr || endpointId[0] == L'\0') {
-        return false;
-    }
-    __try {
-        return ExclusiveProbeInner(endpointId);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        MiniEQ_AppLogCat(L"DIAG",
-            L"exclusive probe: SEH 0x%08X during WASAPI probe, treating as not held",
-            static_cast<unsigned>(GetExceptionCode()));
-        return false;
-    }
-}
-
-// Cached exclusive-probe result, keyed by endpoint. MiniEQ_RunDiagnosis serves
-// the 1 s / 1.5 s timer ticks from this cache; the windows drop the entry via
-// MiniEQ_InvalidateExclusiveProbe when they open and on manual Refresh.
-static std::mutex s_exclMutex;
-static std::map<std::wstring, bool> s_exclCache;
-
-static bool CachedExclusiveProbe(const std::wstring& endpointId) {
-    if (endpointId.empty()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lk(s_exclMutex);
-    const auto it = s_exclCache.find(endpointId);
-    if (it != s_exclCache.end()) {
-        return it->second;
-    }
-    const bool v = EndpointHasExclusiveStream(endpointId.c_str());
-    s_exclCache[endpointId] = v;
-    return v;
-}
-
-// Drop the cached exclusive-probe result so the next diagnosis re-probes.
-// Call when a diagnostics surface opens and on manual Refresh -- never from
-// the periodic timer.
-void MiniEQ_InvalidateExclusiveProbe(const std::wstring& endpointId) {
-    std::lock_guard<std::mutex> lk(s_exclMutex);
-    if (endpointId.empty()) {
-        s_exclCache.clear();
-    } else {
-        s_exclCache.erase(endpointId);
-    }
-}
+// NOTE: there is deliberately NO live exclusive-mode probe anymore. The old
+// probe called IAudioClient::Initialize to detect an exclusive holder, but
+// that call creates a REAL audio stream: on 2026-10-01 it was observed
+// churning the engine (audiodg.exe restarting every ~3 s in lockstep with
+// the probes, 96 restarts in ~6 min, each one dropping playback and
+// reloading our APO). Exclusive-mode detection is therefore not performed --
+// the snapshot reports exclusiveHeld = false and the UI explains that an
+// exclusive-mode app bypasses APOs by Windows design.
 
 // Per-app sessions on this endpoint with live peak levels.
 static std::vector<DiagSessionInfo> EnumEndpointSessions(const std::wstring& endpointId) {
@@ -657,12 +707,11 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
         }
     }
 
-    // Exclusive-mode layer: an app holding the endpoint exclusively bypasses
-    // the engine (and every APO) by Windows design -- the one bypass no
-    // MiniEQ setting can fix. Served from the probe cache: the raw WASAPI
-    // probe creates a real stream, so it only re-runs on window-open and
-    // manual Refresh (see CachedExclusiveProbe), never on the timer tick.
-    s.exclusiveHeld = CachedExclusiveProbe(endpointId);
+    // Exclusive-mode layer: not probed live anymore. The old IAudioClient
+    // probe created a real audio stream and churned the engine (audiodg
+    // restarts every ~3 s), so the snapshot reports exclusiveHeld = false
+    // and the UI explains the bypass instead of detecting it.
+    s.exclusiveHeld = false;
     return s;
 }
 
@@ -745,20 +794,10 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
                      L"Then copy this report and send it over.";
         return v;
     }
-    if (snap.exclusiveHeld && snap.anySessionActive) {
-        // Exclusive mode bypasses the engine (and every APO) by Windows
-        // design -- heartbeats can never arrive for such a stream, so this
-        // diagnosis outranks the generic "bypassing" one below.
-        v.severity = DiagSeverity::Bad;
-        v.title = L"An app is holding this device in exclusive mode.";
-        v.detail = L"WASAPI exclusive mode sends audio straight to the driver, "
-                   L"bypassing the audio engine and every APO, MiniEQ included. "
-                   L"No setting in MiniEQ can intercept it.";
-        v.nextStep = L"In that app, switch its output from \u201Cexclusive\u201D "
-                     L"to \u201Cshared\u201D (Qobuz: Settings \u2192 Audio \u2192 "
-                     L"WASAPI shared), then replay.";
-        return v;
-    }
+    // NOTE: no exclusive-holder verdict anymore. Detecting it required a
+    // live IAudioClient probe that created a real stream and churned the
+    // engine, so it was removed; the static checklist row explains the
+    // bypass instead.
     if (snap.anySessionActive && snap.dllLoaded == 0) {
         // Honest "attached but not loaded": registration is provably right,
         // yet the engine never instantiated our APO for this stream.
@@ -879,7 +918,8 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
     r += L"\r\nMiniEQ enabled: ";
     r += MiniEQ_GlobalEnabledGet() ? L"yes" : L"no (user bypass \u2014 audio passes through)";
     r += L"\r\nExclusive-mode holder: ";
-    r += snap.exclusiveHeld ? L"yes \u2014 an app is bypassing the engine" : L"no";
+    r += L"not probed (the old live check created a real stream and could "
+         L"destabilize the engine; an exclusive-mode app bypasses APOs by design)";
 
     r += L"\r\n\r\nREGISTRATION\r\n";
     r += MiniEQ_EffectSlotShortName();
@@ -1067,6 +1107,8 @@ void MiniEQ_DiagAsyncStop(DiagAsyncState* a) {
 
 #include <commctrl.h>
 #include <vector>
+#include <memory>
+#include <atomic>
 
 enum {
     IDC_DC_VERDICT = 301,
@@ -1078,11 +1120,15 @@ enum {
     IDC_DC_COPY,
     IDC_DC_COPYLOG,
     IDC_DC_FULLLOG,
+    IDC_DC_FORENSICS,
     IDC_DC_CLOSE,
 };
 
 // Posted by the background diagnosis worker when a fresh bundle is ready.
 #define WM_DC_DIAGDONE (WM_APP + 11)
+// Posted by the forensics worker when the report file is written (lParam:
+// 0 = ok, path in s_forensicsPath; nonzero = failed).
+#define WM_DC_FORENSICSDONE (WM_APP + 12)
 
 static const wchar_t* kDcClass = L"MiniEQDiagCenter";
 
@@ -1133,7 +1179,6 @@ static bool             s_loggedLoop = false;
 static DiagEnhancements s_loggedEnh = DiagEnhancements::Unknown;
 static bool             s_loggedHb = false;
 static std::wstring     s_loggedSessSig;
-static std::wstring     s_loggedExSig;
 static std::wstring     s_shownVerdictTitle;
 static ULONGLONG        s_lastLogSize = 0;
 
@@ -1212,12 +1257,6 @@ static void LogTransitions(const DiagSnapshot& snap, const DiagVerdict& v, bool 
             }
         }
         s_loggedSessSig = sig;
-    }
-    const std::wstring exSig = snap.exclusiveHeld ? L"held" : L"clear";
-    if (all || exSig != s_loggedExSig) {
-        MiniEQ_AppLogCat(L"ENGINE", L"exclusive-mode holder: %s",
-                         snap.exclusiveHeld ? L"YES (bypasses engine+APOs)" : L"none");
-        s_loggedExSig = exSig;
     }
     s_haveLogged = true;
 }
@@ -1368,7 +1407,7 @@ static void DcRelayoutForVerdict(const std::wstring& vt) {
     HDC hdc = GetDC(s_hDlg);
     if (hdc != nullptr) {
         HFONT old = (HFONT)SelectObject(hdc, s_fontBold);
-        RECT rc = { 0, 0, 596, 0 };
+        RECT rc = { 0, 0, 736, 0 };
         DrawTextW(hdc, vt.c_str(), -1, &rc, DT_WORDBREAK | DT_CALCRECT);
         SelectObject(hdc, old);
         ReleaseDC(s_hDlg, hdc);
@@ -1382,17 +1421,17 @@ static void DcRelayoutForVerdict(const std::wstring& vt) {
         return;
     }
     s_verdictExtra = extra;
-    SetWindowPos(s_hVerdict, nullptr, 0, 0, 596, need, SWP_NOMOVE | SWP_NOZORDER);
+    SetWindowPos(s_hVerdict, nullptr, 0, 0, 736, need, SWP_NOMOVE | SWP_NOZORDER);
     struct DcItem { HWND hwnd; int x, y, w, h; };
     const DcItem items[] = {
         { s_hGrpEngine, 12, 120, 288, 132 },
         { s_hEngine, 22, 142, 268, 102 },
-        { s_hGrpReg, 308, 120, 300, 132 },
-        { s_hReg, 318, 142, 280, 102 },
-        { s_hGrpSessions, 12, 260, 596, 168 },
-        { s_hSessions, 22, 282, 576, 138 },
-        { s_hGrpLog, 12, 436, 596, 168 },
-        { s_hLog, 22, 458, 576, 138 },
+        { s_hGrpReg, 308, 120, 440, 132 },
+        { s_hReg, 318, 142, 420, 102 },
+        { s_hGrpSessions, 12, 260, 736, 168 },
+        { s_hSessions, 22, 282, 716, 138 },
+        { s_hGrpLog, 12, 436, 736, 168 },
+        { s_hLog, 22, 458, 716, 138 },
     };
     for (const DcItem& it : items) {
         if (it.hwnd != nullptr) {
@@ -1401,19 +1440,20 @@ static void DcRelayoutForVerdict(const std::wstring& vt) {
         }
     }
     const int btnY = 616 + extra;
-    HWND btns[5] = {
+    HWND btns[6] = {
         GetDlgItem(s_hDlg, IDC_DC_RUN), GetDlgItem(s_hDlg, IDC_DC_COPY),
         GetDlgItem(s_hDlg, IDC_DC_COPYLOG), GetDlgItem(s_hDlg, IDC_DC_FULLLOG),
+        GetDlgItem(s_hDlg, IDC_DC_FORENSICS),
         GetDlgItem(s_hDlg, IDC_DC_CLOSE),
     };
-    const int btnX[5] = { 12, 140, 258, 366, 484 };
-    for (int i = 0; i < 5; ++i) {
+    const int btnX[6] = { 12, 140, 258, 366, 484, 632 };
+    for (int i = 0; i < 6; ++i) {
         if (btns[i] != nullptr) {
             SetWindowPos(btns[i], nullptr, btnX[i], btnY, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER);
         }
     }
-    SetWindowPos(s_hDlg, nullptr, 0, 0, 620, 702 + extra,
+    SetWindowPos(s_hDlg, nullptr, 0, 0, 760, 702 + extra,
                  SWP_NOMOVE | SWP_NOZORDER);
     InvalidateRect(s_hDlg, nullptr, TRUE);
 }
@@ -1555,6 +1595,345 @@ static void DcCopyLog(HWND hwnd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Crash forensics: one click collects everything needed to diagnose an
+// audiodg.exe crash loop and writes it as a single UTF-16 report on the
+// Desktop. Runs on a worker thread (event-log + filesystem I/O); the UI
+// thread never blocks. Sections:
+//   1. Current diagnosis (the same report as "Copy report")
+//   2. Recent Application Error events (ID 1000) for AUDIODG.EXE, via wevtapi
+//   3. WER ReportArchive entries for AUDIODG.EXE crashes (+ Report.wer head)
+//   4. Existing C:\CrashDumps\audiodg.exe.*.dmp files (metadata, not contents)
+//   5. Last 64 KB of apo-trace.log
+// ---------------------------------------------------------------------------
+
+static std::atomic<bool> s_forensicsBusy{false}; // one collection at a time
+
+// Completion result owned by the worker and handed to the UI thread via
+// WM_DC_FORENSICSDONE's LPARAM -- no cross-thread statics, no races.
+struct ForensicsResult {
+    bool         ok = false;
+    std::wstring path;
+};
+
+// Diagnosis inputs captured on the UI thread so the worker never races the
+// live snapshot.
+struct ForensicsInput {
+    DiagSnapshot snap;
+    DiagVerdict  verdict;
+    HWND         hwnd;
+};
+
+static void ForensicsAppendLine(std::wstring& out, const wchar_t* s) {
+    out += s;
+    out += L"\r\n";
+}
+
+// Last 64 KB of a UTF-16 log, aligned to a code-unit boundary.
+static std::wstring ForensicsLogTail(const std::wstring& path, LONGLONG cap) {
+    std::wstring text;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return text;
+    }
+    LARGE_INTEGER size = {};
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0) {
+        LONGLONG off = size.QuadPart - cap;
+        const bool truncated = off > 0;
+        if (off < 0) {
+            off = 0;
+        }
+        off &= ~1LL; // UTF-16 alignment: an odd offset shifts every char
+        LARGE_INTEGER li = {};
+        li.QuadPart = off;
+        SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+        const DWORD toRead = static_cast<DWORD>(size.QuadPart - off);
+        std::vector<BYTE> buf(static_cast<size_t>(toRead) + 2, 0);
+        DWORD got = 0;
+        if (ReadFile(h, buf.data(), toRead, &got, nullptr) && got > 0) {
+            const wchar_t* w = reinterpret_cast<const wchar_t*>(buf.data());
+            size_t n = got / sizeof(wchar_t);
+            if (n > 0 && w[0] == 0xFEFF) {
+                ++w;
+                --n;
+            }
+            text.assign(w, n);
+            if (truncated) {
+                text = L"...(truncated to the last 64 KB)...\r\n" + text;
+            }
+        }
+    }
+    CloseHandle(h);
+    return text;
+}
+
+static void ForensicsAppendEventLog(std::wstring& out) {
+    ForensicsAppendLine(out, L"===== APPLICATION ERROR EVENTS (AUDIODG.EXE, ID 1000) =====");
+    EVT_HANDLE hQuery = EvtQuery(nullptr, L"Application",
+        L"*[System[(EventID=1000)]]",
+        EvtQueryChannelPath | EvtQueryReverseDirection);
+    if (hQuery == nullptr) {
+        ForensicsAppendLine(out, L"(could not open the Application event log)");
+        return;
+    }
+    int kept = 0;
+    for (int scanned = 0; scanned < 300 && kept < 20; ++scanned) {
+        EVT_HANDLE hEvent = nullptr;
+        DWORD returned = 0;
+        if (!EvtNext(hQuery, 1, &hEvent, INFINITE, 0, &returned) || returned == 0) {
+            break; // no more events
+        }
+        // Render the event as XML and keep it if it blames AUDIODG.EXE.
+        DWORD bufSize = 0, bufUsed = 0, propCount = 0;
+        EvtRender(nullptr, hEvent, EvtRenderEventXml, 0, nullptr, &bufUsed, &propCount);
+        std::wstring xml;
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && bufUsed > 0) {
+            std::vector<wchar_t> buf(bufUsed / sizeof(wchar_t) + 1, 0);
+            bufSize = (DWORD)(buf.size() * sizeof(wchar_t));
+            if (EvtRender(nullptr, hEvent, EvtRenderEventXml, bufSize,
+                          buf.data(), &bufUsed, &propCount)) {
+                xml.assign(buf.data());
+            }
+        }
+        EvtClose(hEvent);
+        if (xml.find(L"AUDIODG.EXE") == std::wstring::npos &&
+            xml.find(L"audiodg.exe") == std::wstring::npos) {
+            continue;
+        }
+        ++kept;
+        wchar_t head[64] = {};
+        StringCchPrintfW(head, ARRAYSIZE(head), L"--- crash event %d ---", kept);
+        ForensicsAppendLine(out, head);
+        // Cap each event: the XML carries everything (faulting module,
+        // exception code, offset) but can be long.
+        if (xml.size() > 4000) {
+            xml.resize(4000);
+            xml += L"\r\n...(event XML truncated)...";
+        }
+        out += xml;
+        out += L"\r\n";
+    }
+    EvtClose(hQuery);
+    if (kept == 0) {
+        ForensicsAppendLine(out, L"(no AUDIODG.EXE Application Error events found)");
+    }
+}
+
+static void ForensicsAppendWerArchive(std::wstring& out) {
+    ForensicsAppendLine(out, L"===== WER REPORT ARCHIVE (AUDIODG.EXE) =====");
+    const wchar_t* base =
+        L"C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive\\";
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = std::wstring(base) + L"AppCrash_AUDIODG.EXE_*";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        ForensicsAppendLine(out, L"(no archived AUDIODG.EXE crash reports)");
+        return;
+    }
+    int n = 0;
+    do {
+        if ((fd.dwAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+            continue;
+        }
+        if (++n > 10) {
+            ForensicsAppendLine(out, L"...(more archived reports omitted)...");
+            break;
+        }
+        wchar_t head[320] = {};
+        StringCchPrintfW(head, ARRAYSIZE(head), L"--- %s ---", fd.cFileName);
+        ForensicsAppendLine(out, head);
+        // The Report.wer inside names the faulting module + exception.
+        std::wstring wer = std::wstring(base) + fd.cFileName + L"\\Report.wer";
+        HANDLE wh = CreateFileW(wer.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                                nullptr);
+        if (wh != INVALID_HANDLE_VALUE) {
+            char buf[2048] = {};
+            DWORD got = 0;
+            if (ReadFile(wh, buf, sizeof(buf) - 1, &got, nullptr) && got > 0) {
+                // Report.wer is UTF-16LE (with BOM) in practice; sniff the
+                // BOM instead of guessing. (The old code tried UTF-8 first,
+                // which "succeeded" on a single char of UTF-16 and produced
+                // garbage.)
+                wchar_t wbuf[2048] = {};
+                const unsigned char* ub = (const unsigned char*)buf;
+                if (got >= 2 && ub[0] == 0xFF && ub[1] == 0xFE) {
+                    // UTF-16LE: copy raw, skipping the BOM.
+                    size_t wn = (got - 2) / sizeof(wchar_t);
+                    if (wn > ARRAYSIZE(wbuf) - 1) wn = ARRAYSIZE(wbuf) - 1;
+                    memcpy(wbuf, buf + 2, wn * sizeof(wchar_t));
+                    wbuf[wn] = 0;
+                } else {
+                    // UTF-8 (with or without BOM) or ANSI: lossy convert.
+                    // Use the byte count, not -1: the buffer isn't a C
+                    // string and may contain embedded NULs.
+                    const char* src = buf;
+                    int srclen = (int)got;
+                    if (got >= 3 && ub[0] == 0xEF && ub[1] == 0xBB &&
+                        ub[2] == 0xBF) {
+                        src += 3; // skip UTF-8 BOM
+                        srclen -= 3;
+                    }
+                    MultiByteToWideChar(CP_UTF8, 0, src, srclen, wbuf,
+                                        ARRAYSIZE(wbuf) - 1);
+                }
+                out += wbuf;
+                out += L"\r\n";
+            }
+            CloseHandle(wh);
+        } else {
+            ForensicsAppendLine(out, L"(Report.wer not readable)");
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void ForensicsAppendCrashDumps(std::wstring& out) {
+    ForensicsAppendLine(out, L"===== CRASH DUMPS (C:\\CrashDumps) =====");
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW(L"C:\\CrashDumps\\audiodg.exe.*.dmp", &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = FindFirstFileW(L"C:\\CrashDumps\\AUDIODG.EXE.*.dmp", &fd);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        ForensicsAppendLine(out,
+            L"(no audiodg.exe dumps -- set up C:\\CrashDumps capture to get one)");
+        return;
+    }
+    do {
+        if ((fd.dwAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+        const ULONGLONG bytes =
+            (static_cast<ULONGLONG>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        SYSTEMTIME st = {};
+        FileTimeToSystemTime(&fd.ftLastWriteTime, &st);
+        wchar_t line[384] = {};
+        StringCchPrintfW(line, ARRAYSIZE(line),
+            L"%s  (%llu KB, written %04d-%02d-%02d %02d:%02d)",
+            fd.cFileName, bytes / 1024,
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+        ForensicsAppendLine(out, line);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static DWORD WINAPI ForensicsThread(LPVOID param) {
+    // Input was captured on the UI thread (no race with the live snapshot).
+    std::unique_ptr<ForensicsInput> in(static_cast<ForensicsInput*>(param));
+    const HWND hwnd = in->hwnd;
+    std::wstring report;
+    ForensicsAppendLine(report, L"MiniEQ crash forensics");
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t when[128] = {};
+    StringCchPrintfW(when, ARRAYSIZE(when),
+        L"Collected %04d-%02d-%02d %02d:%02d:%02d on this machine",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    ForensicsAppendLine(report, when);
+    if (!in->snap.deviceName.empty()) {
+        ForensicsAppendLine(report, (L"Device: " + in->snap.deviceName).c_str());
+    }
+    ForensicsAppendLine(report, L"");
+    ForensicsAppendLine(report, L"===== CURRENT DIAGNOSIS =====");
+    report += MiniEQ_FormatReport(in->snap, in->verdict);
+    report += L"\r\n";
+    ForensicsAppendEventLog(report);
+    report += L"\r\n";
+    ForensicsAppendWerArchive(report);
+    report += L"\r\n";
+    ForensicsAppendCrashDumps(report);
+    report += L"\r\n";
+    ForensicsAppendLine(report, L"===== APO TRACE LOG (last 64 KB) =====");
+    const std::wstring tail =
+        ForensicsLogTail(MiniEQ_DiagLogPath(), 64LL * 1024);
+    report += tail.empty() ? L"(log empty or unavailable)" : tail;
+    report += L"\r\n";
+
+    // Write UTF-16 with BOM to the Desktop.
+    wchar_t desktop[MAX_PATH] = {};
+    auto result = std::unique_ptr<ForensicsResult>(
+        new (std::nothrow) ForensicsResult());
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr,
+                                   0, desktop)) && desktop[0] != 0 &&
+        result) {
+        wchar_t name[128] = {};
+        StringCchPrintfW(name, ARRAYSIZE(name),
+            L"MiniEQ-forensics-%04d%02d%02d-%02d%02d%02d.txt",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        result->path = std::wstring(desktop) + L"\\" + name;
+        HANDLE h = CreateFileW(result->path.c_str(), GENERIC_WRITE, 0,
+                               nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            const wchar_t bom = 0xFEFF;
+            const DWORD want =
+                (DWORD)(sizeof(bom) + report.size() * sizeof(wchar_t));
+            DWORD written = 0;
+            // WriteFile may report success on a partial write: verify the
+            // full byte count landed, BOM included.
+            BOOL wok = WriteFile(h, &bom, sizeof(bom), &written, nullptr);
+            DWORD w2 = 0;
+            if (wok && written == sizeof(bom)) {
+                wok = WriteFile(h, report.data(),
+                                (DWORD)(report.size() * sizeof(wchar_t)),
+                                &w2, nullptr);
+                written += w2;
+            }
+            result->ok = (wok != FALSE && written == want);
+            CloseHandle(h);
+        }
+    }
+    MiniEQ_AppLogCat(L"DIAG", L"forensics %s: %s",
+                     (result && result->ok) ? L"written" : L"FAILED",
+                     (result && result->ok) ? result->path.c_str()
+                                            : L"(no path)");
+    s_forensicsBusy.store(false, std::memory_order_release);
+    // The UI thread takes ownership; if the window died mid-run the message
+    // simply goes nowhere and the unique_ptr below cleans up. (PostMessage
+    // on a stale HWND fails silently -- no crash.)
+    if (result) {
+        PostMessageW(hwnd, WM_DC_FORENSICSDONE, 0,
+                     reinterpret_cast<LPARAM>(result.release()));
+    } else {
+        PostMessageW(hwnd, WM_DC_FORENSICSDONE, 1, 0);
+    }
+    return 0;
+}
+
+static void DcRunForensics(HWND hwnd) {
+    // Atomic check-and-set: the window may have been closed and reopened
+    // while a worker runs, so a second button (or a second click) must not
+    // start a second collection.
+    if (s_forensicsBusy.exchange(true, std::memory_order_acq_rel)) {
+        return; // one collection at a time
+    }
+    // Capture the diagnosis inputs on the UI thread so the worker never
+    // races the live snapshot.
+    std::unique_ptr<ForensicsInput> in(new (std::nothrow) ForensicsInput());
+    if (!in) {
+        s_forensicsBusy.store(false, std::memory_order_release);
+        return;
+    }
+    in->snap = s_lastSnap;
+    in->verdict = s_lastVerdict;
+    in->hwnd = hwnd;
+    EnableWindow(GetDlgItem(hwnd, IDC_DC_FORENSICS), FALSE); // busy feedback
+    HANDLE h = CreateThread(nullptr, 0, ForensicsThread, in.get(), 0, nullptr);
+    if (h != nullptr) {
+        in.release(); // the thread owns it now
+        CloseHandle(h);
+    } else {
+        EnableWindow(GetDlgItem(hwnd, IDC_DC_FORENSICS), TRUE);
+        s_forensicsBusy.store(false, std::memory_order_release);
+        MessageBoxW(hwnd, L"Could not start the forensics collection.",
+                    L"MiniEQ diagnostics", MB_OK | MB_ICONWARNING);
+    }
+}
+
 static void DcOnCreate(HWND hwnd) {
     s_font = DcMakeFont(false);
     s_fontBold = DcMakeFont(true);
@@ -1587,17 +1966,17 @@ static void DcOnCreate(HWND hwnd) {
         return ctl;
     };
 
-    s_hVerdict = makeStatic(IDC_DC_VERDICT, 12, 10, 596, 102, true, SS_LEFT);
+    s_hVerdict = makeStatic(IDC_DC_VERDICT, 12, 10, 736, 102, true, SS_LEFT);
 
     s_hGrpEngine = makeGroup(L"Audio engine", 12, 120, 288, 132);
     s_hEngine = makeStatic(IDC_DC_ENGINE, 22, 142, 268, 102, false, SS_LEFT);
-    s_hGrpReg = makeGroup(L"Registration", 308, 120, 300, 132);
-    s_hReg = makeStatic(IDC_DC_REG, 318, 142, 280, 102, false, SS_LEFT);
+    s_hGrpReg = makeGroup(L"Registration", 308, 120, 440, 132);
+    s_hReg = makeStatic(IDC_DC_REG, 318, 142, 420, 102, false, SS_LEFT);
 
-    s_hGrpSessions = makeGroup(L"Apps playing on this device", 12, 260, 596, 168);
+    s_hGrpSessions = makeGroup(L"Apps playing on this device", 12, 260, 736, 168);
     s_hSessions = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                                  22, 282, 576, 138, hwnd,
+                                  22, 282, 716, 138, hwnd,
                                   (HMENU)(INT_PTR)IDC_DC_SESSIONS, s_hInst, nullptr);
     SendMessageW(s_hSessions, WM_SETFONT, (WPARAM)s_font, TRUE);
     ListView_SetExtendedListViewStyle(s_hSessions, LVS_EX_FULLROWSELECT);
@@ -1614,11 +1993,11 @@ static void DcOnCreate(HWND hwnd) {
                            (LPARAM)&col);
     }
 
-    s_hGrpLog = makeGroup(L"Recent log (categorized)", 12, 436, 596, 168);
+    s_hGrpLog = makeGroup(L"Recent log (categorized)", 12, 436, 736, 168);
     s_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                              WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
                              WS_VSCROLL | ES_AUTOVSCROLL,
-                             22, 458, 576, 138, hwnd,
+                             22, 458, 716, 138, hwnd,
                              (HMENU)(INT_PTR)IDC_DC_LOG, s_hInst, nullptr);
     SendMessageW(s_hLog, WM_SETFONT, (WPARAM)s_font, TRUE);
 
@@ -1626,13 +2005,11 @@ static void DcOnCreate(HWND hwnd) {
     makeButton(IDC_DC_COPY, L"Copy report", 140, 616, 110);
     makeButton(IDC_DC_COPYLOG, L"Copy log", 258, 616, 100);
     makeButton(IDC_DC_FULLLOG, L"View full log", 366, 616, 110);
-    makeButton(IDC_DC_CLOSE, L"Close", 484, 616, 110);
+    makeButton(IDC_DC_FORENSICS, L"Crash forensics", 484, 616, 140);
+    makeButton(IDC_DC_CLOSE, L"Close", 632, 616, 104);
 
     SetTimer(hwnd, 1, 1000, nullptr);
     MiniEQ_DiagAsyncStart(&s_diagAsync, hwnd, WM_DC_DIAGDONE, s_endpoint);
-    // Fresh exclusive-mode probe for this window lifetime; the 1 s timer
-    // ticks below reuse the cached result (the raw probe churns audiodg).
-    MiniEQ_InvalidateExclusiveProbe(s_endpoint);
     RequestDiagRefresh();
 }
 
@@ -1671,8 +2048,6 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDC_DC_RUN:
             s_forceLogNext = true; // re-log the baseline transition
-            // Manual refresh: re-probe exclusive mode too (timer ticks don't).
-            MiniEQ_InvalidateExclusiveProbe(s_endpoint);
             RequestDiagRefresh();
             return 0;
         case IDC_DC_COPY:
@@ -1684,11 +2059,34 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_DC_FULLLOG:
             MiniEQ_ShowLogViewer(s_hInst, hwnd);
             return 0;
+        case IDC_DC_FORENSICS:
+            DcRunForensics(hwnd);
+            return 0;
         case IDC_DC_CLOSE:
             DestroyWindow(hwnd);
             return 0;
         }
         break;
+    case WM_DC_FORENSICSDONE: {
+        // Ownership of the heap result arrives in LPARAM (wp==1: worker
+        // couldn't even allocate the result -- treat as failure).
+        std::unique_ptr<ForensicsResult> result(
+            wp == 0 ? reinterpret_cast<ForensicsResult*>(lp) : nullptr);
+        EnableWindow(GetDlgItem(hwnd, IDC_DC_FORENSICS), TRUE);
+        if (result && result->ok && !result->path.empty()) {
+            MiniEQ_AppLogCat(L"DIAG", L"forensics report ready: %s",
+                             result->path.c_str());
+            MessageBoxW(hwnd,
+                (L"The forensics report was saved to your Desktop:\r\n\r\n" +
+                 result->path).c_str(),
+                L"MiniEQ crash forensics", MB_OK | MB_ICONINFORMATION);
+        } else {
+            MessageBoxW(hwnd,
+                L"Could not write the forensics report to your Desktop.",
+                L"MiniEQ crash forensics", MB_OK | MB_ICONWARNING);
+        }
+        return 0;
+    }
     case WM_CTLCOLORSTATIC: {
         const LRESULT r = DcOnCtlColorStatic((HDC)wp, (HWND)lp);
         if (r != 0) {
@@ -1722,7 +2120,6 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_loggedEnh = DiagEnhancements::Unknown;
         s_loggedHb = false;
         s_loggedSessSig.clear();
-        s_loggedExSig.clear();
         s_shownVerdictTitle.clear();
         s_lastLogSize = 0;
         s_lastSessListSig.clear();
@@ -1753,7 +2150,7 @@ void MiniEQ_ShowDiagCenter(HINSTANCE hInst, HWND hParent) {
 
     CreateWindowExW(0, kDcClass, L"MiniEQ Diagnostics Center",
                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                    CW_USEDEFAULT, CW_USEDEFAULT, 620, 702,
+                    CW_USEDEFAULT, CW_USEDEFAULT, 760, 702,
                     hParent, nullptr, hInst, nullptr);
     if (s_hDlg != nullptr) {
         ShowWindow(s_hDlg, SW_SHOW);

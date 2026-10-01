@@ -43,12 +43,23 @@
       <Directory Id="ProgramMenuFolder">
         <Directory Id="ApplicationProgramsFolder" Name="MiniEQ" />
       </Directory>
+      <!--
+        Machine-wide settings mirror (C:\ProgramData\MiniEQ\devices.ini):
+        the audio engine cannot reach the interactive user's %APPDATA%, so
+        the APO cold-starts from this mirror when the UI isn't running. The
+        installer creates it with Users write access because a standard
+        (non-elevated) UI cannot create folders directly under ProgramData.
+      -->
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="CommonAppDataMiniEQ" Name="MiniEQ" />
+      </Directory>
     </Directory>
 
     <Feature Id="ProductFeature" Title="MiniEQ" Level="1" Description="MiniEQ app and audio engine plug-in.">
       <ComponentRef Id="Comp_MiniEQ_exe" />
       <ComponentRef Id="Comp_MiniEQ_APO_dll" />
       <ComponentRef Id="Comp_StartMenuShortcut" />
+      <ComponentRef Id="Comp_CommonAppDataDir" />
     </Feature>
 
     <Component Id="Comp_MiniEQ_exe"
@@ -95,6 +106,22 @@
             Source="$(var.BinDir)\MiniEQ_APO.dll"
             KeyPath="yes"
             SelfRegCost="1" />
+    </Component>
+
+    <!--
+      Machine-wide settings mirror directory. KeyPath is the folder itself
+      (CreateFolder); the Permission element grants Users full control so
+      the non-elevated UI can write devices.ini and the audio engine can
+      read it. Removed on uninstall only if empty (RemoveFolder On="uninstall"
+      is deliberately omitted -- another version's mirror may be in use).
+    -->
+    <Component Id="Comp_CommonAppDataDir"
+               Guid="248BDB29-5FF8-4919-8F86-AF721EFFB1D7"
+               Directory="CommonAppDataMiniEQ"
+               KeyPath="yes">
+      <CreateFolder>
+        <Permission User="Users" GenericAll="yes" />
+      </CreateFolder>
     </Component>
 
     <!--

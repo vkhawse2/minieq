@@ -91,9 +91,11 @@ struct DiagSnapshot {
     std::vector<DiagSessionInfo> sessions;
     bool         anySessionActive = false;
     // Exclusive layer: an app holding this endpoint in WASAPI exclusive mode
-    // bypasses the engine (and every APO) by Windows design. Probed by
-    // attempting a shared-mode IAudioClient::Initialize and checking for
-    // AUDCLNT_E_DEVICE_IN_USE -- quick, no stream is left running.
+    // bypasses the engine (and every APO) by Windows design. Deliberately
+    // NOT probed live anymore: the old IAudioClient check created a real
+    // audio stream and churned the engine (audiodg restarts every ~3 s), so
+    // this stays false and the UI explains the bypass instead of detecting
+    // it.
     bool         exclusiveHeld = false;
 };
 
@@ -120,11 +122,19 @@ struct DiagBundle {
 };
 DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId);
 
-// Drop the cached exclusive-mode probe result so the next diagnosis re-probes
-// the endpoint with a real WASAPI stream. Call when a diagnostics surface
-// opens and on manual Refresh -- never from the periodic timer (the raw probe
-// churns the audio engine, see CachedExclusiveProbe in diagcenter.cpp).
-void MiniEQ_InvalidateExclusiveProbe(const std::wstring& endpointId);
+// Circuit breaker: passive audiodg.exe crash-loop detection with an
+// automatic response. NoteUserAction starts a 60 s stand-down after a
+// deliberate engine disturbance (attach/detach/rebuild) so the detector
+// doesn't mistake the user's own churn for a crash loop. Poll feeds the
+// detector from the main window's status timer (~every 5 s) and fires the
+// breaker non-blockingly; the outcome arrives as WM_APP_BREAKER_DONE.
+void MiniEQ_BreakerNoteUserAction();
+void MiniEQ_BreakerPoll(HWND owner);
+#define WM_APP_BREAKER_DONE (WM_APP + 103)
+// wParam outcomes for WM_APP_BREAKER_DONE:
+enum { BreakerOutcomeLaunched = 0, BreakerOutcomeUacDeclined = 1,
+       BreakerOutcomeLaunchFailed = 2, BreakerOutcomePartial = 3,
+       BreakerOutcomeSweepFailed = 4 };
 
 // Background diagnosis worker: runs the heavy probes off the UI thread and
 // hands the finished bundle to the window via a posted message, so the

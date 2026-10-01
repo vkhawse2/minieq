@@ -2,13 +2,13 @@
 //
 // A bank of up to MINIEQ_MAX_BANDS biquad peaking filters (RBJ cookbook) plus
 // a master gain stage, with an optional bs2b-style Bauer crossfeed
-// ("Virtualization") for headphone listening. One instance handles all
+// ("Crossfeed") for headphone listening. One instance handles all
 // channels of one audio stream. The active band count (5 or 10) comes from
 // the settings toggle.
 //
 // Real-time notes: after construction, Process() performs no allocation and
 // no syscalls. UpdateGains() only does arithmetic. The crossfeed state is
-// heap-allocated lazily -- it exists only while virtualization is turned on,
+// heap-allocated lazily -- it exists only while crossfeed is turned on,
 // so the toggle costs zero RAM and zero per-sample CPU when off.
 
 #pragma once
@@ -74,6 +74,20 @@ private:
     static void PeakingCoeffs(float freqHz, float q, float gainDb,
                               float sampleRateHz, Biquad* out);
 
+    // A band whose center sits at/above 45% of the sample rate is disabled
+    // (its coefficients stay flat at 0 dB): RBJ peaking coefficients go
+    // unstable near Nyquist, and a 14/16 kHz band is meaningless at an
+    // 8/16 kHz stream rate. The band's gains keep sweeping/storing normally
+    // so a later format change to a higher rate brings it back correctly.
+    bool BandNyquistSafe(int band) const {
+        return MiniEQ_BandFreq(m_numBands, band) < 0.45f * m_sampleRate;
+    }
+    // Effective gain for coefficient computation: 0 dB for Nyquist-unsafe
+    // bands, the live (swept) gain otherwise.
+    float BandEffectiveGain(int band) const {
+        return BandNyquistSafe(band) ? m_liveGainDb[band] : 0.0f;
+    }
+
     // ---- Click-free parameter changes ----
     // The live coefficients (m_bands / m_masterLinear) are swept toward
     // their targets once per audio frame with a one-pole ramp (~8 ms time
@@ -104,6 +118,25 @@ private:
     bool      m_coeffsDirty = false;           // gains moved: recompute coeffs
     uint32_t  m_coeffTick = 0;                 // decimates the recompute
 
+    // ---- 5<->10 band layout crossfade ----
+    // Switching band count moves every center frequency at once. Keeping
+    // the old filter states under the new coefficients would glitch, so
+    // the pre-switch bank (coefficients + state + master) is frozen into
+    // m_oldBands/m_oldState and keeps filtering while a short (~20 ms)
+    // crossfade blends to the rebuilt main bank. The new bank starts with
+    // fresh (zeroed) state, so its startup transient is fully masked by
+    // the fade, which begins at 100% old. Fixed-size, allocation-free,
+    // RT-safe. A second switch mid-fade simply re-freezes from the main
+    // bank's live state (the dropped in-flight residual is bounded and
+    // brief -- far below the click the old instant switch made).
+    Biquad    m_oldBands[MINIEQ_MAX_BANDS];
+    Tdf2State m_oldState[MINIEQ_MAX_CHANNELS][MINIEQ_MAX_BANDS];
+    int       m_oldNumBands = 0;
+    float     m_oldMaster = 1.0f;
+    float     m_layoutMix = 1.0f;      // 1 = new bank only, 0 = old only
+    float     m_layoutMixStep = 0.0f;  // per-frame fade step
+    uint32_t  m_layoutXfadeLeft = 0;  // frames remaining in the crossfade
+
     // ---- Bypass crossfade ----
     // The old code hard-switched between dry and wet: a click. Now the
     // bypass control ramps a dry/wet mix over ~5 ms. A transition needs the
@@ -115,7 +148,7 @@ private:
     float*    m_scratch = nullptr;
     uint32_t  m_scratchFrames = 0;
 
-    // ---- Optional headphone virtualization (bs2b-style Bauer crossfeed) ----
+    // ---- Optional headphone crossfeed (bs2b-style Bauer) ----
     // Lazily allocated: null until the user turns the toggle on.
     // Coefficients follow the bs2b derivation (default preset: lowpass
     // Fc = 700 Hz at Gd = -6.75 dB, highboost derived for Fc_h ~= 995 Hz):

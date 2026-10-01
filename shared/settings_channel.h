@@ -84,7 +84,14 @@ typedef struct EqSettings {
 //   2: added buildId (repurposed the trailing reserved bytes, so the struct
 //      size is unchanged): the APO stamps the build it was compiled from,
 //      letting the UI tell a stale loaded DLL apart from the installed one.
-#define MINIEQ_STATUS_VERSION 2
+//   3: appended `sequence` (struct grew by 8): a seqlock counter bracketing
+//      the APO worker's field writes, so the UI's status poll takes a
+//      coherent snapshot instead of a torn one. Old/new combinations fail
+//      safe: the UI validates structSize+version before reading (a v1/v2
+//      APO's channel has no sequence field, so the UI falls back to a
+//      best-effort plain copy; a v3 APO's channel is a prefix of what an
+//      old UI maps).
+#define MINIEQ_STATUS_VERSION 3
 
 typedef struct MiniEQApoStatus {
     uint32_t structSize;             // sizeof(MiniEQApoStatus): versioning
@@ -97,15 +104,26 @@ typedef struct MiniEQApoStatus {
     volatile int32_t sampleRate;     // locked format sample rate
     volatile int32_t initOk;         // Initialize succeeded
     char             buildId[16];    // APO build id (short commit SHA), NUL-terminated
+    int64_t          sequence;       // (v3+) seqlock: odd = worker mid-write
 } MiniEQApoStatus;
 
-// "MiniEQ_{sanitized-endpoint-id}" -- caller supplies a buffer.
+// "Global\MiniEQ_{16-hex FNV-1a of endpoint-id}" -- caller supplies a buffer.
 void MiniEQ_MappingNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
 
-// "Global\MiniEQ_Status_{sanitized-endpoint-id}" -- caller supplies a buffer.
+// "Global\MiniEQ_Status_{16-hex FNV-1a of endpoint-id}" -- caller supplies a buffer.
 void MiniEQ_StatusNameForEndpoint(const wchar_t* endpointId,
                                   wchar_t* outName, size_t outNameChars);
+
+// Legacy (pre-hash, sanitize-and-truncate) names: open-only fallback for a
+// new UI talking to an old APO during the upgrade window. Never create
+// channels under these names.
+void MiniEQ_LegacyMappingNameForEndpoint(const wchar_t* endpointId,
+                                         wchar_t* outName,
+                                         size_t outNameChars);
+void MiniEQ_LegacyStatusNameForEndpoint(const wchar_t* endpointId,
+                                        wchar_t* outName,
+                                        size_t outNameChars);
 
 // Global on/off (UI -> APO): one flag shared by every endpoint. The APO
 // creates "Global\MiniEQ__Enabled" -- it must be the creator, because only
@@ -129,6 +147,31 @@ void MiniEQ_GlobalStateName(wchar_t* outName, size_t outNameChars);
 
 // Fill an EqSettings with flat (no-op) values, sequence = 0 (even = consistent).
 void MiniEQ_SettingsInitFlat(EqSettings* s);
+
+// Machine-wide settings file (CSIDL_COMMON_APPDATA\MiniEQ\devices.ini).
+// The UI mirrors per-device settings here on every save, so the APO --
+// which cannot reach the interactive user's %APPDATA% from session 0 --
+// can cold-start with the user's EQ instead of flat defaults when the UI
+// isn't running. Returns nonzero and fills `out` (NUL-terminated) when the
+// path resolves; the caller must still handle a missing/unreadable file.
+int MiniEQ_MachineIniPath(wchar_t* out, size_t outChars);
+
+// Parse one device's settings from an INI file written in the
+// MiniEQ_SaveDeviceSettings layout. Returns nonzero when the device section
+// was present (Band0 decides); `out` starts from flat defaults.
+int MiniEQ_LoadDeviceSettingsFromIni(const wchar_t* iniPath,
+                                     const wchar_t* endpointId,
+                                     EqSettings* out);
+
+// Bounded seqlock read of a live EqSettings channel. The writer brackets
+// every update with InterlockedIncrement64 (odd = write in flight, even =
+// consistent); this snapshots the counter, copies the struct, and re-reads
+// the counter, keeping the copy only when both reads match and are even.
+// Retries up to `tries` times, then gives up -- never spins forever.
+// Returns nonzero with a consistent copy in *out, 0 if the writer kept
+// racing (the caller should keep its previous state).
+// `src` is the live mapped view (may be written concurrently).
+int MiniEQ_SettingsReadSeqlock(const EqSettings* src, EqSettings* out, int tries);
 
 #ifdef __cplusplus
 }
