@@ -246,8 +246,11 @@ bool MiniEQ_FlipDefaultFormat(const std::wstring& endpointId, std::wstring* deta
     bool ok = WriteDeviceFormatBlob(dev, flipped, detail);
     if (ok) {
         // Let the engine tear the graph down and rebuild it on the new
-        // format before restoring the original.
-        Sleep(900);
+        // format before restoring the original. 350 ms is plenty: the
+        // engine typically rebuilds within a few hundred ms, and even if
+        // it coalesces the two writes into a single rebuild, the end state
+        // (original format, fresh graph) is what the caller verifies.
+        Sleep(350);
         ok = WriteDeviceFormatBlob(dev, orig, detail);
         if (!ok && detail != nullptr) {
             *detail = L"flipped, but couldn't restore the original format -- "

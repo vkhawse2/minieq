@@ -799,6 +799,9 @@ struct RecoveryDone {
 // Strong verification: the heartbeat must ADVANCE, not just exist. Returns
 // 0 = advancing (MiniEQ is processing), 1 = path rebuilt but nothing is
 // playing (can't prove it yet), 2 = still no heartbeat.
+// Polls every 250 ms: the APO heartbeat advances per audio block (~10 ms),
+// so this keeps the two-sample confidence of the old 1 s cadence while
+// finishing in ~3 s instead of ~13 s.
 static int VerifyHeartbeatAdvance(const std::wstring& endpoint) {
     if (!MiniEQ_AudioPlaying(endpoint, nullptr)) {
         return 1;
@@ -806,13 +809,13 @@ static int VerifyHeartbeatAdvance(const std::wstring& endpoint) {
     DiagBundle s0 = MiniEQ_RunDiagnosisLocked(endpoint);
     int64_t base = s0.snap.statusChannelOk ? s0.snap.heartbeatCalls : 0;
     for (int i = 0; i < 12; ++i) {
-        Sleep(1000);
+        Sleep(250);
         DiagBundle s = MiniEQ_RunDiagnosisLocked(endpoint);
         if (s.snap.statusChannelOk && s.snap.heartbeatCalls > base) {
             // One advancing sample isn't enough (the row-8 freshness rule
             // needs two); confirm with a second.
             const int64_t mid = s.snap.heartbeatCalls;
-            Sleep(1000);
+            Sleep(250);
             DiagBundle s2 = MiniEQ_RunDiagnosisLocked(endpoint);
             if (s2.snap.heartbeatCalls > mid) {
                 return 0;
@@ -937,7 +940,14 @@ static void OnRecoveryTap(int index) {
             return;
         }
     }
-    s_recResultText = L"Working\u2026 rebuilding the audio path.";
+    std::wstring working = L"Working\u2026 rebuilding the audio path.";
+    if (index == 1 && MiniEQ_AudioPlaying(s_endpoint, nullptr)) {
+        // Re-attach may briefly "unplug" the device, and Windows fails
+        // playing audio over to another output (e.g. laptop speakers).
+        // Pausing first makes the whole thing silent.
+        working += L" Tip: pause your music for a silent re-attach.";
+    }
+    s_recResultText = working;
     UpdateRecoveryTexts();
     SpawnRecoveryJob(index);
 }

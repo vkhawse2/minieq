@@ -471,6 +471,19 @@ static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
 
+    // 0. Probe first: if the active slot already points at us, the registry
+    //    is already correct. We still run the cheap repair layers (1-2)
+    //    below, but skip the slot rewrite AND the device restart -- the
+    //    restart briefly "unplugs" the endpoint and Windows fails any
+    //    playing audio over to another output (e.g. laptop speakers).
+    //    Skipping it also preserves a legitimate child-APO stash, which a
+    //    blind rewrite would clear. Returns S_FALSE in that case so the
+    //    caller can report "already attached, no restart needed".
+    bool alreadyAttached = false;
+    const bool probeOk = SUCCEEDED(
+        MiniEQ_IsAttachedToEndpoint(endpointId, &alreadyAttached));
+    const bool skipRewrite = probeOk && alreadyAttached;
+
     // 1. Repair layers 1+2 (COM class + APO declaration). The installer writes
     //    these via DllRegisterServer, but a failed/interrupted upgrade can
     //    leave them stale -- and the audio engine will not load the APO
@@ -503,7 +516,11 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     }
 
     // 3. Clear any stale child-APO stash so we start clean; AttachToSlot
-    //    re-stashes the real incumbent below.
+    //    re-stashes the real incumbent below. Skipped when the slot already
+    //    held us (step 0): the stash may be a legitimate displaced APO.
+    if (skipRewrite) {
+        return S_FALSE;
+    }
     MiniEQ_ClearChildApoClsid(endpointId);
 
     // 4. Attach to the active slot (stashes the incumbent as our child).
@@ -515,6 +532,7 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     //    send change notifications, so without this the engine keeps using
     //    the list from when the device was last connected ("attached but
     //    never loaded"). Best-effort: the attach itself already succeeded.
+    //    Only reached when the slot actually changed (see step 0).
     MiniEQ_ReenumerateEndpointDevice(endpointId);
 
     return S_OK;

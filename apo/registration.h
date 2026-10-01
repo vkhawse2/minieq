@@ -46,6 +46,10 @@ HRESULT MiniEQ_EnsureLogDirForInstall();
 // detach sweeps both slots.
 // NOTE: even elevated, administrators cannot CREATE subkeys under FxProperties;
 // the key already exists, so we open it and set the value in place.
+// Returns S_OK when the slot was (re)written and the endpoint device was
+// restarted to pick it up; S_FALSE when the slot already pointed at us --
+// the cheap repairs still ran, but the slot rewrite and the device restart
+// were skipped (the restart briefly moves playing audio to another output).
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId);
 HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId);
 

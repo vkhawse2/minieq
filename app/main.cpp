@@ -1385,15 +1385,26 @@ static int RunElevatedHelper(LPWSTR* argv, int argc) {
     HRESULT hr = attach ? MiniEQ_AttachToEndpoint(argv[2])
                         : MiniEQ_DetachFromEndpoint(argv[2]);
     if (SUCCEEDED(hr)) {
-        // Force the audio engine to re-read FxProperties immediately by
-        // restarting the endpoint's device (disable + enable). This makes
-        // attach/detach take effect without a computer restart, and without
-        // touching the Windows Audio service.
-        HRESULT hrReenum = MiniEQ_ReenumerateEndpointDevice(argv[2]);
-        if (SUCCEEDED(hrReenum)) {
+        // Attach owns its restart decision now: MiniEQ_AttachToEndpoint
+        // restarts the endpoint device (disable + enable) only when the
+        // slot actually changed, and returns S_FALSE when the slot already
+        // held us (restart skipped -- no audio interruption at all).
+        // Detach still needs the explicit restart below; its function does
+        // not do it.
+        bool restarted = false;
+        if (attach) {
+            restarted = (hr == S_OK);
+        } else {
+            restarted = SUCCEEDED(MiniEQ_ReenumerateEndpointDevice(argv[2]));
+        }
+        if (attach && hr == S_FALSE) {
             MessageBoxW(nullptr,
-                        attach ? L"MiniEQ is now attached to this device.\nThe device was restarted -- EQ is live. Audio will resume in a few seconds."
-                               : L"MiniEQ has been detached from this device.\nThe device was restarted. Audio will resume in a few seconds.",
+                        L"MiniEQ is already attached to this device.\nNo restart was needed -- your audio was not interrupted.",
+                        L"MiniEQ", MB_ICONINFORMATION);
+        } else if (restarted) {
+            MessageBoxW(nullptr,
+                        attach ? L"MiniEQ is now attached to this device.\nThe device was restarted -- EQ is live. During the restart your audio may briefly play through your speakers, then return to this device."
+                               : L"MiniEQ has been detached from this device.\nThe device was restarted. During the restart your audio may briefly play through your speakers.",
                         L"MiniEQ", MB_ICONINFORMATION);
         } else {
             MessageBoxW(nullptr,
@@ -1478,3 +1489,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
     CoUninitialize();
     return 0;
 }
+
