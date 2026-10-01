@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      efx_slot:
+        description: 'Route 1 experiment: build EFX-slot test binaries (EQ should survive spatial sound)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -17,7 +23,9 @@ jobs:
           # Stamp the short commit SHA into both binaries so the UI can tell
           # whether the audio engine is running a stale APO DLL.
           $sha = $env:GITHUB_SHA.Substring(0, 8)
-          cmake -S . -B build -A x64 "-DMINIEQ_BUILD_ID=$sha"
+          $efx = 'OFF'
+          if ('${{ inputs.efx_slot }}' -eq 'true') { $efx = 'ON' }
+          cmake -S . -B build -A x64 "-DMINIEQ_BUILD_ID=$sha" "-DMINIEQ_EFX_SLOT=$efx"
 
       - name: Build (Release)
         run: cmake --build build --config Release
@@ -43,7 +51,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: minieq-windows-x64
+          name: minieq-windows-x64${{ inputs.efx_slot && '-efx-test' || '' }}
           path: |
             build\stage\MiniEQ.exe
             build\stage\MiniEQ_APO.dll

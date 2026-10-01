@@ -20,5 +20,14 @@ if(NOT DEFINED MINIEQ_BUILD_ID)
     set(MINIEQ_BUILD_ID "dev")
 endif()
 
+# Route 1 experiment: attach the APO in the EFX slot instead of SFX. EFX runs
+# after all mixing at the endpoint, downstream of the spatial-sound render, so
+# an EQ there should survive spatial sound / Dolby Atmos. OFF by default (SFX,
+# current behavior); the CI test build enables it via -DMINIEQ_EFX_SLOT=ON.
+option(MINIEQ_EFX_SLOT "Attach the APO in the EFX slot (spatial-sound experiment)" OFF)
+if(MINIEQ_EFX_SLOT)
+    add_compile_definitions(MINIEQ_EFX_SLOT)
+endif()
+
 add_subdirectory(apo)
 add_subdirectory(app)

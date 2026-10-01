@@ -12,6 +12,25 @@
 static const wchar_t* kApoInterface0 = L"{FD7F2B29-24D0-4B5C-B177-592C39F9CA10}";
 // PKEY_FX_StreamEffectClsid -- the SFX slot in an endpoint's FxProperties.
 static const wchar_t* kFxSfxSlot = L"{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5";
+// PKEY_FX_EndpointEffectClsid -- the EFX slot in an endpoint's FxProperties.
+// EFX runs after all mixing at the endpoint, downstream of the spatial-sound
+// render, so an EQ attached here is not bypassed when spatial sound is on.
+// (Route 1 experiment: does the EQ survive spatial/Atmos from the EFX slot?)
+static const wchar_t* kFxEfxSlot = L"{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},7";
+
+// Active effect slot. SFX by default; builds compiled with MINIEQ_EFX_SLOT
+// default to EFX (test builds). MiniEQ_SetEffectSlot overrides at runtime --
+// reserved for a future slot-choice UI; nothing calls it yet.
+static const wchar_t* g_fxSlot =
+#ifdef MINIEQ_EFX_SLOT
+    kFxEfxSlot;
+#else
+    kFxSfxSlot;
+#endif
+
+void MiniEQ_SetEffectSlot(bool useEfx) {
+    g_fxSlot = useEfx ? kFxEfxSlot : kFxSfxSlot;
+}
 
 static HRESULT ClsidString(wchar_t* out, size_t cch) {
     if (StringFromGUID2(CLSID_MiniEQAPO, out, (int)cch) == 0) {
@@ -392,7 +411,10 @@ static HRESULT OpenFxPropertiesForWrite(const wchar_t* endpointId, HKEY* out) {
     return S_OK;
 }
 
-HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
+// Forward: defined below MiniEQ_AttachToEndpoint.
+static HRESULT DetachFromSlot(const wchar_t* endpointId, const wchar_t* slot);
+
+static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
     wchar_t clsid[64] = {};
     HRESULT hr = ClsidString(clsid, ARRAYSIZE(clsid));
@@ -404,25 +426,35 @@ HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
     hr = OpenFxPropertiesForWrite(endpointId, &h);
     if (FAILED(hr)) return hr;
 
-    // R2: chain, don't just evict. Stash the incumbent SFX APO (if it is a
+    // R2: chain, don't just evict. Stash the incumbent APO (if it is a
     // real third-party CLSID and not us) so the engine keeps running it as
     // our child. Best-effort: a stash failure must not block the attach.
     wchar_t incumbent[64] = {};
     DWORD qsize = sizeof(incumbent), qtype = 0;
-    LONG qrc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &qtype,
+    LONG qrc = RegQueryValueExW(h, slot, nullptr, &qtype,
                                (BYTE*)incumbent, &qsize);
     if (qrc == ERROR_SUCCESS && qtype == REG_SZ && incumbent[0] != L'\0' &&
         _wcsicmp(incumbent, clsid) != 0) {
         MiniEQ_StashChildApoClsid(endpointId, incumbent);
     }
 
-    LONG rc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ, (const BYTE*)clsid,
+    LONG rc = RegSetValueExW(h, slot, 0, REG_SZ, (const BYTE*)clsid,
                              (DWORD)((wcslen(clsid) + 1) * sizeof(wchar_t)));
     RegCloseKey(h);
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
 }
 
-HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
+HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
+    // EFX test builds: migrate, don't double up. If we are still sitting in
+    // the SFX slot from an earlier install, detach there first (restoring
+    // whatever we displaced) so the engine never instantiates us twice.
+    if (g_fxSlot == kFxEfxSlot) {
+        DetachFromSlot(endpointId, kFxSfxSlot);
+    }
+    return AttachToSlot(endpointId, g_fxSlot);
+}
+
+static HRESULT DetachFromSlot(const wchar_t* endpointId, const wchar_t* slot) {
     if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
     wchar_t key[512] = {};
     HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
@@ -446,12 +478,12 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
     // clobber an APO someone else installed after us.
     wchar_t current[64] = {};
     DWORD size = sizeof(current), type = 0;
-    rc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &type, (BYTE*)current,
+    rc = RegQueryValueExW(h, slot, nullptr, &type, (BYTE*)current,
                           &size);
     const bool ours = (rc == ERROR_SUCCESS && type == REG_SZ &&
                        _wcsicmp(current, clsid) == 0);
     if (ours) {
-        rc = RegDeleteValueW(h, kFxSfxSlot);
+        rc = RegDeleteValueW(h, slot);
         // Deleting a value that isn't there is fine.
         if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
         if (rc == ERROR_SUCCESS) {
@@ -462,7 +494,7 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
                 stashed[0] != L'\0') {
                 const DWORD wsize =
                     (DWORD)((wcslen(stashed) + 1) * sizeof(wchar_t));
-                const LONG wrc = RegSetValueExW(h, kFxSfxSlot, 0, REG_SZ,
+                const LONG wrc = RegSetValueExW(h, slot, 0, REG_SZ,
                                                (const BYTE*)stashed, wsize);
                 if (wrc == ERROR_SUCCESS) {
                     MiniEQ_ClearChildApoClsid(endpointId);
@@ -477,6 +509,17 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
     }
     RegCloseKey(h);
     return rc == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(rc);
+}
+
+HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId) {
+    HRESULT hr = DetachFromSlot(endpointId, g_fxSlot);
+    // EFX test builds: also sweep the SFX slot, in case we are still there
+    // from an earlier install.
+    if (g_fxSlot == kFxEfxSlot) {
+        const HRESULT hrSfx = DetachFromSlot(endpointId, kFxSfxSlot);
+        if (SUCCEEDED(hr)) hr = hrSfx;
+    }
+    return hr;
 }
 
 HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
@@ -503,7 +546,7 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
     }
     wchar_t value[64] = {};
     DWORD size = sizeof(value), type = 0;
-    rc = RegQueryValueExW(h, kFxSfxSlot, nullptr, &type, (BYTE*)value, &size);
+    rc = RegQueryValueExW(h, g_fxSlot, nullptr, &type, (BYTE*)value, &size);
     RegCloseKey(h);
     if (rc == ERROR_SUCCESS && type == REG_SZ) {
         *attached = (_wcsicmp(value, clsid) == 0);
