@@ -120,6 +120,12 @@ struct DiagBundle {
 };
 DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId);
 
+// Drop the cached exclusive-mode probe result so the next diagnosis re-probes
+// the endpoint with a real WASAPI stream. Call when a diagnostics surface
+// opens and on manual Refresh -- never from the periodic timer (the raw probe
+// churns the audio engine, see CachedExclusiveProbe in diagcenter.cpp).
+void MiniEQ_InvalidateExclusiveProbe(const std::wstring& endpointId);
+
 // Background diagnosis worker: runs the heavy probes off the UI thread and
 // hands the finished bundle to the window via a posted message, so the
 // Diagnostics Center / Checklist never freeze while data is loading. The

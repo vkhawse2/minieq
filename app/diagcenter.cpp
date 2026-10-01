@@ -25,6 +25,7 @@
 #include <string.h>
 #include <wchar.h>
 
+#include <map>
 #include <mutex>
 
 // PKEY_AudioEndpoint_Disable_SysFx -- the "Audio enhancements" switch.
@@ -371,13 +372,21 @@ static DeviceProps ReadDeviceProps(const std::wstring& endpointId) {
 // Exclusive-mode probe: does an app hold this endpoint in WASAPI exclusive
 // mode? Attempt a shared-mode IAudioClient::Initialize on the endpoint's mix
 // format: AUDCLNT_E_DEVICE_IN_USE means something already holds the device
-// exclusively. On success the client is released immediately without ever
-// starting a stream, so the probe leaves no trace. Any other failure
-// (device gone, engine hiccup) reports "not held" rather than a false red.
-static bool EndpointHasExclusiveStream(const std::wstring& endpointId) {
-    if (endpointId.empty()) {
-        return false;
-    }
+// exclusively. Any other failure (device gone, engine hiccup) reports
+// "not held" rather than a false red.
+//
+// 2026-10-01 -- CRITICAL: IAudioClient::Initialize creates a REAL audio stream
+// on the endpoint, and releasing it tears the stream down again. Run on the
+// 1 s / 1.5 s diagnosis timers (Diagnostics Center + Audio Path Checklist)
+// this visibly churns the Windows audio engine: audiodg.exe was observed
+// restarting every ~3 s in lockstep with the probes (96 restarts in ~6 min,
+// each one dropping playback and reloading our APO), and a probe racing the
+// engine teardown can fault the UI's diagnosis worker thread hard enough to
+// take the whole UI process down with it. The old "leaves no trace" comment
+// was wrong. The raw probe below therefore NEVER runs on a timer tick -- see
+// CachedExclusiveProbe. Timer ticks reuse the last result; only window-open
+// and manual Refresh re-probe.
+static bool ExclusiveProbeInner(const wchar_t* endpointId) {
     IMMDeviceEnumerator* pEnum = nullptr;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                 __uuidof(IMMDeviceEnumerator),
@@ -385,7 +394,7 @@ static bool EndpointHasExclusiveStream(const std::wstring& endpointId) {
         return false;
     }
     IMMDevice* pDev = nullptr;
-    HRESULT hr = pEnum->GetDevice(endpointId.c_str(), &pDev);
+    HRESULT hr = pEnum->GetDevice(endpointId, &pDev);
     pEnum->Release();
     if (FAILED(hr) || pDev == nullptr) {
         return false;
@@ -406,6 +415,55 @@ static bool EndpointHasExclusiveStream(const std::wstring& endpointId) {
     }
     pDev->Release();
     return exclusive;
+}
+
+// SEH shield: the probe runs on the diagnosis worker thread while the audio
+// engine may be mid-teardown; an access violation there must not kill the UI
+// process. Deliberately free of C++ objects so __try is legal under /EHsc.
+static bool EndpointHasExclusiveStream(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') {
+        return false;
+    }
+    __try {
+        return ExclusiveProbeInner(endpointId);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        MiniEQ_AppLogCat(L"DIAG",
+            L"exclusive probe: SEH 0x%08X during WASAPI probe, treating as not held",
+            static_cast<unsigned>(GetExceptionCode()));
+        return false;
+    }
+}
+
+// Cached exclusive-probe result, keyed by endpoint. MiniEQ_RunDiagnosis serves
+// the 1 s / 1.5 s timer ticks from this cache; the windows drop the entry via
+// MiniEQ_InvalidateExclusiveProbe when they open and on manual Refresh.
+static std::mutex s_exclMutex;
+static std::map<std::wstring, bool> s_exclCache;
+
+static bool CachedExclusiveProbe(const std::wstring& endpointId) {
+    if (endpointId.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(s_exclMutex);
+    const auto it = s_exclCache.find(endpointId);
+    if (it != s_exclCache.end()) {
+        return it->second;
+    }
+    const bool v = EndpointHasExclusiveStream(endpointId.c_str());
+    s_exclCache[endpointId] = v;
+    return v;
+}
+
+// Drop the cached exclusive-probe result so the next diagnosis re-probes.
+// Call when a diagnostics surface opens and on manual Refresh -- never from
+// the periodic timer.
+void MiniEQ_InvalidateExclusiveProbe(const std::wstring& endpointId) {
+    std::lock_guard<std::mutex> lk(s_exclMutex);
+    if (endpointId.empty()) {
+        s_exclCache.clear();
+    } else {
+        s_exclCache.erase(endpointId);
+    }
 }
 
 // Per-app sessions on this endpoint with live peak levels.
@@ -601,8 +659,10 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
 
     // Exclusive-mode layer: an app holding the endpoint exclusively bypasses
     // the engine (and every APO) by Windows design -- the one bypass no
-    // MiniEQ setting can fix.
-    s.exclusiveHeld = EndpointHasExclusiveStream(endpointId);
+    // MiniEQ setting can fix. Served from the probe cache: the raw WASAPI
+    // probe creates a real stream, so it only re-runs on window-open and
+    // manual Refresh (see CachedExclusiveProbe), never on the timer tick.
+    s.exclusiveHeld = CachedExclusiveProbe(endpointId);
     return s;
 }
 
@@ -1570,6 +1630,9 @@ static void DcOnCreate(HWND hwnd) {
 
     SetTimer(hwnd, 1, 1000, nullptr);
     MiniEQ_DiagAsyncStart(&s_diagAsync, hwnd, WM_DC_DIAGDONE, s_endpoint);
+    // Fresh exclusive-mode probe for this window lifetime; the 1 s timer
+    // ticks below reuse the cached result (the raw probe churns audiodg).
+    MiniEQ_InvalidateExclusiveProbe(s_endpoint);
     RequestDiagRefresh();
 }
 
@@ -1608,6 +1671,8 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDC_DC_RUN:
             s_forceLogNext = true; // re-log the baseline transition
+            // Manual refresh: re-probe exclusive mode too (timer ticks don't).
+            MiniEQ_InvalidateExclusiveProbe(s_endpoint);
             RequestDiagRefresh();
             return 0;
         case IDC_DC_COPY:

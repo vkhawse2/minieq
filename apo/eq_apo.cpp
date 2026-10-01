@@ -1256,11 +1256,14 @@ try {
         // First-call diagnostic, deferred: the RT thread only records the
         // facts into relaxed atomics; the worker thread writes the trace
         // line, so no file I/O ever happens on the audio thread.
-        if (!m_rtFirstCallPending.exchange(true, std::memory_order_relaxed)) {
+        // Once-per-instance: m_rtFirstCallDone latches on the first call so
+        // the worker's consume (exchange(false)) can't re-arm this.
+        if (!m_rtFirstCallDone.exchange(true, std::memory_order_relaxed)) {
             m_rtFirstCallFrames.store(validFrames, std::memory_order_relaxed);
             m_rtFirstCallChannels.store(m_channels, std::memory_order_relaxed);
             m_rtFirstCallBypass.store(m_localCopy.bypass, std::memory_order_relaxed);
             m_rtFirstCallGain0.store(m_localCopy.bandGainDb[0], std::memory_order_relaxed);
+            m_rtFirstCallPending.store(true, std::memory_order_relaxed);
         }
     }
 

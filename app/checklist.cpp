@@ -761,6 +761,9 @@ void ClOnCreate(HWND hwnd) {
 
     SetTimer(hwnd, 1, 1500, nullptr);
     MiniEQ_DiagAsyncStart(&s_clDiag, hwnd, WM_CL_DIAGDONE, s_endpoint);
+    // Fresh exclusive-mode probe for this window lifetime; the 1.5 s timer
+    // ticks below reuse the cached result (the raw probe churns audiodg).
+    MiniEQ_InvalidateExclusiveProbe(s_endpoint);
     RefreshChecklist();
 }
 
@@ -1115,6 +1118,8 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // re-verifies from this instant.
             s_freshCalls = 0;
             s_freshTick = 0;
+            // Manual refresh: re-probe exclusive mode too (timer ticks don't).
+            MiniEQ_InvalidateExclusiveProbe(s_endpoint);
             RefreshChecklist();
             MiniEQ_AppLogCat(L"UI", L"checklist refreshed");
             return 0;

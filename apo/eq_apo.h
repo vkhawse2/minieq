@@ -194,6 +194,11 @@ private:
     std::atomic<int32_t>  m_rtFirstCallBypass{0};    // bypass flag, 1st call
     std::atomic<float>    m_rtFirstCallGain0{0.0f};  // band 0 gain, 1st call
     std::atomic<bool>     m_rtFirstCallPending{false};
+    // 2026-10-01: the RT side used to re-arm m_rtFirstCallPending on EVERY
+    // APOProcess call (it set the flag whenever the worker had just consumed
+    // it), so the worker logged "FIRST call" every 100 ms forever. This latch
+    // makes the first-call diagnostic truly once-per-instance.
+    std::atomic<bool>     m_rtFirstCallDone{false};
     std::atomic<int32_t>  m_rtGlobalChangeValue{0};
     std::atomic<int64_t>  m_rtGlobalChangeSeq{0};
     std::atomic<bool>     m_rtGlobalChangePending{false};
