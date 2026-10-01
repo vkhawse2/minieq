@@ -89,12 +89,20 @@ private:
     uint32_t  m_channels = 0;
     int       m_numBands = MINIEQ_NUM_BANDS;
     Biquad    m_bands[MINIEQ_MAX_BANDS];       // live coefficients (RT)
-    Biquad    m_target[MINIEQ_MAX_BANDS];      // where UpdateGains() writes
+    float     m_liveGainDb[MINIEQ_MAX_BANDS] = {};  // live gains, swept smoothly
+    float     m_targetGainDb[MINIEQ_MAX_BANDS] = {};// where UpdateGains() writes
+    // NOTE: we sweep the *gains* (dB), not raw coefficients. Interpolating
+    // raw biquad coefficients draws a straight line through coefficient space
+    // that can exit the stability triangle at high sample rates (96 kHz+),
+    // causing blowup. Recomputing via PeakingCoeffs() keeps every intermediate
+    // on the stable RBJ manifold (the Equalizer APO approach).
     Tdf2State m_state[MINIEQ_MAX_CHANNELS][MINIEQ_MAX_BANDS];
     float     m_masterLinear = 1.0f;           // live master gain
     float     m_targetMaster = 1.0f;           // smoothed toward this too
     bool      m_settling = false;              // live coeffs chasing targets
     float     m_smoothAlpha = 0.0026f;         // one-pole step (~8 ms @ 48 kHz)
+    bool      m_coeffsDirty = false;           // gains moved: recompute coeffs
+    uint32_t  m_coeffTick = 0;                 // decimates the recompute
 
     // ---- Bypass crossfade ----
     // The old code hard-switched between dry and wet: a click. Now the

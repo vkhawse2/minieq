@@ -12,12 +12,11 @@
 
 EqDsp::EqDsp() {
     memset(m_bands, 0, sizeof(m_bands));
-    memset(m_target, 0, sizeof(m_target));
     memset(m_state, 0, sizeof(m_state));
     // Default to flat (unity) coefficients so a zeroed struct is a no-op.
+    // (m_liveGainDb / m_targetGainDb are zero-initialized in the header.)
     for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
         m_bands[b].b0 = 1.0f;
-        m_target[b].b0 = 1.0f;
     }
 }
 
@@ -59,23 +58,26 @@ void EqDsp::Configure(float sampleRateHz, uint32_t numChannels) {
 void EqDsp::PeakingCoeffs(float freqHz, float q, float gainDb,
                           float sampleRateHz, Biquad* out) {
     // RBJ "peakingEQ": https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
-    const float A = powf(10.0f, gainDb / 40.0f);
-    const float w0 = 2.0f * (float)M_PI * freqHz / sampleRateHz;
-    const float alpha = sinf(w0) / (2.0f * q);
-    const float cw0 = cosf(w0);
+    // Computed in double: at 96 kHz+ the 60 Hz band's stability margin is
+    // ~1.5e-5, thinner than float32 rounding. Double keeps the coefficients
+    // safely inside the triangle.
+    const double A = pow(10.0, (double)gainDb / 40.0);
+    const double w0 = 2.0 * M_PI * (double)freqHz / (double)sampleRateHz;
+    const double alpha = sin(w0) / (2.0 * (double)q);
+    const double cw0 = cos(w0);
 
-    const float b0 = 1.0f + alpha * A;
-    const float b1 = -2.0f * cw0;
-    const float b2 = 1.0f - alpha * A;
-    const float a0 = 1.0f + alpha / A;
-    const float a1 = -2.0f * cw0;
-    const float a2 = 1.0f - alpha / A;
+    const double b0 = 1.0 + alpha * A;
+    const double b1 = -2.0 * cw0;
+    const double b2 = 1.0 - alpha * A;
+    const double a0 = 1.0 + alpha / A;
+    const double a1 = -2.0 * cw0;
+    const double a2 = 1.0 - alpha / A;
 
-    out->b0 = b0 / a0;
-    out->b1 = b1 / a0;
-    out->b2 = b2 / a0;
-    out->a1 = a1 / a0;
-    out->a2 = a2 / a0;
+    out->b0 = (float)(b0 / a0);
+    out->b1 = (float)(b1 / a0);
+    out->b2 = (float)(b2 / a0);
+    out->a1 = (float)(a1 / a0);
+    out->a2 = (float)(a2 / a0);
 }
 
 void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
@@ -86,31 +88,32 @@ void EqDsp::UpdateGains(const float bandGainDb[MINIEQ_MAX_BANDS], int numBands,
     m_numBands = numBands;
     for (int b = 0; b < numBands; ++b) {
         float g = bandGainDb[b];
-        if (g < MINIEQ_GAIN_MIN_DB) g = MINIEQ_GAIN_MIN_DB;
-        if (g > MINIEQ_GAIN_MAX_DB) g = MINIEQ_GAIN_MAX_DB;
-        PeakingCoeffs(MiniEQ_BandFreq(numBands, b), MINIEQ_BAND_Q, g,
-                      m_sampleRate, &m_target[b]);
+        if (!(g >= MINIEQ_GAIN_MIN_DB)) g = MINIEQ_GAIN_MIN_DB; // also catches NaN
+        if (!(g <= MINIEQ_GAIN_MAX_DB)) g = MINIEQ_GAIN_MAX_DB; // also catches NaN
+        m_targetGainDb[b] = g;
     }
     // Bands above the active count park at flat, so a later 5->10 switch
-    // sweeps from a known state instead of stale coefficients.
+    // sweeps from a known state instead of a stale gain.
     for (int b = numBands; b < MINIEQ_MAX_BANDS; ++b) {
-        m_target[b].b0 = 1.0f;
-        m_target[b].b1 = 0.0f;
-        m_target[b].b2 = 0.0f;
-        m_target[b].a1 = 0.0f;
-        m_target[b].a2 = 0.0f;
+        m_targetGainDb[b] = 0.0f;
     }
-    if (masterGainDb < MINIEQ_GAIN_MIN_DB) masterGainDb = MINIEQ_GAIN_MIN_DB;
-    if (masterGainDb > MINIEQ_GAIN_MAX_DB) masterGainDb = MINIEQ_GAIN_MAX_DB;
+    if (!(masterGainDb >= MINIEQ_GAIN_MIN_DB)) masterGainDb = MINIEQ_GAIN_MIN_DB;
+    if (!(masterGainDb <= MINIEQ_GAIN_MAX_DB)) masterGainDb = MINIEQ_GAIN_MAX_DB;
     m_targetMaster = powf(10.0f, masterGainDb / 20.0f);
-    // The RT thread sweeps the live coefficients toward these targets in
-    // Process() -- no instant jump, no click.
+    // The RT thread sweeps the live *gains* toward these targets in
+    // Process() and recomputes coefficients via PeakingCoeffs() -- no instant
+    // jump, no click, and every intermediate stays on the stable RBJ manifold.
     m_settling = true;
 }
 
 void EqDsp::SnapCoeffs() {
-    memcpy(m_bands, m_target, sizeof(m_bands));
+    for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+        m_liveGainDb[b] = m_targetGainDb[b];
+        PeakingCoeffs(MiniEQ_BandFreq(m_numBands, b), MINIEQ_BAND_Q,
+                      m_liveGainDb[b], m_sampleRate, &m_bands[b]);
+    }
     m_masterLinear = m_targetMaster;
+    m_coeffsDirty = false;
     m_settling = false;
 }
 
@@ -118,14 +121,24 @@ void EqDsp::AdvanceCoeffs() {
     const float a = m_smoothAlpha;
     float maxDiff = 0.0f;
     for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
-        Biquad* k = &m_bands[b];
-        const Biquad* t = &m_target[b];
-        float d;
-        d = t->b0 - k->b0; k->b0 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
-        d = t->b1 - k->b1; k->b1 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
-        d = t->b2 - k->b2; k->b2 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
-        d = t->a1 - k->a1; k->a1 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
-        d = t->a2 - k->a2; k->a2 += d * a; maxDiff = fmaxf(maxDiff, fabsf(d));
+        const float target = m_targetGainDb[b];
+        float d = target - m_liveGainDb[b];
+        if (fabsf(d) > 1e-7f) {
+            m_liveGainDb[b] += d * a;
+            maxDiff = fmaxf(maxDiff, fabsf(d));
+            m_coeffsDirty = true;
+        }
+    }
+    // Recompute coefficients at a decimated rate: the gain sweep runs
+    // per-sample (cheap), but PeakingCoeffs uses transcendentals -- doing
+    // it every 64th sample (~750 Hz @ 48 kHz) is smooth and RT-safe.
+    // Every intermediate stays on the stable RBJ manifold (see header note).
+    if (m_coeffsDirty && ((m_coeffTick++ & 63) == 0)) {
+        for (int b = 0; b < MINIEQ_MAX_BANDS; ++b) {
+            PeakingCoeffs(MiniEQ_BandFreq(m_numBands, b), MINIEQ_BAND_Q,
+                          m_liveGainDb[b], m_sampleRate, &m_bands[b]);
+        }
+        m_coeffsDirty = false;
     }
     const float dm = m_targetMaster - m_masterLinear;
     m_masterLinear += dm * a;
