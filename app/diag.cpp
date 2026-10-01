@@ -157,6 +157,32 @@ void MiniEQ_AppLog(const wchar_t* fmt, ...) {
     va_end(ap);
 }
 
+bool MiniEQ_CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
+    if (text.empty()) {
+        return false;
+    }
+    if (!OpenClipboard(hwnd)) {
+        return false;
+    }
+    bool ok = false;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (h != nullptr) {
+        void* p = GlobalLock(h);
+        if (p != nullptr) {
+            memcpy(p, text.c_str(), bytes);
+            GlobalUnlock(h);
+            ok = SetClipboardData(CF_UNICODETEXT, h) != nullptr;
+        }
+        if (!ok) {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
 //------------------------------------------------------------------------------
 // Endpoint peak meter: is audio flowing right now?
 //------------------------------------------------------------------------------
@@ -203,6 +229,7 @@ HWND  s_hLogWnd = nullptr;
 HWND  s_hLogEdit = nullptr;
 HWND  s_hLogPause = nullptr;
 HWND  s_hLogAutoChk = nullptr;
+HWND  s_hLogCopy = nullptr;
 HFONT s_hLogFont = nullptr;
 UINT64 s_logOffset = 0;
 bool  s_logPaused = false;
@@ -306,6 +333,25 @@ void LogViewerLayout(HWND hwnd) {
                  SWP_NOZORDER);
     SetWindowPos(s_hLogPause, nullptr, 104, H - barH, 90, 26, SWP_NOZORDER);
     SetWindowPos(s_hLogAutoChk, nullptr, 204, H - barH, 120, 26, SWP_NOZORDER);
+    SetWindowPos(s_hLogCopy, nullptr, 330, H - barH, 90, 26, SWP_NOZORDER);
+}
+
+static void LogViewerCopyAll(HWND hwnd) {
+    if (s_hLogEdit == nullptr) {
+        return;
+    }
+    const LRESULT len = SendMessageW(s_hLogEdit, WM_GETTEXTLENGTH, 0, 0);
+    if (len <= 0 || len > 4 * 1024 * 1024) {
+        return; // empty, or absurdly large: don't wedge the clipboard
+    }
+    std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+    SendMessageW(s_hLogEdit, WM_GETTEXT, (WPARAM)text.size(),
+                 (LPARAM)text.data());
+    text.resize(static_cast<size_t>(len));
+    if (MiniEQ_CopyTextToClipboard(hwnd, text)) {
+        MiniEQ_AppLogCat(L"UI", L"live log copied to clipboard (%lld chars)",
+                         static_cast<long long>(len));
+    }
 }
 
 LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -336,8 +382,13 @@ LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             CreateWindowW(L"BUTTON", L"Auto-scroll",
                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 120,
                           26, hwnd, (HMENU)(INT_PTR)204, hInst, nullptr);
+        s_hLogCopy =
+            CreateWindowW(L"BUTTON", L"Copy all",
+                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 90,
+                          26, hwnd, (HMENU)(INT_PTR)205, hInst, nullptr);
         SendMessageW(s_hLogPause, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(s_hLogAutoChk, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(s_hLogCopy, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(GetDlgItem(hwnd, 202), WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(s_hLogAutoChk, BM_SETCHECK, BST_CHECKED, 0);
         LogViewerLayout(hwnd);
@@ -360,6 +411,8 @@ LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         } else if (id == 203) {
             s_logPaused = !s_logPaused;
             SetWindowTextW(s_hLogPause, s_logPaused ? L"Resume" : L"Pause");
+        } else if (id == 205) {
+            LogViewerCopyAll(hwnd);
         }
         return 0;
     }
@@ -376,6 +429,7 @@ LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         s_hLogEdit = nullptr;
         s_hLogPause = nullptr;
         s_hLogAutoChk = nullptr;
+        s_hLogCopy = nullptr;
         s_logPaused = false;
         return 0;
     }

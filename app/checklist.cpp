@@ -44,6 +44,7 @@ enum {
     IDC_CL_LEGEND = 450,
     IDC_CL_REFRESH,
     IDC_CL_CLOSE,
+    IDC_CL_COPY,
     IDC_CL_ENHFIX,
     IDC_CL_SECT4,
     IDC_CL_RECSEG,   // owner-drawn 3-way recovery toggle
@@ -566,6 +567,7 @@ void LayoutRows() {
     MoveWindow(s_hRecDesc, 14, y, 472, 40, TRUE); y += 40 + 4;
     MoveWindow(s_hRecResult, 14, y, 472, 34, TRUE); y += 34 + 4;
     MoveWindow(s_hLegend, 14, y + 6, 300, 18, TRUE);
+    MoveWindow(GetDlgItem(s_hDlg, IDC_CL_COPY), 228, y + 2, 80, 26, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_REFRESH), 316, y + 2, 80, 26, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_CLOSE), 404, y + 2, 80, 26, TRUE);
 
@@ -587,6 +589,13 @@ void LayoutRows() {
     }
 }
 
+// Background diagnosis: the worker thread runs the probes, the window only
+// paints finished bundles. Static storage: outlives any in-flight run.
+static DiagAsyncState s_clDiag;
+
+// Posted by the background diagnosis worker when a fresh bundle is ready.
+#define WM_CL_DIAGDONE (WM_APP + 12)
+
 void RefreshChecklist() {
     if (s_hDlg == nullptr) {
         return;
@@ -597,10 +606,22 @@ void RefreshChecklist() {
         s_fixNote = FixNote::None;
         s_fixNoteRow = -1;
     }
+    // The probes run on the worker thread; this just asks for a fresh
+    // bundle and returns immediately. Cheap: coalesces while a run is in
+    // flight, so the UI thread never waits on the diagnosis.
+    MiniEQ_DiagAsyncRequest(&s_clDiag);
+}
+
+// Paint one finished bundle on the UI thread. The heavy probes already ran
+// on the worker thread, so this never blocks.
+static void RenderChecklistBundle(const DiagBundle& b) {
+    if (s_hDlg == nullptr) {
+        return;
+    }
+    const DiagSnapshot& snap = b.snap;
+    const DiagSpatialInfo& spatial = b.spatial;
     const std::wstring dllPath = MiniEQ_ApoDllPath();
-    const DiagSnapshot snap = MiniEQ_RunDiagnosis(s_endpoint);
     s_lastAudiodgPid = snap.audiodgPid; // feeds the recovery watch
-    const DiagSpatialInfo spatial = MiniEQ_ReadSpatialSound(s_endpoint);
     BuildRows(snap, spatial, dllPath);
 
     for (int i = 0; i < kRows; ++i) {
@@ -711,6 +732,7 @@ void ClOnCreate(HWND hwnd) {
 
     makeButton(IDC_CL_REFRESH, L"Refresh");
     makeButton(IDC_CL_CLOSE, L"Close");
+    makeButton(IDC_CL_COPY, L"Copy");
     // One-click fix for the audio-enhancements row: visible only while
     // enhancements are Off (row 3 in Error). LayoutRows positions it.
     s_hEnhFix = makeButton(IDC_CL_ENHFIX, L"Turn on");
@@ -726,6 +748,7 @@ void ClOnCreate(HWND hwnd) {
     s_hRecResult = makeStatic(IDC_CL_RECSLT, L"", 14, 0, 472, 34, false);
 
     SetTimer(hwnd, 1, 1500, nullptr);
+    MiniEQ_DiagAsyncStart(&s_clDiag, hwnd, WM_CL_DIAGDONE, s_endpoint);
     RefreshChecklist();
 }
 
@@ -765,18 +788,18 @@ static int VerifyHeartbeatAdvance(const std::wstring& endpoint) {
     if (!MiniEQ_AudioPlaying(endpoint, nullptr)) {
         return 1;
     }
-    DiagSnapshot s0 = MiniEQ_RunDiagnosis(endpoint);
-    int64_t base = s0.statusChannelOk ? s0.heartbeatCalls : 0;
+    DiagBundle s0 = MiniEQ_RunDiagnosisLocked(endpoint);
+    int64_t base = s0.snap.statusChannelOk ? s0.snap.heartbeatCalls : 0;
     for (int i = 0; i < 12; ++i) {
         Sleep(1000);
-        DiagSnapshot s = MiniEQ_RunDiagnosis(endpoint);
-        if (s.statusChannelOk && s.heartbeatCalls > base) {
+        DiagBundle s = MiniEQ_RunDiagnosisLocked(endpoint);
+        if (s.snap.statusChannelOk && s.snap.heartbeatCalls > base) {
             // One advancing sample isn't enough (the row-8 freshness rule
             // needs two); confirm with a second.
-            const int64_t mid = s.heartbeatCalls;
+            const int64_t mid = s.snap.heartbeatCalls;
             Sleep(1000);
-            DiagSnapshot s2 = MiniEQ_RunDiagnosis(endpoint);
-            if (s2.heartbeatCalls > mid) {
+            DiagBundle s2 = MiniEQ_RunDiagnosisLocked(endpoint);
+            if (s2.snap.heartbeatCalls > mid) {
                 return 0;
             }
             base = mid;
@@ -1002,6 +1025,44 @@ static void DrawRecoverySeg(const DRAWITEMSTRUCT* di) {
     DeleteObject(edge);
 }
 
+// Copy the whole checklist (device + time + every row's state/title/detail/
+// fix) as plain text, so a failed audio path can be pasted for support.
+static void CopyChecklistReport(HWND hwnd) {
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t head[320] = {};
+    StringCchPrintfW(head, ARRAYSIZE(head),
+        L"MiniEQ audio path checklist \u2014 %s\r\nchecked %04u-%02u-%02u "
+        L"%02u:%02u:%02u\r\n\r\n",
+        s_deviceName.empty() ? L"(no device)" : s_deviceName.c_str(),
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring report = head;
+    for (int i = 0; i < kRows; ++i) {
+        const CheckRow& r = s_rows[i];
+        const wchar_t* tag = L"[WAIT]";
+        if (r.state == CheckState::Ok) {
+            tag = L"[OK]";
+        } else if (r.state == CheckState::Error) {
+            tag = L"[ERROR]";
+        }
+        report += tag;
+        report += L" ";
+        report += r.title;
+        report += L"\r\n     ";
+        report += r.detail;
+        report += L"\r\n";
+        if (!r.fix.empty()) {
+            report += L"     Fix: ";
+            report += r.fix;
+            report += L"\r\n";
+        }
+        report += L"\r\n";
+    }
+    if (MiniEQ_CopyTextToClipboard(hwnd, report)) {
+        MiniEQ_AppLogCat(L"UI", L"checklist report copied to clipboard");
+    }
+}
+
 LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -1010,10 +1071,17 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == 1) {
-            RefreshChecklist();
+            RefreshChecklist(); // asks the worker; never blocks the UI
             CheckWatchEngine();
         }
         return 0;
+    case WM_CL_DIAGDONE: {
+        DiagBundle b;
+        if (MiniEQ_DiagAsyncTake(&s_clDiag, b)) {
+            RenderChecklistBundle(b);
+        }
+        return 0;
+    }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_CL_RECSEG && HIWORD(wp) == STN_CLICKED) {
             // Recovery toggle tap: hit-test which third was tapped.
@@ -1040,6 +1108,9 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case IDC_CL_CLOSE:
             DestroyWindow(hwnd);
+            return 0;
+        case IDC_CL_COPY:
+            CopyChecklistReport(hwnd);
             return 0;
         case IDC_CL_ENHFIX: {
             // One-click fix: switch enhancements back to device defaults
@@ -1087,6 +1158,7 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        MiniEQ_DiagAsyncStop(&s_clDiag);
         DeleteObject(s_font);
         DeleteObject(s_fontBold);
         DeleteObject(s_fontName);

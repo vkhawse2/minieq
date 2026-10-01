@@ -14,6 +14,7 @@
 
 #include <windows.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,49 @@ struct DiagVerdict {
 // Collect one full snapshot for an endpoint. Safe to call on the UI thread
 // (about once a second); every failing probe degrades to "unknown".
 DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId);
+
+// Snapshot + spatial read, serialized through one process-wide lock. Every
+// background diagnosis in the app (Diagnostics Center, Checklist, recovery
+// verify) goes through here: the freshness and crash-loop detectors keep
+// "last poll" statics that only stay coherent when polls don't overlap.
+struct DiagBundle {
+    DiagSnapshot  snap;
+    DiagSpatialInfo spatial;
+};
+DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId);
+
+// Background diagnosis worker: runs the heavy probes off the UI thread and
+// hands the finished bundle to the window via a posted message, so the
+// Diagnostics Center / Checklist never freeze while data is loading. The
+// window owns the state (static storage); the worker never touches window
+// handles except the single PostMessage.
+struct DiagAsyncState {
+    HWND hwnd = nullptr;
+    UINT doneMsg = 0;
+    HANDLE hThread = nullptr;
+    HANDLE hWake = nullptr; // auto-reset: a refresh was requested
+    HANDLE hStop = nullptr; // manual-reset: shut down
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::wstring endpoint;
+    std::unique_ptr<DiagBundle> result; // guarded by lock
+    bool hasResult = false;
+    bool busy = false; // a run is in flight; new requests coalesce
+    // Bumped on every Start/Stop: a worker finishing a probe from a previous
+    // incarnation drops its bundle instead of posting it to a new window.
+    uint64_t generation = 0;
+};
+
+void MiniEQ_DiagAsyncStart(DiagAsyncState* a, HWND hwnd, UINT doneMsg,
+                           const std::wstring& endpoint);
+void MiniEQ_DiagAsyncSetEndpoint(DiagAsyncState* a,
+                                 const std::wstring& endpoint);
+// Ask for a fresh bundle. Cheap: if a run is already in flight the request
+// coalesces and the next timer tick re-asks.
+void MiniEQ_DiagAsyncRequest(DiagAsyncState* a);
+// Take the latest finished bundle (true) or report none waiting (false).
+bool MiniEQ_DiagAsyncTake(DiagAsyncState* a, DiagBundle& out);
+// Shut down: no more posted messages, worker joined (bounded wait).
+void MiniEQ_DiagAsyncStop(DiagAsyncState* a);
 
 // Turn a snapshot into the plain-language verdict.
 DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap);

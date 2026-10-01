@@ -25,6 +25,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include <mutex>
+
 // PKEY_AudioEndpoint_Disable_SysFx -- the "Audio enhancements" switch.
 // {1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},5. The native storage is a
 // REG_DWORD (VT_UI4 through the property store): 1 = enhancements OFF
@@ -863,6 +865,143 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
 }
 
 // ---------------------------------------------------------------------------
+// Background diagnosis worker
+//
+// The full snapshot (process/module snapshots, registry + COM reads) used to
+// run on the UI thread every second -- any slow probe froze the whole
+// window while data was loading. Now one worker thread per window runs the
+// probes; the finished bundle is handed over under a lock and the window is
+// poked with a posted message. The UI only ever paints the last finished
+// bundle, so a slow refresh degrades to "slightly older data", never a hang.
+// ---------------------------------------------------------------------------
+
+DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId) {
+    // One lock for every background diagnosis in the process: the freshness
+    // and crash-loop detectors keep "last poll" statics that only stay
+    // coherent when polls don't overlap.
+    static std::mutex s_mutex;
+    std::lock_guard<std::mutex> lk(s_mutex);
+    DiagBundle b;
+    b.snap = MiniEQ_RunDiagnosis(endpointId);
+    b.spatial = MiniEQ_ReadSpatialSound(endpointId);
+    return b;
+}
+
+static DWORD WINAPI DiagWorkerProc(LPVOID param) {
+    DiagAsyncState* a = static_cast<DiagAsyncState*>(param);
+    // The probes use COM (MMDeviceEnumerator, property stores); the recovery
+    // thread already runs these same calls in MTA, so do the same here.
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HANDLE ev[2] = { a->hStop, a->hWake };
+    for (;;) {
+        const DWORD w = WaitForMultipleObjects(2, ev, FALSE, INFINITE);
+        if (w != WAIT_OBJECT_0 + 1) {
+            break; // stop requested (or the wait itself failed)
+        }
+        std::wstring ep;
+        uint64_t gen = 0;
+        AcquireSRWLockShared(&a->lock);
+        ep = a->endpoint;
+        gen = a->generation;
+        ReleaseSRWLockShared(&a->lock);
+        DiagBundle b = MiniEQ_RunDiagnosisLocked(ep);
+        AcquireSRWLockExclusive(&a->lock);
+        if (gen != a->generation) {
+            // The window was torn down and re-created while this probe ran;
+            // drop the stale bundle instead of posting it to the new window.
+            ReleaseSRWLockExclusive(&a->lock);
+            continue;
+        }
+        a->result.reset(new (std::nothrow) DiagBundle(std::move(b)));
+        a->hasResult = (a->result != nullptr);
+        a->busy = false;
+        const HWND hwnd = a->hwnd;
+        const UINT msg = a->doneMsg;
+        ReleaseSRWLockExclusive(&a->lock);
+        if (hwnd != nullptr) {
+            PostMessageW(hwnd, msg, 0, 0);
+        }
+    }
+    CoUninitialize();
+    return 0;
+}
+
+void MiniEQ_DiagAsyncStart(DiagAsyncState* a, HWND hwnd, UINT doneMsg,
+                           const std::wstring& endpoint) {
+    AcquireSRWLockExclusive(&a->lock);
+    a->hwnd = hwnd;
+    a->doneMsg = doneMsg;
+    a->endpoint = endpoint;
+    ++a->generation; // any in-flight probe from a previous life is now stale
+    a->busy = false;
+    a->hasResult = false;
+    a->result.reset();
+    ReleaseSRWLockExclusive(&a->lock);
+    a->hStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    a->hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    a->hThread = CreateThread(nullptr, 0, DiagWorkerProc, a, 0, nullptr);
+}
+
+void MiniEQ_DiagAsyncSetEndpoint(DiagAsyncState* a,
+                                 const std::wstring& endpoint) {
+    AcquireSRWLockExclusive(&a->lock);
+    a->endpoint = endpoint;
+    ReleaseSRWLockExclusive(&a->lock);
+}
+
+void MiniEQ_DiagAsyncRequest(DiagAsyncState* a) {
+    bool kick = false;
+    AcquireSRWLockExclusive(&a->lock);
+    if (!a->busy && a->hThread != nullptr) {
+        a->busy = true;
+        kick = true;
+    }
+    ReleaseSRWLockExclusive(&a->lock);
+    if (kick) {
+        SetEvent(a->hWake);
+    }
+    // Busy: the in-flight run will post doneMsg when it lands, and the
+    // window's 1 s timer re-asks anyway -- requests coalesce, never queue.
+}
+
+bool MiniEQ_DiagAsyncTake(DiagAsyncState* a, DiagBundle& out) {
+    AcquireSRWLockExclusive(&a->lock);
+    if (!a->hasResult || a->result == nullptr) {
+        ReleaseSRWLockExclusive(&a->lock);
+        return false;
+    }
+    out = std::move(*a->result);
+    a->result.reset();
+    a->hasResult = false;
+    ReleaseSRWLockExclusive(&a->lock);
+    return true;
+}
+
+void MiniEQ_DiagAsyncStop(DiagAsyncState* a) {
+    AcquireSRWLockExclusive(&a->lock);
+    a->hwnd = nullptr; // the window is going away: no more PostMessage
+    ++a->generation;   // a wedged probe finishing late drops its bundle
+    ReleaseSRWLockExclusive(&a->lock);
+    if (a->hThread == nullptr) {
+        return;
+    }
+    SetEvent(a->hStop);
+    // Bounded wait: a probe stuck hard (wedged COM call) must not hang
+    // window teardown. The worker owns no window state, so abandoning it in
+    // that pathological case is safe -- it just exits when the call returns.
+    WaitForSingleObject(a->hThread, 3000);
+    CloseHandle(a->hThread);
+    a->hThread = nullptr;
+    CloseHandle(a->hWake);
+    a->hWake = nullptr;
+    CloseHandle(a->hStop);
+    a->hStop = nullptr;
+    a->result.reset();
+    a->hasResult = false;
+    a->busy = false;
+}
+
+// ---------------------------------------------------------------------------
 // The Diagnostics Center window (modeless)
 // ---------------------------------------------------------------------------
 
@@ -877,9 +1016,13 @@ enum {
     IDC_DC_LOG,
     IDC_DC_RUN,
     IDC_DC_COPY,
+    IDC_DC_COPYLOG,
     IDC_DC_FULLLOG,
     IDC_DC_CLOSE,
 };
+
+// Posted by the background diagnosis worker when a fresh bundle is ready.
+#define WM_DC_DIAGDONE (WM_APP + 11)
 
 static const wchar_t* kDcClass = L"MiniEQDiagCenter";
 
@@ -916,6 +1059,11 @@ static DiagSeverity s_verdictSeverity = DiagSeverity::Neutral;
 static std::wstring s_endpoint;
 static DiagSnapshot s_lastSnap;
 static DiagVerdict  s_lastVerdict;
+
+// Background diagnosis: the worker thread runs the probes, the window only
+// paints finished bundles. Static storage: outlives any in-flight run.
+static DiagAsyncState s_diagAsync;
+static bool           s_forceLogNext = false; // "Run diagnosis" re-logs baseline
 
 // Transition-logging state: only log when something actually changed.
 static bool             s_haveLogged = false;
@@ -1028,7 +1176,16 @@ static void SetListCellW(HWND lv, int row, int col, LPWSTR text) {
     (void)SendMessageW(lv, LVM_SETITEMTEXTW, (WPARAM)row, (LPARAM)&it);
 }
 
+// Skip rebuilds when nothing changed: deleting + re-inserting rows every
+// second makes the list flash and steals scroll position mid-crash-loop.
+static std::wstring s_lastSessListSig;
+
 static void UpdateSessionList(const DiagSnapshot& snap) {
+    const std::wstring sig = SessionSignature(snap.sessions);
+    if (sig == s_lastSessListSig) {
+        return;
+    }
+    s_lastSessListSig = sig;
     ListView_DeleteAllItems(s_hSessions);
     int row = 0;
     for (const DiagSessionInfo& si : snap.sessions) {
@@ -1184,12 +1341,13 @@ static void DcRelayoutForVerdict(const std::wstring& vt) {
         }
     }
     const int btnY = 616 + extra;
-    HWND btns[4] = {
+    HWND btns[5] = {
         GetDlgItem(s_hDlg, IDC_DC_RUN), GetDlgItem(s_hDlg, IDC_DC_COPY),
-        GetDlgItem(s_hDlg, IDC_DC_FULLLOG), GetDlgItem(s_hDlg, IDC_DC_CLOSE),
+        GetDlgItem(s_hDlg, IDC_DC_COPYLOG), GetDlgItem(s_hDlg, IDC_DC_FULLLOG),
+        GetDlgItem(s_hDlg, IDC_DC_CLOSE),
     };
-    const int btnX[4] = { 12, 160, 288, 488 };
-    for (int i = 0; i < 4; ++i) {
+    const int btnX[5] = { 12, 140, 258, 366, 484 };
+    for (int i = 0; i < 5; ++i) {
         if (btns[i] != nullptr) {
             SetWindowPos(btns[i], nullptr, btnX[i], btnY, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER);
@@ -1200,11 +1358,13 @@ static void DcRelayoutForVerdict(const std::wstring& vt) {
     InvalidateRect(s_hDlg, nullptr, TRUE);
 }
 
-static void RefreshDiagCenter(bool forceLog) {
+// Paint one finished bundle. Runs on the UI thread; the heavy probes
+// already happened on the worker thread, so this never blocks.
+static void RenderDiagSnapshot(const DiagBundle& b, bool forceLog) {
     if (s_hDlg == nullptr) {
         return;
     }
-    const DiagSnapshot snap = MiniEQ_RunDiagnosis(s_endpoint);
+    const DiagSnapshot& snap = b.snap;
     const DiagVerdict v = MiniEQ_MakeVerdict(snap);
 
     std::wstring vt = v.title + L"\r\n\r\n" + v.detail;
@@ -1262,31 +1422,77 @@ static void RefreshDiagCenter(bool forceLog) {
 
     UpdateSessionList(snap);
     LogTransitions(snap, v, forceLog);
-    UpdateLogTail();
+    // (Log tail refreshes on the 1 s timer; no file I/O here.)
 
     s_lastSnap = snap;
     s_lastVerdict = v;
 }
 
+// Ask the worker for a fresh bundle. Cheap: coalesces while a run is in
+// flight, so the UI thread never waits on the probes.
+static void RequestDiagRefresh() {
+    MiniEQ_DiagAsyncRequest(&s_diagAsync);
+}
+
 static void DcCopyReport(HWND hwnd) {
     const std::wstring report = MiniEQ_FormatReport(s_lastSnap, s_lastVerdict);
-    if (OpenClipboard(hwnd)) {
-        EmptyClipboard();
-        const size_t bytes = (report.size() + 1) * sizeof(wchar_t);
-        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (h != nullptr) {
-            void* p = GlobalLock(h);
-            if (p != nullptr) {
-                memcpy(p, report.c_str(), bytes);
-                GlobalUnlock(h);
-                SetClipboardData(CF_UNICODETEXT, h);
-            } else {
-                GlobalFree(h);
+    if (MiniEQ_CopyTextToClipboard(hwnd, report)) {
+        MiniEQ_AppLogCat(L"DIAG", L"report copied to clipboard");
+    }
+}
+
+// Copy the entire APO trace log (apo-trace.log) in one click, so the full
+// history can be pasted for support. Capped at 512 KB: the tail stays useful
+// even on machines with long uptimes, and the clipboard stays sane.
+static void DcCopyLog(HWND hwnd) {
+    std::wstring text;
+    HANDLE h = CreateFileW(MiniEQ_DiagLogPath().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size = {};
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0) {
+            // Cap at the last 512 KB so the clipboard stays sane even on
+            // machines with long uptimes.
+            const LONGLONG cap = 512LL * 1024;
+            LONGLONG off = size.QuadPart - cap;
+            const bool truncated = off > 0;
+            if (off < 0) {
+                off = 0;
+            }
+            // Align to a UTF-16 code-unit boundary: an odd offset would
+            // shift every character by one byte (gibberish).
+            off &= ~1LL;
+            LARGE_INTEGER li = {};
+            li.QuadPart = off;
+            SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+            const DWORD toRead = static_cast<DWORD>(size.QuadPart - off);
+            std::vector<BYTE> buf(static_cast<size_t>(toRead) + 2, 0);
+            DWORD got = 0;
+            if (ReadFile(h, buf.data(), toRead, &got, nullptr) && got > 0) {
+                const wchar_t* w =
+                    reinterpret_cast<const wchar_t*>(buf.data());
+                size_t n = got / sizeof(wchar_t);
+                if (n > 0 && w[0] == 0xFEFF) {
+                    ++w;
+                    --n; // drop the BOM
+                }
+                text.assign(w, n);
+                if (truncated) {
+                    text = L"...(truncated to the last 512 KB)...\r\n" + text;
+                }
             }
         }
-        CloseClipboard();
+        CloseHandle(h);
     }
-    MiniEQ_AppLogCat(L"DIAG", L"report copied to clipboard");
+    if (text.empty()) {
+        MessageBoxW(hwnd, L"The APO trace log is empty or unavailable.",
+                    L"MiniEQ diagnostics", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (MiniEQ_CopyTextToClipboard(hwnd, text)) {
+        MiniEQ_AppLogCat(L"DIAG", L"full APO log copied to clipboard");
+    }
 }
 
 static void DcOnCreate(HWND hwnd) {
@@ -1356,13 +1562,15 @@ static void DcOnCreate(HWND hwnd) {
                              (HMENU)(INT_PTR)IDC_DC_LOG, s_hInst, nullptr);
     SendMessageW(s_hLog, WM_SETFONT, (WPARAM)s_font, TRUE);
 
-    makeButton(IDC_DC_RUN, L"Run diagnosis", 12, 616, 140);
-    makeButton(IDC_DC_COPY, L"Copy report", 160, 616, 120);
-    makeButton(IDC_DC_FULLLOG, L"View full log", 288, 616, 120);
-    makeButton(IDC_DC_CLOSE, L"Close", 488, 616, 120);
+    makeButton(IDC_DC_RUN, L"Run diagnosis", 12, 616, 120);
+    makeButton(IDC_DC_COPY, L"Copy report", 140, 616, 110);
+    makeButton(IDC_DC_COPYLOG, L"Copy log", 258, 616, 100);
+    makeButton(IDC_DC_FULLLOG, L"View full log", 366, 616, 110);
+    makeButton(IDC_DC_CLOSE, L"Close", 484, 616, 110);
 
     SetTimer(hwnd, 1, 1000, nullptr);
-    RefreshDiagCenter(false);
+    MiniEQ_DiagAsyncStart(&s_diagAsync, hwnd, WM_DC_DIAGDONE, s_endpoint);
+    RequestDiagRefresh();
 }
 
 static LRESULT DcOnCtlColorStatic(HDC hdc, HWND hctl) {
@@ -1383,16 +1591,30 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == 1) {
-            RefreshDiagCenter(false);
+            RequestDiagRefresh(); // worker probes; UI never blocks
+            UpdateLogTail();      // cheap: early-outs when size unchanged
         }
         return 0;
+    case WM_DC_DIAGDONE: {
+        DiagBundle b;
+        if (MiniEQ_DiagAsyncTake(&s_diagAsync, b)) {
+            const bool forceLog = s_forceLogNext;
+            s_forceLogNext = false;
+            RenderDiagSnapshot(b, forceLog);
+        }
+        return 0;
+    }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_DC_RUN:
-            RefreshDiagCenter(true);
+            s_forceLogNext = true; // re-log the baseline transition
+            RequestDiagRefresh();
             return 0;
         case IDC_DC_COPY:
             DcCopyReport(hwnd);
+            return 0;
+        case IDC_DC_COPYLOG:
+            DcCopyLog(hwnd);
             return 0;
         case IDC_DC_FULLLOG:
             MiniEQ_ShowLogViewer(s_hInst, hwnd);
@@ -1438,6 +1660,9 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_loggedExSig.clear();
         s_shownVerdictTitle.clear();
         s_lastLogSize = 0;
+        s_lastSessListSig.clear();
+        s_forceLogNext = false;
+        MiniEQ_DiagAsyncStop(&s_diagAsync);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1447,7 +1672,7 @@ void MiniEQ_ShowDiagCenter(HINSTANCE hInst, HWND hParent) {
     if (s_hDlg != nullptr) {
         ShowWindow(s_hDlg, SW_SHOW);
         SetForegroundWindow(s_hDlg);
-        RefreshDiagCenter(false);
+        RequestDiagRefresh();
         return;
     }
     s_hInst = hInst;
@@ -1474,8 +1699,9 @@ void MiniEQ_DiagCenterSetDevice(const std::wstring& endpointId) {
     if (s_endpoint != endpointId) {
         s_endpoint = endpointId;
         s_haveLogged = false; // re-log the baseline for the new device
+        MiniEQ_DiagAsyncSetEndpoint(&s_diagAsync, endpointId);
         if (s_hDlg != nullptr) {
-            RefreshDiagCenter(false);
+            RequestDiagRefresh();
         }
     }
 }

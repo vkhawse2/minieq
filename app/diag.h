@@ -34,3 +34,7 @@ float MiniEQ_EndpointPeakLevel(const std::wstring& endpointId);
 
 // Show (or raise) the modeless live-log viewer.
 void MiniEQ_ShowLogViewer(HINSTANCE hInst, HWND hParent);
+
+// Copy text to the clipboard (CF_UNICODETEXT). False when the clipboard
+// couldn't be opened.
+bool MiniEQ_CopyTextToClipboard(HWND hwnd, const std::wstring& text);
