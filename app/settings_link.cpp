@@ -218,7 +218,6 @@ bool StatusLink::MaybeUpgrade(const std::wstring& endpointId) {
     CloseHandle(probe);
     return Open(endpointId);
 }
-}
 
 bool StatusLink::Read(MiniEQApoStatus* out) {
     if (m_pView == nullptr || out == nullptr) {

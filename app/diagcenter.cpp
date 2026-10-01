@@ -1734,7 +1734,7 @@ static void ForensicsAppendWerArchive(std::wstring& out) {
     }
     int n = 0;
     do {
-        if ((fd.dwAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
             wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
             continue;
         }
@@ -1804,7 +1804,7 @@ static void ForensicsAppendCrashDumps(std::wstring& out) {
         return;
     }
     do {
-        if ((fd.dwAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             continue;
         }
         const ULONGLONG bytes =

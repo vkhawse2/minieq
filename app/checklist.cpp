@@ -340,7 +340,7 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
     // probe that created a real stream and churned audiodg, so it was
     // removed. It never claims green; yellow by design.
     s_rows[5].title = L"Exclusive-mode apps";
-    s_rows[5].state = CheckState::Warning;
+    s_rows[5].state = CheckState::Idle;
     s_rows[5].detail = L"An app in WASAPI exclusive mode sends audio straight to the driver, "
                        L"bypassing the engine and every APO, MiniEQ included. MiniEQ no longer "
                        L"checks for this live (the check itself destabilized the audio engine).";
