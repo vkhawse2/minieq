@@ -515,6 +515,28 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
     if (SUCCEEDED(MiniEQ_IsAttachedToEndpoint(endpointId.c_str(), &attached))) {
         s.attached = attached;
     }
+    // Full registration picture: the engine needs the AudioEngine declaration
+    // key (layer 2) even when the slot (layer 3) is right, and seeing both
+    // slots + the child stash exposes double-registration leftovers.
+    bool declared = false;
+    if (SUCCEEDED(MiniEQ_QueryApoDeclaration(&declared))) {
+        s.apoDeclared = declared ? 1 : 0;
+    }
+    wchar_t slotClsid[64] = {};
+    if (MiniEQ_QuerySlotValue(endpointId.c_str(), false, slotClsid,
+                              ARRAYSIZE(slotClsid)) == S_OK) {
+        s.sfxSlotClsid = slotClsid;
+    }
+    if (MiniEQ_QuerySlotValue(endpointId.c_str(), true, slotClsid,
+                              ARRAYSIZE(slotClsid)) == S_OK) {
+        s.efxSlotClsid = slotClsid;
+    }
+    wchar_t stashed[64] = {};
+    if (MiniEQ_ReadChildApoClsid(endpointId.c_str(), stashed,
+                                 ARRAYSIZE(stashed)) == S_OK &&
+        stashed[0] != L'\0') {
+        s.childStashClsid = stashed;
+    }
     s.dllPath = MiniEQ_ApoDllPath();
     if (!s.dllPath.empty()) {
         s.dllExists = (GetFileAttributesW(s.dllPath.c_str()) != INVALID_FILE_ATTRIBUTES);
@@ -611,6 +633,20 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
                    L"so Windows never loads our equalizer for it.";
         v.nextStep = L"In the main window, click \"Attach to this device\" "
                      L"(one admin approval).";
+        return v;
+    }
+    if (snap.apoDeclared == 0) {
+        // The slot points at us but the engine's own APO declaration key is
+        // missing -- Windows can't resolve our CLSID, so the slot is a dead
+        // pointer. Re-attaching repairs the declaration (self-healing attach).
+        v.severity = DiagSeverity::Bad;
+        v.title = L"MiniEQ's engine registration is missing.";
+        v.detail = L"The endpoint slot points at MiniEQ_APO, but the audio "
+                   L"engine's own APO declaration key is missing or "
+                   L"inconsistent, so Windows can't resolve it -- the slot "
+                   L"is a dead pointer.";
+        v.nextStep = L"Detach, then re-attach (Recovery > Re-attach). The "
+                     L"attach repairs the missing declaration automatically.";
         return v;
     }
     if (snap.enhancements == DiagEnhancements::Off) {
@@ -787,6 +823,17 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
     r += MiniEQ_EffectSlotShortName();
     r += L" slot points at MiniEQ: ";
     r += snap.attached ? L"yes" : L"no";
+    r += L"\r\nEngine APO declaration: ";
+    r += snap.apoDeclared > 0 ? L"present" :
+         (snap.apoDeclared == 0 ? L"MISSING (slot is a dead pointer)" : L"unknown");
+    r += L"\r\nSFX slot: ";
+    r += snap.sfxSlotClsid.empty() ? L"(empty)" : snap.sfxSlotClsid.c_str();
+    r += L"\r\nEFX slot: ";
+    r += snap.efxSlotClsid.empty() ? L"(empty)" : snap.efxSlotClsid.c_str();
+    if (!snap.childStashClsid.empty()) {
+        r += L"\r\nDisplaced-APO stash: ";
+        r += snap.childStashClsid.c_str();
+    }
     r += L"\r\nDLL path: ";
     r += snap.dllPath.empty() ? L"(not registered)" : snap.dllPath;
     r += L"\r\nDLL file exists: ";
@@ -1045,6 +1092,9 @@ static void UpdateLogTail() {
     if (off < 0) {
         off = 0;
     }
+    // Align to a UTF-16 code-unit boundary: an odd offset would shift every
+    // character by one byte (gibberish) in the reinterpret_cast below.
+    off &= ~1LL;
     LARGE_INTEGER li = {};
     li.QuadPart = off;
     SetFilePointerEx(h, li, nullptr, FILE_BEGIN);

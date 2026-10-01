@@ -59,6 +59,14 @@ struct DiagSnapshot {
     std::wstring dllPath;            // InprocServer32 path of our CLSID
     bool         dllExists = false;
     DiagEnhancements enhancements = DiagEnhancements::Unknown;
+    // Full registration picture: the audio engine needs the AudioEngine
+    // declaration key (layer 2) even when the SFX slot (layer 3) is right.
+    // 1 = declaration present and consistent, 0 = missing/inconsistent,
+    // -1 = unknown (registry unreadable).
+    int          apoDeclared = -1;
+    std::wstring sfxSlotClsid;        // empty = SFX slot value absent
+    std::wstring efxSlotClsid;        // empty = EFX slot value absent
+    std::wstring childStashClsid;     // empty = no displaced-APO stash
 
     // Engine layer.
     DWORD        audiodgPid = 0;

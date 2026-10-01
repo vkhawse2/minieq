@@ -52,6 +52,24 @@ HRESULT MiniEQ_DetachFromEndpoint(const wchar_t* endpointId);
 // True if the active effect slot of this endpoint already points at our APO.
 HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached);
 
+// Restarts the Windows device node behind an audio endpoint (disable +
+// enable), forcing the OS to re-enumerate it so the audio engine re-reads
+// the FxProperties effect list. Raw registry writes to FxProperties don't
+// send change notifications, so without this the engine keeps the effect
+// list from when the device was last connected. Requires elevation;
+// best-effort (returns an error if the device isn't found, but the attach
+// itself already succeeded).
+HRESULT MiniEQ_ReenumerateEndpointDevice(const wchar_t* endpointId);
+
+// Diagnostics (read-only): is the AudioEngine APO declaration present and
+// consistent with GetRegistrationProperties? S_OK always; *present answers.
+HRESULT MiniEQ_QueryApoDeclaration(bool* present);
+
+// Diagnostics (read-only): reads one FxProperties slot value.
+// S_OK = slot holds a CLSID string (copied to out), S_FALSE = slot absent.
+HRESULT MiniEQ_QuerySlotValue(const wchar_t* endpointId, bool efx,
+                             wchar_t* out, size_t cch);
+
 // Selects the effect slot at runtime: false = SFX (default), true = EFX.
 // Reserved for a future slot-choice UI; nothing calls it yet. Builds compiled
 // with MINIEQ_EFX_SLOT start in EFX mode.

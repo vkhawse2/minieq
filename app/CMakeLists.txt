@@ -32,7 +32,8 @@ target_include_directories(MiniEQ PRIVATE
 # ole32/uuid: COM + MMDevice. advapi32: registry. comctl32: trackbars.
 # shell32: SHGetFolderPathW + elevated relaunch. runtimeobject: WinRT
 # (RoGetActivationFactory / HSTRING) for the live spatial-sound switch.
-target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 runtimeobject)
+# setupapi: device re-enumeration (disable/enable) after FxProperties attach.
+target_link_libraries(MiniEQ PRIVATE ole32 uuid advapi32 comctl32 shell32 runtimeobject setupapi)
 
 # Build id the UI expects the loaded APO to report (see root CMakeLists).
 target_compile_definitions(MiniEQ PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")

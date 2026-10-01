@@ -7,6 +7,19 @@
 #include <audioenginebaseapo.h> // APO_FLAG_INPLACE
 #include <sddl.h> // ConvertStringSecurityDescriptorToSecurityDescriptorW
 #include <strsafe.h>
+#include <setupapi.h>  // SetupDi* for device re-enumeration
+#include <devguid.h>   // GUID_DEVCLASS_MEDIA
+#include <mmdeviceapi.h> // IMMDeviceEnumerator (friendly name lookup)
+#include <propsys.h>   // IPropertyStore, PROPVARIANT
+#include <propkey.h>   // PROPERTYKEY (must precede functiondiscoverykeys_devpkey.h)
+#include <wctype.h>    // towlower
+
+// PKEY_Device_FriendlyName -- defined TU-local (the SDK header only declares
+// it, which links LNK2019; see AGENTS.md).
+static const PROPERTYKEY kPkeyDeviceFriendlyName = {
+    { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA1, 0xE0, 0xE0 } },
+    14
+};
 
 // IID_IAudioProcessingObject -- the APO interface we implement.
 static const wchar_t* kApoInterface0 = L"{FD7F2B29-24D0-4B5C-B177-592C39F9CA10}";
@@ -456,13 +469,55 @@ static HRESULT AttachToSlot(const wchar_t* endpointId, const wchar_t* slot) {
 }
 
 HRESULT MiniEQ_AttachToEndpoint(const wchar_t* endpointId) {
-    // EFX test builds: migrate, don't double up. If we are still sitting in
-    // the SFX slot from an earlier install, detach there first (restoring
-    // whatever we displaced) so the engine never instantiates us twice.
-    if (g_fxSlot == kFxEfxSlot) {
-        DetachFromSlot(endpointId, kFxSfxSlot);
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+
+    // 1. Repair layers 1+2 (COM class + APO declaration). The installer writes
+    //    these via DllRegisterServer, but a failed/interrupted upgrade can
+    //    leave them stale -- and the audio engine will not load the APO
+    //    without the AudioEngine declaration key. Best-effort: the DLL sits
+    //    next to the --attach helper (MiniEQ.exe).
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath)) > 0) {
+            wchar_t* slash = wcsrchr(exePath, L'\\');
+            if (slash != nullptr) {
+                *(slash + 1) = L'\0';
+                wchar_t dllPath[MAX_PATH] = {};
+                if (SUCCEEDED(StringCchCopyW(dllPath, ARRAYSIZE(dllPath), exePath)) &&
+                    SUCCEEDED(StringCchCatW(dllPath, ARRAYSIZE(dllPath), L"MiniEQ_APO.dll")) &&
+                    GetFileAttributesW(dllPath) != INVALID_FILE_ATTRIBUTES) {
+                    MiniEQ_RegisterComClass(dllPath);
+                    MiniEQ_RegisterApoDeclaration();
+                    MiniEQ_EnsureLogDirForInstall();
+                }
+            }
+        }
     }
-    return AttachToSlot(endpointId, g_fxSlot);
+
+    // 2. Sweep our CLSID from the INACTIVE slot. The EFX experiment left us
+    //    registered in both SFX and EFX on some machines; the engine must
+    //    never see us twice.
+    {
+        const wchar_t* inactiveSlot = (g_fxSlot == kFxEfxSlot) ? kFxSfxSlot : kFxEfxSlot;
+        DetachFromSlot(endpointId, inactiveSlot);
+    }
+
+    // 3. Clear any stale child-APO stash so we start clean; AttachToSlot
+    //    re-stashes the real incumbent below.
+    MiniEQ_ClearChildApoClsid(endpointId);
+
+    // 4. Attach to the active slot (stashes the incumbent as our child).
+    const HRESULT hr = AttachToSlot(endpointId, g_fxSlot);
+    if (FAILED(hr)) return hr;
+
+    // 5. Force the OS to re-enumerate the endpoint so the audio engine
+    //    re-reads the FxProperties effect list. Raw registry writes don't
+    //    send change notifications, so without this the engine keeps using
+    //    the list from when the device was last connected ("attached but
+    //    never loaded"). Best-effort: the attach itself already succeeded.
+    MiniEQ_ReenumerateEndpointDevice(endpointId);
+
+    return S_OK;
 }
 
 static HRESULT DetachFromSlot(const wchar_t* endpointId, const wchar_t* slot) {
@@ -562,5 +617,169 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached) {
     if (rc == ERROR_SUCCESS && type == REG_SZ) {
         *attached = (_wcsicmp(value, clsid) == 0);
     }
+    return S_OK;
+}
+
+//------------------------------------------------------------------------------
+// Device re-enumeration: makes the audio engine re-read FxProperties.
+//------------------------------------------------------------------------------
+
+// Friendly name of an MMDevice endpoint (e.g. "Headphones (Airdopes 411ANC)").
+static bool EndpointFriendlyName(const wchar_t* endpointId, wchar_t* out, size_t cch) {
+    if (endpointId == nullptr || out == nullptr || cch == 0) return false;
+    out[0] = L'\0';
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&pEnum))) || pEnum == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    IMMDevice* pDev = nullptr;
+    if (SUCCEEDED(pEnum->GetDevice(endpointId, &pDev)) && pDev != nullptr) {
+        IPropertyStore* pProps = nullptr;
+        if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps != nullptr) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(pProps->GetValue(kPkeyDeviceFriendlyName, &pv)) &&
+                pv.vt == VT_LPWSTR && pv.pwszVal != nullptr) {
+                StringCchCopyW(out, cch, pv.pwszVal);
+                ok = (out[0] != L'\0');
+            }
+            PropVariantClear(&pv);
+            pProps->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return ok;
+}
+
+// Restarts one device node (disable + enable) via the Setup API. Returns true
+// if the device was found and the restart was issued.
+static bool RestartDevnode(HDEVINFO hDevInfo, PSP_DEVINFO_DATA pDevInfo) {
+    SP_PROPCHANGE_PARAMS params = {};
+    params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+    params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    params.Scope = DICS_FLAG_GLOBAL;
+
+    params.StateChange = DICS_DISABLE;
+    if (!SetupDiSetClassInstallParamsW(hDevInfo, pDevInfo,
+                                       &params.ClassInstallHeader,
+                                       sizeof(params)) ||
+        !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, pDevInfo)) {
+        return false;
+    }
+    Sleep(1200); // let the stack settle before re-enabling
+    params.StateChange = DICS_ENABLE;
+    if (!SetupDiSetClassInstallParamsW(hDevInfo, pDevInfo,
+                                       &params.ClassInstallHeader,
+                                       sizeof(params)) ||
+        !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, pDevInfo)) {
+        return false;
+    }
+    return true;
+}
+
+HRESULT MiniEQ_ReenumerateEndpointDevice(const wchar_t* endpointId) {
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+
+    // Match the endpoint to its device node by friendly name. The MMDevice
+    // friendly name ("Headphones (Airdopes 411ANC)") matches the devnode's
+    // SPDRP_FRIENDLYNAME on typical audio devices.
+    wchar_t wantName[256] = {};
+    if (!EndpointFriendlyName(endpointId, wantName, ARRAYSIZE(wantName))) {
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_MEDIA, nullptr, nullptr,
+                                            DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    SP_DEVINFO_DATA devInfo = {};
+    devInfo.cbSize = sizeof(devInfo);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo); ++i) {
+        wchar_t devName[256] = {};
+        DWORD reqSize = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME,
+                                              nullptr, (BYTE*)devName,
+                                              sizeof(devName), &reqSize)) {
+            continue;
+        }
+        // Case-insensitive containment either way handles minor naming
+        // differences between the MMDevice and devnode names.
+        wchar_t wantLow[256] = {}, devLow[256] = {};
+        for (size_t k = 0; k < ARRAYSIZE(wantLow) - 1 && wantName[k] != L'\0'; ++k)
+            wantLow[k] = towlower(wantName[k]);
+        for (size_t k = 0; k < ARRAYSIZE(devLow) - 1 && devName[k] != L'\0'; ++k)
+            devLow[k] = towlower(devName[k]);
+        if (wcsstr(wantLow, devLow) == nullptr && wcsstr(devLow, wantLow) == nullptr) {
+            continue;
+        }
+        hr = RestartDevnode(hDevInfo, &devInfo) ? S_OK
+                                                : HRESULT_FROM_WIN32(GetLastError());
+        break; // first match wins
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return hr;
+}
+
+//------------------------------------------------------------------------------
+// Diagnostics queries (read-only, no elevation needed).
+//------------------------------------------------------------------------------
+
+HRESULT MiniEQ_QueryApoDeclaration(bool* present) {
+    if (present == nullptr) return E_POINTER;
+    *present = false;
+    wchar_t clsid[64] = {};
+    HRESULT hr = ClsidString(clsid, ARRAYSIZE(clsid));
+    if (FAILED(hr)) return hr;
+    wchar_t key[160] = {};
+    hr = StringCchPrintfW(key, ARRAYSIZE(key),
+                          L"SOFTWARE\\Classes\\AudioEngine\\AudioProcessingObjects\\%s",
+                          clsid);
+    if (FAILED(hr)) return hr;
+    HKEY h = nullptr;
+    const LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc == ERROR_SUCCESS) {
+        // The engine cross-checks these two against GetRegistrationProperties.
+        wchar_t iface[64] = {};
+        DWORD size = sizeof(iface), type = 0;
+        const LONG irc = RegQueryValueExW(h, L"APOInterface0", nullptr, &type,
+                                         (BYTE*)iface, &size);
+        DWORD flags = 0;
+        DWORD fsize = sizeof(flags), ftype = 0;
+        const LONG frc = RegQueryValueExW(h, L"Flags", nullptr, &ftype,
+                                         (BYTE*)&flags, &fsize);
+        RegCloseKey(h);
+        *present = (irc == ERROR_SUCCESS && type == REG_SZ &&
+                    _wcsicmp(iface, kApoInterface0) == 0 &&
+                    frc == ERROR_SUCCESS && ftype == REG_DWORD);
+    }
+    return S_OK;
+}
+
+HRESULT MiniEQ_QuerySlotValue(const wchar_t* endpointId, bool efx,
+                             wchar_t* out, size_t cch) {
+    if (out == nullptr || cch == 0) return E_POINTER;
+    out[0] = L'\0';
+    if (endpointId == nullptr || endpointId[0] == L'\0') return E_INVALIDARG;
+    wchar_t key[512] = {};
+    HRESULT hr = FxPropertiesKey(endpointId, key, ARRAYSIZE(key));
+    if (FAILED(hr)) return hr;
+    HKEY h = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &h);
+    if (rc != ERROR_SUCCESS) {
+        return rc == ERROR_FILE_NOT_FOUND ? S_FALSE : HRESULT_FROM_WIN32(rc);
+    }
+    const wchar_t* slot = efx ? kFxEfxSlot : kFxSfxSlot;
+    DWORD size = (DWORD)(cch * sizeof(wchar_t)), type = 0;
+    rc = RegQueryValueExW(h, slot, nullptr, &type, (BYTE*)out, &size);
+    RegCloseKey(h);
+    if (rc == ERROR_FILE_NOT_FOUND) return S_FALSE; // slot value absent
+    if (rc != ERROR_SUCCESS) return HRESULT_FROM_WIN32(rc);
+    if (type != REG_SZ) return S_FALSE;
     return S_OK;
 }
