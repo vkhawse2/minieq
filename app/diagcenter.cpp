@@ -1080,6 +1080,11 @@ static HWND        s_hEngine = nullptr;
 static HWND        s_hReg = nullptr;
 static HWND        s_hSessions = nullptr;
 static HWND        s_hLog = nullptr;
+static HWND        s_hGrpEngine = nullptr;
+static HWND        s_hGrpReg = nullptr;
+static HWND        s_hGrpSessions = nullptr;
+static HWND        s_hGrpLog = nullptr;
+static int         s_verdictExtra = 0; // verdict pane growth beyond 102px
 static HFONT       s_font = nullptr;
 static HFONT       s_fontBold = nullptr;
 static HBRUSH      s_verdictBrush[4] = {};
@@ -1305,6 +1310,70 @@ static void UpdateLogTail() {
     SendMessageW(s_hLog, EM_SCROLLCARET, 0, 0);
 }
 
+// The verdict copy varies in length -- some diagnoses need three
+// paragraphs. Measure the wrapped text in the real (bold) font and grow
+// the verdict pane so the whole text is always visible: nothing is
+// clipped and no control below is ever painted over. Every below-fold
+// control is repositioned from its base coordinates each time, so the
+// layout can never drift; the window grows with the content and never
+// shrinks below its designed 702 px height.
+static void DcRelayoutForVerdict(const std::wstring& vt) {
+    if (s_hDlg == nullptr || s_hVerdict == nullptr || s_fontBold == nullptr) {
+        return;
+    }
+    int need = 102;
+    HDC hdc = GetDC(s_hDlg);
+    if (hdc != nullptr) {
+        HFONT old = (HFONT)SelectObject(hdc, s_fontBold);
+        RECT rc = { 0, 0, 596, 0 };
+        DrawTextW(hdc, vt.c_str(), -1, &rc, DT_WORDBREAK | DT_CALCRECT);
+        SelectObject(hdc, old);
+        ReleaseDC(s_hDlg, hdc);
+        need = rc.bottom + 16; // breathing room above/below the text
+        if (need < 102) {
+            need = 102;
+        }
+    }
+    const int extra = need - 102;
+    if (extra == s_verdictExtra) {
+        return;
+    }
+    s_verdictExtra = extra;
+    SetWindowPos(s_hVerdict, nullptr, 0, 0, 596, need, SWP_NOMOVE | SWP_NOZORDER);
+    struct DcItem { HWND hwnd; int x, y, w, h; };
+    const DcItem items[] = {
+        { s_hGrpEngine, 12, 120, 288, 132 },
+        { s_hEngine, 22, 142, 268, 102 },
+        { s_hGrpReg, 308, 120, 300, 132 },
+        { s_hReg, 318, 142, 280, 102 },
+        { s_hGrpSessions, 12, 260, 596, 168 },
+        { s_hSessions, 22, 282, 576, 138 },
+        { s_hGrpLog, 12, 436, 596, 168 },
+        { s_hLog, 22, 458, 576, 138 },
+    };
+    for (const DcItem& it : items) {
+        if (it.hwnd != nullptr) {
+            SetWindowPos(it.hwnd, nullptr, it.x, it.y + extra, it.w, it.h,
+                         SWP_NOZORDER);
+        }
+    }
+    const int btnY = 616 + extra;
+    HWND btns[4] = {
+        GetDlgItem(s_hDlg, IDC_DC_RUN), GetDlgItem(s_hDlg, IDC_DC_COPY),
+        GetDlgItem(s_hDlg, IDC_DC_FULLLOG), GetDlgItem(s_hDlg, IDC_DC_CLOSE),
+    };
+    const int btnX[4] = { 12, 160, 288, 488 };
+    for (int i = 0; i < 4; ++i) {
+        if (btns[i] != nullptr) {
+            SetWindowPos(btns[i], nullptr, btnX[i], btnY, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER);
+        }
+    }
+    SetWindowPos(s_hDlg, nullptr, 0, 0, 620, 702 + extra,
+                 SWP_NOMOVE | SWP_NOZORDER);
+    InvalidateRect(s_hDlg, nullptr, TRUE);
+}
+
 static void RefreshDiagCenter(bool forceLog) {
     if (s_hDlg == nullptr) {
         return;
@@ -1317,6 +1386,7 @@ static void RefreshDiagCenter(bool forceLog) {
         vt += L"\r\n\r\nNext step: " + v.nextStep;
     }
     SetTextIfChanged(s_hVerdict, vt);
+    DcRelayoutForVerdict(vt);
     if (v.title != s_shownVerdictTitle) {
         s_shownVerdictTitle = v.title;
         s_verdictSeverity = v.severity;
@@ -1417,23 +1487,24 @@ static void DcOnCreate(HWND hwnd) {
         SendMessageW(ctl, WM_SETFONT, (WPARAM)s_font, TRUE);
         return ctl;
     };
-    auto makeGroup = [&](const wchar_t* text, int x, int y, int w, int h) {
+    auto makeGroup = [&](const wchar_t* text, int x, int y, int w, int h) -> HWND {
         HWND ctl = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                  x, y, w, h, hwnd, nullptr, s_hInst, nullptr);
         SendMessageW(ctl, WM_SETFONT, (WPARAM)s_font, TRUE);
+        return ctl;
     };
 
     s_hVerdict = makeStatic(IDC_DC_VERDICT, 12, 10, 596, 102, true, SS_LEFT);
 
-    makeGroup(L"Audio engine", 12, 120, 288, 110);
-    s_hEngine = makeStatic(IDC_DC_ENGINE, 22, 142, 268, 80, false, SS_LEFT);
-    makeGroup(L"Registration", 308, 120, 300, 110);
-    s_hReg = makeStatic(IDC_DC_REG, 318, 142, 280, 80, false, SS_LEFT);
+    s_hGrpEngine = makeGroup(L"Audio engine", 12, 120, 288, 132);
+    s_hEngine = makeStatic(IDC_DC_ENGINE, 22, 142, 268, 102, false, SS_LEFT);
+    s_hGrpReg = makeGroup(L"Registration", 308, 120, 300, 132);
+    s_hReg = makeStatic(IDC_DC_REG, 318, 142, 280, 102, false, SS_LEFT);
 
-    makeGroup(L"Apps playing on this device", 12, 238, 596, 168);
+    s_hGrpSessions = makeGroup(L"Apps playing on this device", 12, 260, 596, 168);
     s_hSessions = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                                  22, 260, 576, 138, hwnd,
+                                  22, 282, 576, 138, hwnd,
                                   (HMENU)(INT_PTR)IDC_DC_SESSIONS, s_hInst, nullptr);
     SendMessageW(s_hSessions, WM_SETFONT, (WPARAM)s_font, TRUE);
     ListView_SetExtendedListViewStyle(s_hSessions, LVS_EX_FULLROWSELECT);
@@ -1450,18 +1521,18 @@ static void DcOnCreate(HWND hwnd) {
                            (LPARAM)&col);
     }
 
-    makeGroup(L"Recent log (categorized)", 12, 414, 596, 168);
+    s_hGrpLog = makeGroup(L"Recent log (categorized)", 12, 436, 596, 168);
     s_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                              WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
                              WS_VSCROLL | ES_AUTOVSCROLL,
-                             22, 436, 576, 138, hwnd,
+                             22, 458, 576, 138, hwnd,
                              (HMENU)(INT_PTR)IDC_DC_LOG, s_hInst, nullptr);
     SendMessageW(s_hLog, WM_SETFONT, (WPARAM)s_font, TRUE);
 
-    makeButton(IDC_DC_RUN, L"Run diagnosis", 12, 594, 140);
-    makeButton(IDC_DC_COPY, L"Copy report", 160, 594, 120);
-    makeButton(IDC_DC_FULLLOG, L"View full log", 288, 594, 120);
-    makeButton(IDC_DC_CLOSE, L"Close", 488, 594, 120);
+    makeButton(IDC_DC_RUN, L"Run diagnosis", 12, 616, 140);
+    makeButton(IDC_DC_COPY, L"Copy report", 160, 616, 120);
+    makeButton(IDC_DC_FULLLOG, L"View full log", 288, 616, 120);
+    makeButton(IDC_DC_CLOSE, L"Close", 488, 616, 120);
 
     SetTimer(hwnd, 1, 1000, nullptr);
     RefreshDiagCenter(false);
@@ -1524,6 +1595,11 @@ static LRESULT CALLBACK DcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_hReg = nullptr;
         s_hSessions = nullptr;
         s_hLog = nullptr;
+        s_hGrpEngine = nullptr;
+        s_hGrpReg = nullptr;
+        s_hGrpSessions = nullptr;
+        s_hGrpLog = nullptr;
+        s_verdictExtra = 0;
         s_font = nullptr;
         s_fontBold = nullptr;
         s_haveLogged = false;
@@ -1560,7 +1636,7 @@ void MiniEQ_ShowDiagCenter(HINSTANCE hInst, HWND hParent) {
 
     CreateWindowExW(0, kDcClass, L"MiniEQ Diagnostics Center",
                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                    CW_USEDEFAULT, CW_USEDEFAULT, 620, 680,
+                    CW_USEDEFAULT, CW_USEDEFAULT, 620, 702,
                     hParent, nullptr, hInst, nullptr);
     if (s_hDlg != nullptr) {
         ShowWindow(s_hDlg, SW_SHOW);

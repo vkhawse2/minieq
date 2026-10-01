@@ -7,6 +7,7 @@
 #include <shlobj.h>
 #include <stdarg.h>
 #include <strsafe.h>
+#include <aclapi.h>
 
 #include <vector>
 
@@ -25,6 +26,74 @@ std::wstring MiniEQ_DiagLogPath() {
     return std::wstring(win) + L"\\Temp\\MiniEQ-apo-trace.log";
 }
 
+// True when the directory's DACL already grants Users FILE_ADD_FILE.
+static bool MiniEQ_UsersCanWriteDir(const wchar_t* path, PSID usersSid) {
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    bool ok = false;
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, &acl, nullptr, &sd) == ERROR_SUCCESS) {
+        ACL_SIZE_INFORMATION info = {};
+        if (GetAclInformation(acl, &info, sizeof(info), AclSizeInformation)) {
+            for (DWORD i = 0; i < info.AceCount && !ok; ++i) {
+                ACCESS_ALLOWED_ACE* ace = nullptr;
+                if (!GetAce(acl, i, reinterpret_cast<void**>(&ace)) ||
+                    ace == nullptr) {
+                    continue;
+                }
+                if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE) {
+                    continue;
+                }
+                if (EqualSid(usersSid, reinterpret_cast<PSID>(&ace->SidStart)) &&
+                    (ace->Mask & FILE_ADD_FILE) != 0) {
+                    ok = true;
+                }
+            }
+        }
+        LocalFree(sd);
+    }
+    return ok;
+}
+
+// Grants the local Users group file-create rights on the directory, merged
+// into the existing DACL (never replaced). The installer's --attach-all
+// helper runs as SYSTEM before the user ever launches the app; a
+// SYSTEM-created %PROGRAMDATA% subdirectory is not user-writable, which
+// would silently break the app's own diagnostic log on fresh installs.
+static void MiniEQ_GrantUsersWriteDir(const wchar_t* path) {
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    PSID usersSid = nullptr;
+    if (!AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_USERS, 0, 0, 0, 0, 0, 0,
+                                  &usersSid)) {
+        return;
+    }
+    if (!MiniEQ_UsersCanWriteDir(path, usersSid)) {
+        EXPLICIT_ACCESSW ea = {};
+        ea.grfAccessPermissions = FILE_ADD_FILE | FILE_LIST_DIRECTORY | SYNCHRONIZE;
+        ea.grfAccessMode = GRANT_ACCESS;
+        ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(usersSid);
+        PACL oldAcl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  nullptr, nullptr, &oldAcl, nullptr, &sd) == ERROR_SUCCESS) {
+            PACL newAcl = nullptr;
+            if (SetEntriesInAclW(1, &ea, oldAcl, &newAcl) == ERROR_SUCCESS &&
+                newAcl != nullptr) {
+                SetNamedSecurityInfoW(const_cast<LPWSTR>(path), SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION,
+                                      nullptr, nullptr, newAcl, nullptr);
+                LocalFree(newAcl);
+            }
+            LocalFree(sd);
+        }
+    }
+    FreeSid(usersSid);
+}
+
 void MiniEQ_EnsureLogDir() {
     wchar_t dir[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr,
@@ -32,7 +101,11 @@ void MiniEQ_EnsureLogDir() {
         return;
     }
     std::wstring d = std::wstring(dir) + L"\\MiniEQ";
-    CreateDirectoryW(d.c_str(), nullptr); // already exists: harmless
+    if (!CreateDirectoryW(d.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return;
+    }
+    MiniEQ_GrantUsersWriteDir(d.c_str());
 }
 
 static void MiniEQ_AppLogV(const wchar_t* category, const wchar_t* fmt, va_list ap) {

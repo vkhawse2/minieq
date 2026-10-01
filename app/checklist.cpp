@@ -507,15 +507,49 @@ void BuildRows(const DiagSnapshot& snap, const DiagSpatialInfo& spatial,
 // Dialog
 // ---------------------------------------------------------------------------
 
+// Visual line count of a detail/fix string inside its 448 px static.
+// SS_LEFT word-wraps, so a long single-line string still occupies several
+// visual lines -- counting only '\n' under-measures and lets rows paint
+// over each other. Measured with the real font so the wrap is exact.
+static int WrappedLines(const std::wstring& text, int width) {
+    if (text.empty()) {
+        return 1;
+    }
+    int lines = 1;
+    HDC hdc = GetDC(s_hDlg);
+    if (hdc != nullptr) {
+        HFONT old = (HFONT)SelectObject(hdc, s_font);
+        RECT rc = { 0, 0, width, 0 };
+        DrawTextW(hdc, text.c_str(), -1, &rc, DT_WORDBREAK | DT_CALCRECT);
+        TEXTMETRICW tm = {};
+        int lh = 16;
+        if (GetTextMetricsW(hdc, &tm)) {
+            lh = tm.tmHeight + tm.tmExternalLeading;
+        }
+        if (lh < 1) {
+            lh = 16;
+        }
+        lines = (rc.bottom + lh - 1) / lh;
+        if (lines < 1) {
+            lines = 1;
+        }
+        SelectObject(hdc, old);
+        ReleaseDC(s_hDlg, hdc);
+    } else {
+        for (wchar_t c : text) {
+            if (c == L'\n') {
+                ++lines;
+            }
+        }
+    }
+    return lines;
+}
+
 int RowHeight(const CheckRow& r) {
     int h = 20 + 4; // title + gap
-    int lines = 1;
-    for (wchar_t c : r.detail) {
-        if (c == L'\n') ++lines;
-    }
-    h += lines * 16;
+    h += WrappedLines(r.detail, 448) * 16;
     if (r.state == CheckState::Error && !r.fix.empty()) {
-        h += 4 + 16;
+        h += 4 + WrappedLines(r.fix, 448) * 16;
     }
     return h + 8; // bottom pad
 }
@@ -533,15 +567,13 @@ void LayoutRows() {
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
         int dy = y + 24;
-        int lines = 1;
-        for (wchar_t c : s_rows[i].detail) {
-            if (c == L'\n') ++lines;
-        }
+        const int lines = WrappedLines(s_rows[i].detail, 448);
         MoveWindow(s_hDetail[i], 38, dy, 448, lines * 16, TRUE);
         dy += lines * 16 + 4;
         const bool showFix = (s_rows[i].state == CheckState::Error &&
                               !s_rows[i].fix.empty());
-        MoveWindow(s_hFix[i], 38, dy, 448, 16, TRUE);
+        const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
+        MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
         y += rh;
     }
@@ -563,18 +595,16 @@ void LayoutRows() {
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
         int dy = y + 24;
-        int lines = 1;
-        for (wchar_t c : s_rows[i].detail) {
-            if (c == L'\n') ++lines;
-        }
+        const int lines = WrappedLines(s_rows[i].detail, 448);
         MoveWindow(s_hDetail[i], 38, dy, 448, lines * 16, TRUE);
         dy += lines * 16 + 4;
         const bool showFix = (s_rows[i].state == CheckState::Error &&
                               !s_rows[i].fix.empty());
-        MoveWindow(s_hFix[i], 38, dy, 448, 16, TRUE);
+        const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
+        MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
         if (hFixBtn != nullptr) {
-            MoveWindow(hFixBtn, 38, dy + 16 + 6, 110, 26, TRUE);
+            MoveWindow(hFixBtn, 38, dy + fixLines * 16 + 6, 110, 26, TRUE);
             ShowWindow(hFixBtn, SW_SHOW);
         }
         if (i == 3 && hFixBtn != s_hEnhFix) {
@@ -591,15 +621,13 @@ void LayoutRows() {
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
         int dy = y + 24;
-        int lines = 1;
-        for (wchar_t c : s_rows[i].detail) {
-            if (c == L'\n') ++lines;
-        }
+        const int lines = WrappedLines(s_rows[i].detail, 448);
         MoveWindow(s_hDetail[i], 38, dy, 448, lines * 16, TRUE);
         dy += lines * 16 + 4;
         const bool showFix = (s_rows[i].state == CheckState::Error &&
                               !s_rows[i].fix.empty());
-        MoveWindow(s_hFix[i], 38, dy, 448, 16, TRUE);
+        const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
+        MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
         y += rh;
     }
