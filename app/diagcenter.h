@@ -130,6 +130,12 @@ DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId);
 // breaker non-blockingly; the outcome arrives as WM_APP_BREAKER_DONE.
 void MiniEQ_BreakerNoteUserAction();
 void MiniEQ_BreakerPoll(HWND owner);
+// SAFE/DETACHED latch: set the moment the breaker trips and cleared only by
+// a deliberate user re-attach (MiniEQ_BreakerUserResume). While latched, no
+// automatic recovery -- attach verification, silent reloads, engine watch --
+// may run or re-arm, so MiniEQ can never feed the crash loop it detected.
+bool MiniEQ_BreakerLatched();
+void MiniEQ_BreakerUserResume();
 #define WM_APP_BREAKER_DONE (WM_APP + 103)
 // wParam outcomes for WM_APP_BREAKER_DONE:
 enum { BreakerOutcomeLaunched = 0, BreakerOutcomeUacDeclined = 1,

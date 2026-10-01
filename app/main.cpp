@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.0"
+#define MINIEQ_APP_VERSION L"0.2.2"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
@@ -135,6 +135,8 @@ static HWND                 g_btnChecklist; // "Checklist" button
 static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
 static ULONGLONG            g_lastTick = 0;
+static ULONGLONG            g_bypassSince = 0; // "playing + stale heartbeat" streak start (verdict debounce)
+static bool                 g_breakerLatchSeen = false; // breaker-latch edge detection for arm cancellation
 // Automatic endpoint-reappearance recovery (0.2.0): when a device-change
 // storm settles and our endpoint is back but the EQ path isn't live, the UI
 // runs a bounded backoff of non-elevated path reloads -- 100/250/500 ms,
@@ -495,6 +497,9 @@ static void UpdateEngineReload() {
     if (g_endpointId.empty() || !g_attached || g_reloadWorkerBusy) {
         return;
     }
+    if (MiniEQ_BreakerLatched()) {
+        return; // SAFE/DETACHED: no automatic stale-build reloads either
+    }
     // The APO must actually be loaded before a reload means anything.
     TryOpenChannels();
     MiniEQApoStatus st = {};
@@ -666,6 +671,25 @@ static void UpdateDiagStatus() {
             }
         }
         const bool fresh = (g_lastCalls > 0) && (now - g_lastTick < 2000);
+        // Verdict debounce: "playing but bypassing" is claimed only after
+        // audio has been playing with a stale heartbeat for ~4 s straight.
+        // Inside the grace window the state stays a neutral wait, so a
+        // graph rebuild between songs never flashes a false failure.
+        const bool playing = MiniEQ_EndpointPeakLevel(g_endpointId) > 0.001f;
+        // Instantiated but not locked yet (Initialize ran, no processing
+        // stream): starting up, never a bypass -- don't accrue the streak.
+        const bool startingUp = st.initCalls > 0 && st.processCalls == 0 &&
+                                st.locked == 0;
+        if (playing && !fresh && !startingUp) {
+            if (g_bypassSince == 0) {
+                g_bypassSince = now;
+            }
+        } else {
+            g_bypassSince = 0;
+        }
+        const bool bypassSettled = playing && !fresh && !startingUp &&
+                                   g_bypassSince != 0 &&
+                                   (now - g_bypassSince >= 4000);
         if (g_enhState == DiagEnhancements::Off) {
             state = DIAG_ENHOFF;
             StringCchCopyW(text, ARRAYSIZE(text),
@@ -693,7 +717,7 @@ static void UpdateDiagStatus() {
             StringCchCopyW(hint, ARRAYSIZE(hint),
                 L"A settings change rebuilt the audio path; "
                 L"this clears on its own, no restart needed.");
-        } else if (MiniEQ_EndpointPeakLevel(g_endpointId) > 0.001f) {
+        } else if (bypassSettled) {
             state = DIAG_ERROR;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio is playing but NOT going through MiniEQ");
@@ -754,6 +778,9 @@ static void UpdateDiagStatus() {
 // escalation never surprises. Never loops: after the escalation the outcome
 // is reported honestly and the user drives.
 static void ArmAttachVerify() {
+    if (MiniEQ_BreakerLatched()) {
+        return; // SAFE/DETACHED: no automatic verification/escalation until the user re-attaches
+    }
     g_verifyUntil = GetTickCount64() + kVerifyMs;
     g_verifyEscalated = false;
     g_verifyNudgePending = false;
@@ -763,6 +790,13 @@ static void ArmAttachVerify() {
 }
 
 static void UpdateAttachVerify() {
+    if (MiniEQ_BreakerLatched()) {
+        // The breaker owns the state now: verification (and its forced
+        // re-attach escalation) stays off until the user re-attaches.
+        g_verifyUntil = 0;
+        g_verifyNudgePending = false;
+        return;
+    }
     if (g_verifyNudgePending) {
         g_verifyNudgePending = false;
         const ULONGLONG nowEsc = GetTickCount64();
@@ -850,6 +884,9 @@ static void UpdateAttachVerify() {
 // re-runs the non-elevated engine reload; the 500 ms status poll observes
 // the result. Stops on DIAG_LIVE, after 5 steps, or when superseded.
 static void StartAutoRecovery(HWND hwnd) {
+    if (MiniEQ_BreakerLatched()) {
+        return; // SAFE/DETACHED: automatic recovery stays off until the user re-attaches
+    }
     if (g_autoRecStep != 0) {
         return; // already running
     }
@@ -857,6 +894,27 @@ static void StartAutoRecovery(HWND hwnd) {
     MiniEQ_AppLogCat(L"ENGINE",
         L"auto-recovery: endpoint present but path not live; backoff started");
     SetTimer(hwnd, IDT_AUTORECOVER, kAutoRecBackoffMs[0], nullptr);
+}
+
+// Circuit-breaker enforcement, run once on the latch's rising edge: cancel
+// every pending automatic recovery arm. The per-path gates (StartAutoRecovery,
+// ArmAttachVerify, UpdateAttachVerify, UpdateEngineReload, the checklist
+// watch) keep anything from re-arming while the latch holds.
+static void CancelRecoveryForBreaker(HWND hwnd) {
+    if (g_verifyUntil != 0 || g_verifyNudgePending) {
+        g_verifyUntil = 0;
+        g_verifyNudgePending = false;
+        g_verifyText.clear();
+        MiniEQ_AppLogCat(L"BREAKER",
+            L"attach verification cancelled -- circuit breaker is latched");
+    }
+    if (g_autoRecStep != 0) {
+        KillTimer(hwnd, IDT_AUTORECOVER);
+        g_autoRecStep = 0;
+        MiniEQ_AppLogCat(L"BREAKER",
+            L"auto-recovery cancelled -- circuit breaker is latched");
+    }
+    UpdateBanner();
 }
 
 static void SelectDevice(int index) {
@@ -881,6 +939,7 @@ static void SelectDevice(int index) {
     // enhancements reading start over.
     g_sawLive = false;
     g_lastLiveTick = 0;
+    g_bypassSince = 0; // verdict debounce streak is per-device too
     g_enhCheckTick = 0;
     g_enhState = DiagEnhancements::Unknown;
     // A manual device switch ends any post-attach note from another device.
@@ -1340,6 +1399,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if ((++breakerTick % 10) == 0) {
                 MiniEQ_BreakerPoll(hwnd);
             }
+            // SAFE/DETACHED latch: on its rising edge, cancel every pending
+            // automatic recovery arm exactly once. The gates on each
+            // recovery entry point keep them off while the latch holds.
+            const bool breakerLatched = MiniEQ_BreakerLatched();
+            if (breakerLatched && !g_breakerLatchSeen) {
+                g_breakerLatchSeen = true;
+                MiniEQ_AppLogCat(L"BREAKER",
+                    L"latched SAFE/DETACHED -- automatic recovery suspended until you re-attach");
+                CancelRecoveryForBreaker(hwnd);
+            } else if (!breakerLatched) {
+                g_breakerLatchSeen = false;
+            }
         } else if (wParam == IDT_DEVSETTLE) {
             KillTimer(hwnd, IDT_DEVSETTLE);
             if (g_devChangeCoalesced > 1) {
@@ -1369,7 +1440,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } else if (wParam == IDT_AUTORECOVER) {
             KillTimer(hwnd, IDT_AUTORECOVER);
-            if (g_autoRecStep <= 0 || g_autoRecStep > 5) {
+            if (MiniEQ_BreakerLatched()) {
+                // The breaker tripped mid-backoff: stop, don't reload.
+                g_autoRecStep = 0;
+                MiniEQ_AppLogCat(L"BREAKER",
+                    L"auto-recovery stopped -- circuit breaker is latched");
+            } else if (g_autoRecStep <= 0 || g_autoRecStep > 5) {
                 g_autoRecStep = 0;
             } else if (g_diagState == DIAG_LIVE) {
                 // The 500 ms poll saw the heartbeat come back: recovered.
@@ -1464,6 +1540,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RefreshDeviceList();
         } else if (id == IDC_ATTACH) {
             if (!g_endpointId.empty()) {
+                // A deliberate attach/detach is the one user action that
+                // clears the circuit-breaker latch.
+                MiniEQ_BreakerUserResume();
                 RelaunchElevatedAttach(!g_attached, /*force=*/false);
             }
         } else if (id == IDC_POWER) {
@@ -1489,6 +1568,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // registration takes effect now.
                 if (!g_endpointId.empty() && !g_attached) {
                     MiniEQ_AppLog(L"UI: attach banner accepted for new default device");
+                    MiniEQ_BreakerUserResume(); // deliberate attach clears the latch
                     if (DoElevatedAttach(true, /*force=*/false)) {
                         ChainReloadForBanner();
                     }
@@ -1597,7 +1677,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // Mark this build as seen so the timer doesn't re-arm.
             g_reloadKey = g_endpointId + L"|fresh";
             MiniEQ_AppLogCat(L"ENGINE",
-                L"auto-reload verified -- engine now runs build %S (was %s)",
+                L"auto-reload done -- engine instantiated build %S (was %s); "
+                L"instantiation verified, live processing is confirmed by the heartbeat",
                 MiniEQ_ExpectedBuildId(), out->reportedBuild.c_str());
             break;
         }
@@ -1632,8 +1713,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 L"MiniEQ detected the Windows audio engine restarting in a loop "
                 L"and detached itself from all your audio devices to keep your "
                 L"sound stable.\n\n"
-                L"Your audio should be working again now, without the EQ. You "
-                L"can re-attach MiniEQ to a device whenever you're ready.",
+                L"Your audio should be working again now, without the EQ. "
+                L"MiniEQ will stay detached and won't try to re-attach itself: "
+                L"when you're ready, click \"Attach to this device\" to turn "
+                L"the EQ back on.",
                 L"MiniEQ circuit breaker", MB_ICONWARNING);
         } else if (outcome == BreakerOutcomeLaunchFailed ||
                    outcome == BreakerOutcomeSweepFailed) {

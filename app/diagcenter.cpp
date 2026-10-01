@@ -119,6 +119,7 @@ static std::atomic<ULONGLONG> s_breakerStandDownUntil{0};   // 60 s after a deli
 static std::atomic<ULONGLONG> s_breakerUacCooldownUntil{0}; // 30 min after a declined UAC prompt
 static std::atomic<bool>      s_breakerTripped{false};      // one UAC prompt per loop episode
 static std::atomic<bool>      s_breakerSweepActive{false};  // elevated sweep currently in flight
+static std::atomic<bool>      s_breakerLatched{false};      // SAFE/DETACHED latch (see BreakerPoll)
 
 // Deliberate user action (attach / detach / path rebuild): the engine may
 // legitimately restart right after, so don't mistake that churn for a crash
@@ -126,6 +127,18 @@ static std::atomic<bool>      s_breakerSweepActive{false};  // elevated sweep cu
 void MiniEQ_BreakerNoteUserAction() {
     s_breakerStandDownUntil.store(GetTickCount64() + 60ULL * 1000,
                                  std::memory_order_release);
+}
+
+bool MiniEQ_BreakerLatched() {
+    return s_breakerLatched.load(std::memory_order_acquire);
+}
+
+// Deliberate user re-attach: the only way out of the SAFE/DETACHED latch.
+void MiniEQ_BreakerUserResume() {
+    if (s_breakerLatched.exchange(false, std::memory_order_acq_rel)) {
+        MiniEQ_AppLogCat(L"BREAKER",
+            L"user re-attach -- circuit-breaker latch cleared, recovery re-enabled");
+    }
 }
 
 // Outcome codes posted with WM_APP_BREAKER_DONE (see diagcenter.h).
@@ -204,6 +217,9 @@ void MiniEQ_BreakerPoll(HWND owner) {
         s_breakerTripped.store(false, std::memory_order_release); // engine calm: re-arm
         return;
     }
+    if (s_breakerLatched.load(std::memory_order_acquire)) {
+        return; // SAFE/DETACHED: keep observing, never fire again until the user resumes
+    }
     if (s_breakerTripped.load(std::memory_order_acquire)) {
         return; // one UAC prompt per episode
     }
@@ -214,6 +230,13 @@ void MiniEQ_BreakerPoll(HWND owner) {
         return; // user declined the prompt -- don't nag
     }
     s_breakerTripped.store(true, std::memory_order_release);
+    // Latch SAFE/DETACHED before the sweep even launches: from this moment
+    // every automatic recovery path (attach verify + forced re-attach,
+    // silent-reload backoff, stale-build reload, checklist watch) stays off
+    // until the user deliberately re-attaches. The episode flag above only
+    // suppresses repeat prompts; this latch is what keeps MiniEQ itself
+    // from re-entering the crash loop it just detected.
+    s_breakerLatched.store(true, std::memory_order_release);
     MiniEQ_ChecklistDisarmWatch(); // the watch's auto-recovery must not fight the breaker
     MiniEQ_AppLogCat(L"BREAKER",
         L"audiodg.exe restart loop detected -- firing the circuit breaker");
@@ -719,6 +742,13 @@ DiagSnapshot MiniEQ_RunDiagnosis(const std::wstring& endpointId) {
 // Verdict
 // ---------------------------------------------------------------------------
 
+// Verdict debounce state: "bypassing MiniEQ" is claimed only after the
+// (session active + heartbeat stale) condition has persisted ~4 s across
+// consecutive snapshots, so a single stale sample between songs or during
+// a graph rebuild never flashes a false failure. Keyed by endpoint.
+static std::wstring s_debEndpoint;
+static ULONGLONG    s_debBypassSince = 0;
+
 DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
     DiagVerdict v;
     if (snap.endpointId.empty()) {
@@ -792,6 +822,41 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
         v.nextStep = L"Detach MiniEQ from this device, replay, and see whether the "
                      L"crashing stops \u2014 that tells us if our APO is the trigger. "
                      L"Then copy this report and send it over.";
+        return v;
+    }
+    // Instantiated but not locked yet: the status channel exists (created
+    // in Initialize) while no processing stream has reached the APO. That
+    // is "starting up", never a failure.
+    if (snap.anySessionActive && snap.statusChannelOk && !snap.apoLocked) {
+        s_debBypassSince = 0; // a different story from bypass; don't accrue
+        v.severity = DiagSeverity::Neutral;
+        v.title = L"MiniEQ is starting up.";
+        v.detail = L"The audio engine has loaded MiniEQ, but hasn't put it "
+                   L"in the processing path yet \u2014 normal for a moment "
+                   L"after an attach or a device change.";
+        return v;
+    }
+    // Debounce: claim a bypass only once "audio playing + no heartbeat" has
+    // held for ~4 s across consecutive snapshots. Inside the grace window
+    // the honest verdict is a neutral wait, not a failure.
+    if (snap.endpointId != s_debEndpoint) {
+        s_debEndpoint = snap.endpointId;
+        s_debBypassSince = 0;
+    }
+    const ULONGLONG debNow = GetTickCount64();
+    if (!(snap.anySessionActive && !snap.heartbeatFresh)) {
+        s_debBypassSince = 0;
+    } else if (s_debBypassSince == 0) {
+        s_debBypassSince = debNow;
+    }
+    const bool bypassSettled =
+        s_debBypassSince != 0 && (debNow - s_debBypassSince >= 4000);
+    if (snap.anySessionActive && !bypassSettled) {
+        v.severity = DiagSeverity::Neutral;
+        v.title = L"Waiting for audio.";
+        v.detail = L"MiniEQ is attached; audio just started or the path is "
+                   L"still settling, so this gets a few seconds before "
+                   L"it's judged.";
         return v;
     }
     // NOTE: no exclusive-holder verdict anymore. Detecting it required a

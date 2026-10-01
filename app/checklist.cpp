@@ -928,6 +928,12 @@ static DWORD WINAPI RecoveryThread(LPVOID param) {
 }
 
 static void SpawnRecoveryJob(int action) {
+    if (action == 2 && MiniEQ_BreakerLatched()) {
+        // Watch auto-recovery must never run while the breaker is latched.
+        MiniEQ_AppLogCat(L"BREAKER",
+            L"watch auto-recovery refused -- circuit breaker is latched");
+        return;
+    }
     // Any recovery deliberately disturbs the engine -- start the breaker's
     // stand-down so its passive detector doesn't mistake our own churn for
     // a crash loop.
@@ -983,6 +989,19 @@ static void OnRecoveryTap(int index) {
         s_recSel = RecoverySel::Watch;
         s_recWatchArmed = !s_recWatchArmed;
         if (s_recWatchArmed) {
+            if (MiniEQ_BreakerLatched()) {
+                // SAFE/DETACHED: the breaker detached MiniEQ after an
+                // engine crash loop; the watch must not undo that.
+                s_recWatchArmed = false;
+                s_recResultText =
+                    L"Watch stays off: the circuit breaker detached MiniEQ "
+                    L"after an engine crash loop. Re-attach MiniEQ first, "
+                    L"then arm the watch.";
+                MiniEQ_AppLogCat(L"BREAKER",
+                    L"recovery watch arm refused -- circuit breaker is latched");
+                UpdateRecoveryTexts();
+                return;
+            }
             s_recWatchPid = s_lastAudiodgPid; // baseline; never fires on arm
             s_recWatchCount = 0;
             s_recWatchLastMs = 0;
@@ -1011,6 +1030,9 @@ static void OnRecoveryTap(int index) {
             UpdateRecoveryTexts();
             return;
         }
+        // A deliberate re-attach is the one user action that clears the
+        // circuit-breaker latch.
+        MiniEQ_BreakerUserResume();
     }
     std::wstring working = L"Working\u2026 rebuilding the audio path.";
     if (index == 1 && MiniEQ_AudioPlaying(s_endpoint, nullptr)) {
@@ -1029,6 +1051,20 @@ static void OnRecoveryTap(int index) {
 // format-flip recovery per new pid, 30 s cooldown, auto-disarm after 5 so
 // a crash loop can't churn forever.
 static void CheckWatchEngine() {
+    if (MiniEQ_BreakerLatched()) {
+        // The breaker owns the state: the watch stands down and stays down
+        // until the user deliberately re-attaches and re-arms it.
+        if (s_recWatchArmed) {
+            s_recWatchArmed = false;
+            s_recResultText =
+                L"Watch stopped \u2014 the circuit breaker detached MiniEQ "
+                L"to protect your audio. It stays off until you re-attach.";
+            MiniEQ_AppLogCat(L"BREAKER",
+                L"recovery watch stopped -- circuit breaker is latched");
+            UpdateRecoveryTexts();
+        }
+        return;
+    }
     if (!s_recWatchArmed || s_endpoint.empty() || s_recBusy) {
         return;
     }
