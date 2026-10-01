@@ -190,6 +190,11 @@ private:
     // section (older build's channel) it publishes the v2 way instead --
     // never writing past the mapping.
     bool           m_statusSeqlock = false;
+    // True when the mapped status section is big enough for the v4 initCalls
+    // field: Initialize stamps it then. On a smaller adopted section (older
+    // build's channel) Initialize skips the stamp -- never writing past the
+    // mapping.
+    bool           m_statusHasInitCalls = false;
     std::atomic<uint64_t> m_rtCalls{0};       // RT thread (relaxed)
     // Deferred RT diagnostics: the audio thread only records facts into
     // these relaxed atomics -- no QPC, no file tracing there. The worker

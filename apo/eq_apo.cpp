@@ -388,6 +388,43 @@ try {
                  m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
                  m_mappingName[0] ? m_mappingName : L"<none>");
 
+    // v4: the status channel is created here, at Initialize time -- not
+    // only in LockForProcess -- and every successful Initialize stamps
+    // initCalls. This is the observable the UI uses to tell "the engine
+    // instantiated the APO but never put it in the processing path"
+    // (initCalls > 0, processCalls == 0, locked == 0) apart from "the APO
+    // was never instantiated": the stuck state a forced re-enumeration
+    // fixes. No worker thread exists yet, so the stamp is written
+    // directly, bracketed by the seqlock when the section supports it.
+    CreateStatusMapping();
+    if (m_pStatus != nullptr && m_statusHasInitCalls) {
+        volatile LONG64* seqAddr =
+            reinterpret_cast<volatile LONG64*>(&m_pStatus->sequence);
+        volatile LONG64* initAddr =
+            reinterpret_cast<volatile LONG64*>(&m_pStatus->initCalls);
+        if (m_statusSeqlock) {
+            // Stuck-odd repair, same as PublishStatus: a previous instance
+            // may have died mid-publish when its audiodg crashed.
+            for (;;) {
+                const int64_t seq = InterlockedCompareExchange64(seqAddr, 0, 0);
+                if (!(seq & 1)) {
+                    break; // even: healthy
+                }
+                if (InterlockedCompareExchange64(seqAddr, seq + 1, seq) == seq) {
+                    break; // repaired
+                }
+            }
+            InterlockedIncrement64(seqAddr); // -> odd: write in flight
+        }
+        InterlockedIncrement64(initAddr);
+        m_pStatus->initOk = 1;
+        if (m_statusSeqlock) {
+            InterlockedIncrement64(seqAddr); // -> even: consistent
+        }
+        MiniEQ_Trace(L"MiniEQ_APO: initCalls=%lld (Initialize stamped)",
+                     (long long)*initAddr);
+    }
+
     m_initialized = true;
     return S_OK;
 } catch (...) {
@@ -1059,6 +1096,12 @@ void CEqApo::CreateStatusMapping() {
     if (m_statusName[0] == L'\0') {
         return;
     }
+    if (m_pStatus != nullptr) {
+        // Already mapped (e.g. Initialize created it before LockForProcess):
+        // mapping again would leak the handle. The worker relies on this
+        // being callable repeatedly, so the guard lives here.
+        return;
+    }
     bool fresh = false;
     HANDLE h = OpenOrCreateGlobalChannel(m_statusName,
                                          (DWORD)sizeof(MiniEQApoStatus), &fresh);
@@ -1077,15 +1120,19 @@ void CEqApo::CreateStatusMapping() {
         return;
     }
     // Minimum we can work with: the full v2 layout (through buildId). The
-    // v3 seqlock field needs the full v3 size on top of that.
+    // v3 seqlock field needs the full v3 size on top of that, and the v4
+    // initCalls field the full v4 size.
     const size_t kMinStatusSize =
         offsetof(MiniEQApoStatus, buildId) + sizeof(st->buildId);
     const size_t kSeqlockSize =
         offsetof(MiniEQApoStatus, sequence) + sizeof(st->sequence);
+    const size_t kInitCallsSize =
+        offsetof(MiniEQApoStatus, initCalls) + sizeof(st->initCalls);
     uint32_t secSize = 0;
     if (fresh) {
-        // We created it at this build's size: stamp the full v3 header.
-        // (The OS zeroes the section; sequence = 0 = even = consistent.)
+        // We created it at this build's size: stamp this build's header.
+        // (The OS zeroes the section; sequence = 0 = even = consistent,
+        // initCalls = 0 = never initialized yet.)
         st->structSize = (uint32_t)sizeof(MiniEQApoStatus);
         st->version = MINIEQ_STATUS_VERSION;
         StringCchCopyA(st->buildId, ARRAYSIZE(st->buildId), MiniEQ_ApoBuildId());
@@ -1119,9 +1166,11 @@ void CEqApo::CreateStatusMapping() {
     m_pStatus = st;
     m_hStatusMap = h;
     m_statusSeqlock = (secSize >= kSeqlockSize);
-    MiniEQ_Trace(L"MiniEQ_APO: status channel %s \"%s\" (seqlock %s)",
+    m_statusHasInitCalls = (secSize >= kInitCallsSize);
+    MiniEQ_Trace(L"MiniEQ_APO: status channel %s \"%s\" (seqlock %s, initCalls %s)",
                  fresh ? L"CREATED" : L"adopted", m_statusName,
-                 m_statusSeqlock ? L"on" : L"off");
+                 m_statusSeqlock ? L"on" : L"off",
+                 m_statusHasInitCalls ? L"on" : L"off");
 }
 
 void CEqApo::PublishStatus() {
@@ -1203,6 +1252,7 @@ void CEqApo::CloseStatusMapping() {
         m_pStatus = nullptr;
     }
     m_statusSeqlock = false;
+    m_statusHasInitCalls = false;
     if (m_hStatusMap != nullptr) {
         CloseHandle(m_hStatusMap);
         m_hStatusMap = nullptr;

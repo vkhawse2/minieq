@@ -91,7 +91,12 @@ typedef struct EqSettings {
 //      APO's channel has no sequence field, so the UI falls back to a
 //      best-effort plain copy; a v3 APO's channel is a prefix of what an
 //      old UI maps).
-#define MINIEQ_STATUS_VERSION 3
+//   4: appended `initCalls` (struct grew by 8): the APO stamps this in
+//      Initialize, and the status channel is now created there too (not
+//      only in LockForProcess). Lets the UI tell "engine instantiated the
+//      APO but never put it in the processing path" (initCalls > 0,
+//      processCalls == 0, locked == 0) apart from "APO never instantiated".
+#define MINIEQ_STATUS_VERSION 4
 
 typedef struct MiniEQApoStatus {
     uint32_t structSize;             // sizeof(MiniEQApoStatus): versioning
@@ -105,6 +110,7 @@ typedef struct MiniEQApoStatus {
     volatile int32_t initOk;         // Initialize succeeded
     char             buildId[16];    // APO build id (short commit SHA), NUL-terminated
     int64_t          sequence;       // (v3+) seqlock: odd = worker mid-write
+    volatile int64_t initCalls;      // (v4+) successful Initialize calls, all-time
 } MiniEQApoStatus;
 
 // "Global\MiniEQ_{16-hex FNV-1a of endpoint-id}" -- caller supplies a buffer.

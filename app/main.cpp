@@ -69,9 +69,15 @@ enum {
     IDC_BANNERBTN    = 189, // auto-attach banner "Attach MiniEQ" button
 };
 
+// App version: bump for every handed-over build. Shown in the main window
+// title; the MSI filename/version and the CI artifact name are bumped to
+// match (installer/MiniEQ.wxs, .github/workflows/build.yml).
+#define MINIEQ_APP_VERSION L"0.2.0"
+
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
 #define IDT_DEVGHOST 3  // one-shot: a device still missing after 4 s is really gone
+#define IDT_AUTORECOVER 4 // one-shot: next step of the endpoint-reappearance backoff
 
 
 static const wchar_t* kBandNames5[MINIEQ_NUM_BANDS] = {
@@ -129,6 +135,15 @@ static HWND                 g_btnChecklist; // "Checklist" button
 static int                  g_diagState = -1; // -1 unset; see DIAG_* below
 static int64_t              g_lastCalls = 0;
 static ULONGLONG            g_lastTick = 0;
+// Automatic endpoint-reappearance recovery (0.2.0): when a device-change
+// storm settles and our endpoint is back but the EQ path isn't live, the UI
+// runs a bounded backoff of non-elevated path reloads -- 100/250/500 ms,
+// 1 s, 2 s -- then stops and waits for the next device-change event.
+// Never loops, never escalates to UAC by itself: if the silent reloads
+// don't restore the heartbeat, the post-attach verification (armed below)
+// takes over with its one warned escalation. Step 0 = inactive.
+static int                  g_autoRecStep = 0;
+static const int            kAutoRecBackoffMs[5] = { 100, 250, 500, 1000, 2000 };
 static HBRUSH               g_diagBrush[8] = {}; // one per DIAG_* state
 // Banner: shared slot for the auto-attach offer and the engine-reload
 // states. Reload states outrank attach states while they are active.
@@ -166,6 +181,7 @@ static std::wstring         g_verifyText; // custom text for BannerKind::VerifyN
 static ULONGLONG            g_verifyUntil = 0; // 0 = not verifying
 static bool                 g_verifyEscalated = false;
 static bool                 g_verifyNudgePending = false;
+static bool                 g_verifyLoggedStuck = false; // init-without-lock diagnosis logged
 static ULONGLONG            g_lastEscalateTick = 0; // rate-limit for the UAC escalation
 static constexpr ULONGLONG  kVerifyMs = 20000; // 20 s per verification round
 // Engine auto-reload: when the status channel reports a stale APO build, the
@@ -741,6 +757,7 @@ static void ArmAttachVerify() {
     g_verifyUntil = GetTickCount64() + kVerifyMs;
     g_verifyEscalated = false;
     g_verifyNudgePending = false;
+    g_verifyLoggedStuck = false;
     g_verifyText.clear();
     MiniEQ_AppLogCat(L"ENGINE", L"attach verify armed: watching for live heartbeat");
 }
@@ -782,6 +799,22 @@ static void UpdateAttachVerify() {
         UpdateBanner();
         return;
     }
+    // v4: while waiting, distinguish "the engine instantiated the APO but
+    // never put it in the processing path" from "the APO never
+    // instantiated". The former (initCalls > 0, processCalls == 0,
+    // locked == 0) is the stuck state a forced re-enumeration fixes --
+    // log the diagnosis once so the escalation below reads as a finding,
+    // not a guess.
+    if (!g_verifyLoggedStuck) {
+        MiniEQApoStatus vst = {};
+        if (g_statusLink.IsOpen() && g_statusLink.Read(&vst) &&
+            vst.initCalls > 0 && vst.processCalls == 0 && vst.locked == 0) {
+            g_verifyLoggedStuck = true;
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"attach verify: APO instantiated %lld time(s) but never entered the processing path (Initialize without LockForProcess) -- forced re-enumeration is the fix",
+                (long long)vst.initCalls);
+        }
+    }
     if (g_reloadWorkerBusy) {
         // The engine-reload worker is still working on it: don't time out
         // while it runs; the deadline slides with the timer.
@@ -809,6 +842,21 @@ static void UpdateAttachVerify() {
             UpdateBanner();
         }
     }
+}
+
+// Automatic endpoint-reappearance recovery (0.2.0): starts the bounded
+// backoff of silent path reloads. Called when a device-change storm
+// settles with our endpoint present but the EQ path not live. Each step
+// re-runs the non-elevated engine reload; the 500 ms status poll observes
+// the result. Stops on DIAG_LIVE, after 5 steps, or when superseded.
+static void StartAutoRecovery(HWND hwnd) {
+    if (g_autoRecStep != 0) {
+        return; // already running
+    }
+    g_autoRecStep = 1;
+    MiniEQ_AppLogCat(L"ENGINE",
+        L"auto-recovery: endpoint present but path not live; backoff started");
+    SetTimer(hwnd, IDT_AUTORECOVER, kAutoRecBackoffMs[0], nullptr);
 }
 
 static void SelectDevice(int index) {
@@ -1307,6 +1355,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // be a slow re-enumeration (Bluetooth) or a real unplug:
                 // give it 4 s, then fall back instead of showing a ghost.
                 SetTimer(hwnd, IDT_DEVGHOST, 4000, nullptr);
+            } else if (g_attached && !g_endpointId.empty() &&
+                       EndpointInList(g_endpointId) &&
+                       g_verifyUntil == 0 && g_autoRecStep == 0) {
+                // The endpoint survived the storm (Bluetooth reconnect, dock
+                // re-plug) and we're still registered on it. If the EQ path
+                // isn't live, run the automatic reattach: a bounded backoff
+                // of silent path reloads, no UAC, no loops.
+                UpdateDiagStatus();
+                if (g_diagState != DIAG_LIVE) {
+                    StartAutoRecovery(hwnd);
+                }
+            }
+        } else if (wParam == IDT_AUTORECOVER) {
+            KillTimer(hwnd, IDT_AUTORECOVER);
+            if (g_autoRecStep <= 0 || g_autoRecStep > 5) {
+                g_autoRecStep = 0;
+            } else if (g_diagState == DIAG_LIVE) {
+                // The 500 ms poll saw the heartbeat come back: recovered.
+                MiniEQ_AppLogCat(L"ENGINE",
+                    L"auto-recovery: path live, stopping");
+                g_autoRecStep = 0;
+            } else {
+                MiniEQ_AppLogCat(L"ENGINE",
+                    L"auto-recovery: silent reload %d/5", g_autoRecStep);
+                SpawnReloadWorker(/*force=*/true);
+                ++g_autoRecStep;
+                if (g_autoRecStep <= 5) {
+                    SetTimer(hwnd, IDT_AUTORECOVER,
+                             kAutoRecBackoffMs[g_autoRecStep - 1], nullptr);
+                } else {
+                    // Backoff exhausted and the path is still dead: stop the
+                    // silent attempts. Arm the post-attach verification so
+                    // its one warned escalation (forced re-attach) can take
+                    // over -- the user sees the banner before any prompt.
+                    g_autoRecStep = 0;
+                    MiniEQ_AppLogCat(L"ENGINE",
+                        L"auto-recovery: backoff exhausted, arming verification");
+                    ArmAttachVerify();
+                }
             }
         } else if (wParam == IDT_DEVGHOST) {
             KillTimer(hwnd, IDT_DEVGHOST);
@@ -1805,7 +1892,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE /*prev*/, LPWSTR cmdLine, int sho
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, L"MiniEQWnd", L"MiniEQ",
+    wchar_t title[64] = {};
+    StringCchPrintfW(title, ARRAYSIZE(title), L"MiniEQ %s", MINIEQ_APP_VERSION);
+    HWND hwnd = CreateWindowExW(0, L"MiniEQWnd", title,
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 480, 632,
                                 nullptr, nullptr, hInst, nullptr);
