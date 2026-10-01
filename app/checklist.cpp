@@ -71,6 +71,12 @@ std::wstring s_deviceName;
 HWND      s_hDevName = nullptr;
 HWND      s_hSub = nullptr;
 HWND      s_hSect[4] = {};
+// Collapsible sections: a folded block hides its rows and LayoutRows
+// shrinks the window to fit. Headers are clickable (SS_NOTIFY).
+bool      s_collapsed[4] = { false, false, false, false };
+const wchar_t* kSectTitle[4] = {
+    L"INSTALL & REGISTRATION", L"WINDOWS SETTINGS", L"LIVE AUDIO PATH", L"RECOVERY"
+};
 HWND      s_hDot[kRows] = {};
 HWND      s_hTitle[kRows] = {};
 HWND      s_hDetail[kRows] = {};
@@ -502,41 +508,71 @@ int RowHeight(const CheckRow& r) {
     return h + 8; // bottom pad
 }
 
+// Row ranges per collapsible section: 0 -> rows 0..2, 1 -> rows 3..4,
+// 2 -> rows 5..8, 3 -> recovery controls (no check rows).
+static void SectionRange(int s, int& first, int& last) {
+    static const int kFirst[4] = { 0, 3, 5, -1 };
+    static const int kLast[4]  = { 2, 4, 8, -1 };
+    first = kFirst[s];
+    last = kLast[s];
+}
+
+static void UpdateSectionHeaders() {
+    for (int s = 0; s < 4; ++s) {
+        std::wstring t = s_collapsed[s] ? L"\u25B8 " : L"\u25BE ";
+        t += kSectTitle[s];
+        int first, last;
+        SectionRange(s, first, last);
+        if (s_collapsed[s] && first >= 0) {
+            // At-a-glance health while folded: "2/3 working".
+            int ok = 0, total = 0;
+            for (int i = first; i <= last; ++i) {
+                ++total;
+                if (s_rows[i].state == CheckState::Ok) {
+                    ++ok;
+                }
+            }
+            wchar_t buf[48];
+            swprintf(buf, 48, L" \u2014 %d/%d working", ok, total);
+            t += buf;
+        }
+        SetTextIfChanged(s_hSect[s], t.c_str());
+    }
+}
+
 void LayoutRows() {
+    UpdateSectionHeaders();
     int y = 62;
     auto place = [&](HWND h, int x, int w, int hh) {
         MoveWindow(h, x, y, w, hh, TRUE);
     };
     const int sectH = 22;
 
-    place(s_hSect[0], 14, 472, sectH); y += sectH + 4;
-    for (int i = 0; i < 3; ++i) {
-        const int rh = RowHeight(s_rows[i]);
-        MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
-        MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
-        int dy = y + 24;
-        const int lines = WrappedLines(s_rows[i].detail, 448);
-        MoveWindow(s_hDetail[i], 38, dy, 448, lines * 16, TRUE);
-        dy += lines * 16 + 4;
-        const bool showFix = (s_rows[i].state == CheckState::Error &&
-                              !s_rows[i].fix.empty());
-        const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
-        MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
-        ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
-        y += rh;
-    }
-    place(s_hSect[1], 14, 472, sectH); y += sectH + 4;
-    for (int i = 3; i < 5; ++i) {
+    auto hideRow = [&](int i) {
+        ShowWindow(s_hDot[i], SW_HIDE);
+        ShowWindow(s_hTitle[i], SW_HIDE);
+        ShowWindow(s_hDetail[i], SW_HIDE);
+        ShowWindow(s_hFix[i], SW_HIDE);
+        if (i == 3) {
+            ShowWindow(s_hEnhFix, SW_HIDE);
+        }
+    };
+    // Lays out one check row at the current y; returns its height.
+    // withFixBtn adds the one-click "Turn on" button (enhancements row).
+    auto layoutRow = [&](int i, bool withFixBtn) -> int {
         int rh = RowHeight(s_rows[i]);
         // One-click fix button under the fix line, while the row is red:
         // "Turn on" for audio enhancements (index 3). Spatial sound
         // (index 4) is the user's own setting -- MiniEQ never touches it,
         // so it gets no button.
-        HWND hFixBtn = (i == 3 && s_rows[i].state == CheckState::Error)
+        HWND hFixBtn = (withFixBtn && s_rows[i].state == CheckState::Error)
                            ? s_hEnhFix : nullptr;
         if (hFixBtn != nullptr) {
             rh += 34;
         }
+        ShowWindow(s_hDot[i], SW_SHOW);
+        ShowWindow(s_hTitle[i], SW_SHOW);
+        ShowWindow(s_hDetail[i], SW_SHOW);
         MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
         MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
         int dy = y + 24;
@@ -548,36 +584,61 @@ void LayoutRows() {
         const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
         MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
         ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
-        if (hFixBtn != nullptr) {
-            MoveWindow(hFixBtn, 38, dy + fixLines * 16 + 6, 110, 26, TRUE);
-            ShowWindow(hFixBtn, SW_SHOW);
+        if (withFixBtn) {
+            if (hFixBtn != nullptr) {
+                MoveWindow(hFixBtn, 38, dy + fixLines * 16 + 6, 110, 26, TRUE);
+                ShowWindow(hFixBtn, SW_SHOW);
+            } else {
+                ShowWindow(s_hEnhFix, SW_HIDE);
+            }
         }
-        if (i == 3 && hFixBtn != s_hEnhFix) {
-            ShowWindow(s_hEnhFix, SW_HIDE);
+        return rh;
+    };
+
+    place(s_hSect[0], 14, 472, sectH); y += sectH + 4;
+    if (s_collapsed[0]) {
+        for (int i = 0; i < 3; ++i) {
+            hideRow(i);
         }
-        y += rh;
+    } else {
+        for (int i = 0; i < 3; ++i) {
+            y += layoutRow(i, false);
+        }
+    }
+    place(s_hSect[1], 14, 472, sectH); y += sectH + 4;
+    if (s_collapsed[1]) {
+        for (int i = 3; i < 5; ++i) {
+            hideRow(i);
+        }
+    } else {
+        for (int i = 3; i < 5; ++i) {
+            y += layoutRow(i, i == 3);
+        }
     }
     place(s_hSect[2], 14, 472, sectH); y += sectH + 4;
-    for (int i = 5; i < 9; ++i) {
-        const int rh = RowHeight(s_rows[i]);
-        MoveWindow(s_hDot[i], 16, y + 2, 18, 18, TRUE);
-        MoveWindow(s_hTitle[i], 38, y, 448, 20, TRUE);
-        int dy = y + 24;
-        const int lines = WrappedLines(s_rows[i].detail, 448);
-        MoveWindow(s_hDetail[i], 38, dy, 448, lines * 16, TRUE);
-        dy += lines * 16 + 4;
-        const bool showFix = (s_rows[i].state == CheckState::Error &&
-                              !s_rows[i].fix.empty());
-        const int fixLines = showFix ? WrappedLines(s_rows[i].fix, 448) : 1;
-        MoveWindow(s_hFix[i], 38, dy, 448, fixLines * 16, TRUE);
-        ShowWindow(s_hFix[i], showFix ? SW_SHOW : SW_HIDE);
-        y += rh;
+    if (s_collapsed[2]) {
+        for (int i = 5; i < 9; ++i) {
+            hideRow(i);
+        }
+    } else {
+        for (int i = 5; i < 9; ++i) {
+            y += layoutRow(i, false);
+        }
     }
     // Recovery: three-way toggle (Reload path / Re-attach / Watch engine).
     MoveWindow(s_hSect[3], 14, y, 472, sectH, TRUE); y += sectH + 6;
-    MoveWindow(s_hRecSeg, 14, y, 472, 32, TRUE); y += 32 + 6;
-    MoveWindow(s_hRecDesc, 14, y, 472, 40, TRUE); y += 40 + 4;
-    MoveWindow(s_hRecResult, 14, y, 472, 34, TRUE); y += 34 + 4;
+    if (s_collapsed[3]) {
+        ShowWindow(s_hRecSeg, SW_HIDE);
+        ShowWindow(s_hRecDesc, SW_HIDE);
+        ShowWindow(s_hRecResult, SW_HIDE);
+    } else {
+        ShowWindow(s_hRecSeg, SW_SHOW);
+        ShowWindow(s_hRecDesc, SW_SHOW);
+        ShowWindow(s_hRecResult, SW_SHOW);
+        MoveWindow(s_hRecSeg, 14, y, 472, 32, TRUE); y += 32 + 6;
+        MoveWindow(s_hRecDesc, 14, y, 472, 40, TRUE); y += 40 + 4;
+        MoveWindow(s_hRecResult, 14, y, 472, 34, TRUE); y += 34 + 4;
+    }
     MoveWindow(s_hLegend, 14, y + 6, 300, 18, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_COPY), 228, y + 2, 80, 26, TRUE);
     MoveWindow(GetDlgItem(s_hDlg, IDC_CL_REFRESH), 316, y + 2, 80, 26, TRUE);
@@ -587,18 +648,30 @@ void LayoutRows() {
     // shrunken row leaves no ghost text behind.
     InvalidateRect(s_hDlg, nullptr, TRUE);
 
-    // Grow the window if the content needs more room (long device names,
-    // two-line details); never shrink below the designed size.
+    // Fit the window to the content: grow for long text (long device names,
+    // two-line details), shrink when sections are folded. The window is not
+    // user-resizable, so tracking the content height is always correct.
     RECT rc = {};
     GetWindowRect(s_hDlg, &rc);
     const int needClient = y + 40;
-    RECT want = { 0, 0, 500, needClient > 700 ? needClient : 700 };
+    const int wantClient = needClient < 380 ? 380 : needClient;
+    RECT want = { 0, 0, 500, wantClient };
     AdjustWindowRect(&want, (DWORD)GetWindowLongW(s_hDlg, GWL_STYLE), FALSE);
     const int wantH = want.bottom - want.top;
-    if ((rc.bottom - rc.top) < wantH) {
+    if ((rc.bottom - rc.top) != wantH) {
         SetWindowPos(s_hDlg, nullptr, 0, 0, rc.right - rc.left, wantH,
                      SWP_NOMOVE | SWP_NOZORDER);
     }
+}
+
+// Header tap: fold/unfold a section, then re-layout (which repaints and
+// resizes the window to fit).
+static void ToggleSection(int s) {
+    if (s < 0 || s > 3) {
+        return;
+    }
+    s_collapsed[s] = !s_collapsed[s];
+    LayoutRows();
 }
 
 // Background diagnosis: the worker thread runs the probes, the window only
@@ -696,8 +769,10 @@ void ClOnCreate(HWND hwnd) {
     s_fontBold = ClMakeFont(true);
 
     auto makeStatic = [&](int id, const wchar_t* text, int x, int y, int w,
-                          int h, bool bold) -> HWND {
-        HWND ctl = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                          int h, bool bold, bool notify = false) -> HWND {
+        HWND ctl = CreateWindowW(L"STATIC", text,
+                                 WS_CHILD | WS_VISIBLE | SS_LEFT |
+                                     (notify ? SS_NOTIFY : 0),
                                  x, y, w, h, hwnd, (HMENU)(INT_PTR)id,
                                  s_hInst, nullptr);
         SendMessageW(ctl, WM_SETFONT, (WPARAM)(bold ? s_fontBold : s_font), TRUE);
@@ -724,11 +799,10 @@ void ClOnCreate(HWND hwnd) {
 
     s_hSub = makeStatic(IDC_CL_SUB, L"", 14, 38, 472, 18, false);
 
-    const wchar_t* sects[3] = {
-        L"INSTALL & REGISTRATION", L"WINDOWS SETTINGS", L"LIVE AUDIO PATH"
-    };
+    // Clickable section headers (SS_NOTIFY): tap to fold/unfold.
     for (int s = 0; s < 3; ++s) {
-        s_hSect[s] = makeStatic(IDC_CL_SECT1 + s, sects[s], 14, 0, 472, 22, false);
+        s_hSect[s] = makeStatic(IDC_CL_SECT1 + s, kSectTitle[s], 14, 0, 472, 22,
+                                false, true);
     }
 
     for (int i = 0; i < kRows; ++i) {
@@ -751,7 +825,8 @@ void ClOnCreate(HWND hwnd) {
     ShowWindow(s_hEnhFix, SW_HIDE);
 
     // Recovery: three-way toggle. LayoutRows positions everything.
-    s_hSect[3] = makeStatic(IDC_CL_SECT4, L"RECOVERY", 14, 0, 472, 22, false);
+    s_hSect[3] = makeStatic(IDC_CL_SECT4, kSectTitle[3], 14, 0, 472, 22, false,
+                            true);
     s_hRecSeg = CreateWindowW(L"STATIC", L"",
                               WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY,
                               0, 0, 472, 32, hwnd,
@@ -1108,6 +1183,20 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_COMMAND:
+        if (HIWORD(wp) == STN_CLICKED) {
+            // Section header tap: fold/unfold the block.
+            // (SECT4 is not consecutive with SECT1..3, so map explicitly.)
+            const int id = LOWORD(wp);
+            if (id == IDC_CL_SECT1 || id == IDC_CL_SECT2 ||
+                id == IDC_CL_SECT3) {
+                ToggleSection(id - IDC_CL_SECT1);
+                return 0;
+            }
+            if (id == IDC_CL_SECT4) {
+                ToggleSection(3);
+                return 0;
+            }
+        }
         if (LOWORD(wp) == IDC_CL_RECSEG && HIWORD(wp) == STN_CLICKED) {
             // Recovery toggle tap: hit-test which third was tapped.
             POINT pt = {};
@@ -1194,7 +1283,9 @@ LRESULT CALLBACK ClWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_fontName = nullptr;
         s_hDlg = nullptr;
         s_open = false;
-        PostQuitMessage(0);
+        // NOTE: no PostQuitMessage here. This window runs a nested modal
+        // loop that exits on s_open == false; posting WM_QUIT would leak
+        // into the main window's message loop and quit the whole app.
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
