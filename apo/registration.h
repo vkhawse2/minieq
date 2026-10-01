@@ -57,6 +57,9 @@ HRESULT MiniEQ_IsAttachedToEndpoint(const wchar_t* endpointId, bool* attached);
 // with MINIEQ_EFX_SLOT start in EFX mode.
 void MiniEQ_SetEffectSlot(bool useEfx);
 
+// Short name of the active effect slot ("SFX" or "EFX") for UI labels.
+const wchar_t* MiniEQ_EffectSlotShortName();
+
 // R2: APO-chaining bookkeeping. Attach stashes the incumbent SFX-slot CLSID
 // (when it is a real third-party APO, not us) under
 // HKLM\SOFTWARE\MiniEQ\ChildAPO\<endpoint-guid>; the APO reads it at

@@ -1177,7 +1177,12 @@ void CEqApo::StopWorker() {
         SetEvent(m_hWorkerStop);
     }
     if (m_hWorkerThread != nullptr) {
-        WaitForSingleObject(m_hWorkerThread, 2000);
+        // Wait for the thread to actually exit -- never abandon it. The old
+        // 2 s timeout let UnlockForProcess unmap the status view and shut
+        // down DSP state while the worker could still be inside WorkerStep /
+        // PublishStatus writing to it: heap corruption / AV surfacing later
+        // as a crash in the engine wrapper's Release during graph teardown.
+        WaitForSingleObject(m_hWorkerThread, INFINITE);
         CloseHandle(m_hWorkerThread);
         m_hWorkerThread = nullptr;
     }

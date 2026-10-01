@@ -42,6 +42,11 @@
 #include "dsp.h"
 #include "../shared/settings_channel.h"
 
+// dllmain.cpp -- module lock count backing DllCanUnloadNow. Every live APO
+// object holds one count from CreateInstance until its inner refcount reaches
+// zero; without it ole32 can unload the DLL while instances are alive.
+extern volatile LONG g_MiniEQDllLockCount;
+
 class CEqApo : public IAudioProcessingObject,
                public IAudioProcessingObjectRT,
                public IAudioProcessingObjectConfiguration,
@@ -114,6 +119,11 @@ private:
         STDMETHODIMP_(ULONG) Release() override {
             const ULONG c = --m_cRef;
             if (c == 0) {
+                // Release the DLL lifetime lock *before* deleting the owner:
+                // after this point no code in this module may run for the
+                // object, but the module itself must stay mapped until the
+                // engine's wrapper finishes its own Release.
+                InterlockedDecrement(&g_MiniEQDllLockCount);
                 delete m_pOwner;
             }
             return c;

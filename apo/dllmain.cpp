@@ -22,7 +22,15 @@
 
 #include <strsafe.h>
 
-static volatile LONG g_lockCount = 0;
+// Module lock count backing DllCanUnloadNow. The class factory's AddRef /
+// Release / LockServer touch it, and -- critically -- every live APO object
+// holds one count from CreateInstance until its inner refcount reaches zero
+// (see CInnerUnknown::Release in eq_apo.h). Without the per-object count the
+// engine releases the factory right after CreateInstance, DllCanUnloadNow
+// wrongly returns S_OK while APO instances are alive, ole32 unloads our DLL
+// mid-session, and the engine's CSystemEffectWrapper then calls through
+// unmapped memory -- the 0xc0000005 crash seen in audiodg.exe.
+volatile LONG g_MiniEQDllLockCount = 0;
 static HMODULE g_hModule = nullptr;
 
 //------------------------------------------------------------------------------
@@ -42,10 +50,10 @@ public:
         return E_NOINTERFACE;
     }
     STDMETHODIMP_(ULONG) AddRef() override {
-        return (ULONG)InterlockedIncrement(&g_lockCount);
+        return (ULONG)InterlockedIncrement(&g_MiniEQDllLockCount);
     }
     STDMETHODIMP_(ULONG) Release() override {
-        return (ULONG)InterlockedDecrement(&g_lockCount);
+        return (ULONG)InterlockedDecrement(&g_MiniEQDllLockCount);
     }
     STDMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (ppv == nullptr) return E_POINTER;
@@ -62,14 +70,19 @@ public:
         if (pUnkOuter != nullptr && riid != IID_IUnknown) return E_NOINTERFACE;
         CEqApo* apo = new (std::nothrow) CEqApo(pUnkOuter);
         if (apo == nullptr) return E_OUTOFMEMORY;
+        // Hold the DLL loaded for this object's whole lifetime. Balanced in
+        // CInnerUnknown::Release when the inner count reaches zero (which
+        // deletes the owner) -- including the QI-failure path below, where
+        // NonDelegatingRelease drops the count to zero and deletes.
+        InterlockedIncrement(&g_MiniEQDllLockCount);
         HRESULT hr = apo->NonDelegatingQueryInterface(riid, ppv);
         apo->NonDelegatingRelease(); // balance the initial inner ref
         MiniEQ_Trace(L"MiniEQ_APO: CreateInstance -> hr=0x%08lx", hr);
         return hr;
     }
     STDMETHODIMP LockServer(BOOL bLock) override {
-        if (bLock) InterlockedIncrement(&g_lockCount);
-        else InterlockedDecrement(&g_lockCount);
+        if (bLock) InterlockedIncrement(&g_MiniEQDllLockCount);
+        else InterlockedDecrement(&g_MiniEQDllLockCount);
         return S_OK;
     }
 };
@@ -115,7 +128,7 @@ try {
 }
 
 STDAPI DllCanUnloadNow() {
-    return g_lockCount == 0 ? S_OK : S_FALSE;
+    return g_MiniEQDllLockCount == 0 ? S_OK : S_FALSE;
 }
 
 STDAPI DllRegisterServer() {

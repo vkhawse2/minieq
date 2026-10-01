@@ -606,7 +606,8 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
     if (!snap.attached) {
         v.severity = DiagSeverity::Warn;
         v.title = L"MiniEQ isn't attached to this device.";
-        v.detail = L"The SFX slot of this endpoint doesn't point at MiniEQ_APO, "
+        v.detail = std::wstring(MiniEQ_EffectSlotShortName()) +
+                   L" slot of this endpoint doesn't point at MiniEQ_APO, "
                    L"so Windows never loads our equalizer for it.";
         v.nextStep = L"In the main window, click \"Attach to this device\" "
                      L"(one admin approval).";
@@ -665,7 +666,8 @@ DiagVerdict MiniEQ_MakeVerdict(const DiagSnapshot& snap) {
         // yet the engine never instantiated our APO for this stream.
         v.severity = DiagSeverity::Bad;
         v.title = L"MiniEQ is attached, but Windows never loaded it.";
-        v.detail = L"Registration is correct \u2014 the SFX slot points at MiniEQ_APO "
+        v.detail = std::wstring(MiniEQ_EffectSlotShortName()) +
+                   L" slot registration is correct \u2014 it points at MiniEQ_APO "
                    L"and audio enhancements are on \u2014 but audiodg.exe never "
                    L"instantiated our APO for this stream. Windows skipped it "
                    L"silently, with no error.";
@@ -782,7 +784,8 @@ std::wstring MiniEQ_FormatReport(const DiagSnapshot& snap, const DiagVerdict& v)
     r += snap.exclusiveHeld ? L"yes \u2014 an app is bypassing the engine" : L"no";
 
     r += L"\r\n\r\nREGISTRATION\r\n";
-    r += L"SFX slot points at MiniEQ: ";
+    r += MiniEQ_EffectSlotShortName();
+    r += L" slot points at MiniEQ: ";
     r += snap.attached ? L"yes" : L"no";
     r += L"\r\nDLL path: ";
     r += snap.dllPath.empty() ? L"(not registered)" : snap.dllPath;
@@ -1196,7 +1199,8 @@ static void RefreshDiagCenter(bool forceLog) {
     }
     SetTextIfChanged(s_hEngine, eng);
 
-    std::wstring reg = L"SFX slot \u2192 MiniEQ: ";
+    std::wstring reg = MiniEQ_EffectSlotShortName();
+    reg += L" slot \u2192 MiniEQ: ";
     reg += snap.attached ? L"yes \u2713" : L"no";
     reg += L"\r\nDLL path: ";
     reg += snap.dllPath.empty() ? L"(not registered)" : snap.dllPath;

@@ -32,6 +32,10 @@ void MiniEQ_SetEffectSlot(bool useEfx) {
     g_fxSlot = useEfx ? kFxEfxSlot : kFxSfxSlot;
 }
 
+const wchar_t* MiniEQ_EffectSlotShortName() {
+    return g_fxSlot == kFxEfxSlot ? L"EFX" : L"SFX";
+}
+
 static HRESULT ClsidString(wchar_t* out, size_t cch) {
     if (StringFromGUID2(CLSID_MiniEQAPO, out, (int)cch) == 0) {
         return E_FAIL;
@@ -273,6 +277,13 @@ HRESULT MiniEQ_ReadChildApoClsid(const wchar_t* endpointId, wchar_t* out,
     if (rc != ERROR_SUCCESS || type != REG_SZ) {
         out[0] = L'\0';
         return S_FALSE;
+    }
+    // Defensive: strip a trailing ",N" slot suffix if some stash (or unusual
+    // slot data) carried it -- CLSIDFromString needs the bare CLSID. Bare
+    // CLSIDs pass through untouched.
+    wchar_t* comma = wcsrchr(out, L',');
+    if (comma != nullptr && comma > out && *(comma - 1) == L'}') {
+        *comma = L'\0';
     }
     return S_OK;
 }
