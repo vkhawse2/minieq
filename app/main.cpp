@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.6"
+#define MINIEQ_APP_VERSION L"0.2.7"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
@@ -146,6 +146,7 @@ static bool                 g_breakerLatchSeen = false; // breaker-latch edge de
 // don't restore the heartbeat, the post-attach verification (armed below)
 // takes over with its one warned escalation. Step 0 = inactive.
 static int                  g_autoRecStep = 0;
+static DWORD                g_autoRecPid = 0; // audiodg pid when the backoff began (engine-death watchdog)
 static const int            kAutoRecBackoffMs[5] = { 100, 250, 500, 1000, 2000 };
 static HBRUSH               g_diagBrush[8] = {}; // one per DIAG_* state
 // Banner: shared slot for the auto-attach offer and the engine-reload
@@ -894,10 +895,14 @@ static void StartAutoRecovery(HWND hwnd) {
     if (MiniEQ_BreakerLatched()) {
         return; // SAFE/DETACHED: automatic recovery stays off until the user re-attaches
     }
+    if (MiniEQ_BreakerRestartLoopActive()) {
+        return; // engine is crash-looping: silent reloads would only feed it
+    }
     if (g_autoRecStep != 0) {
         return; // already running
     }
     g_autoRecStep = 1;
+    g_autoRecPid = MiniEQ_CurrentAudiodgPid(); // engine-death watchdog baseline
     MiniEQ_AppLogCat(L"ENGINE",
         L"auto-recovery: endpoint present but path not live; backoff started");
     SetTimer(hwnd, IDT_AUTORECOVER, kAutoRecBackoffMs[0], nullptr);
@@ -1539,12 +1544,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     L"auto-recovery stopped -- circuit breaker is latched");
             } else if (g_autoRecStep <= 0 || g_autoRecStep > 5) {
                 g_autoRecStep = 0;
+            } else if (MiniEQ_BreakerRestartLoopActive() ||
+                       (g_autoRecPid != 0 && MiniEQ_CurrentAudiodgPid() != 0 &&
+                        MiniEQ_CurrentAudiodgPid() != g_autoRecPid)) {
+                // The engine died underneath the backoff (audiodg restarted
+                // since it began, or is crash-looping): every further format
+                // flip is an audible break in a dying engine. Stop here and
+                // let the breaker and the user decide what happens next.
+                g_autoRecStep = 0;
+                MiniEQ_AppLogCat(L"ENGINE",
+                    L"auto-recovery stopped -- audiodg restarted underneath us; standing down");
             } else if (g_diagState == DIAG_LIVE) {
                 // The 500 ms poll saw the heartbeat come back: recovered.
                 MiniEQ_AppLogCat(L"ENGINE",
                     L"auto-recovery: path live, stopping");
                 g_autoRecStep = 0;
             } else {
+                MiniEQApoStatus st = {};
+                if (g_statusLink.IsOpen() && g_statusLink.Read(&st) &&
+                    st.initCalls > 0 && st.processCalls == 0 && st.locked == 0) {
+                    // The engine instantiates the APO but never puts it in
+                    // the processing path. Format flips don't fix that
+                    // (seen 10:47 and 11:10); skip the remaining reloads
+                    // and go straight to the forced re-attach escalation.
+                    g_autoRecStep = 0;
+                    MiniEQ_AppLogCat(L"ENGINE",
+                        L"auto-recovery: APO instantiated but never locks; "
+                        L"skipping remaining reloads, arming verification");
+                    ArmAttachVerify();
+                    return 0;
+                }
                 MiniEQ_AppLogCat(L"ENGINE",
                     L"auto-recovery: silent reload %d/5", g_autoRecStep);
                 SpawnReloadWorker(/*force=*/true);

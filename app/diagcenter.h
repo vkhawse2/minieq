@@ -149,6 +149,9 @@ void MiniEQ_BreakerUserResume();
 // refuses to run recovery cycles while this holds: automatic reloads during
 // a storm would only feed the loop the breaker exists to starve.
 bool MiniEQ_BreakerRestartLoopActive();
+// Current audiodg.exe PID (0 if not running). Used by the app's recovery
+// backoff to notice the engine dying underneath it and stand down.
+DWORD MiniEQ_CurrentAudiodgPid();
 #define WM_APP_BREAKER_DONE (WM_APP + 103)
 // wParam outcomes for WM_APP_BREAKER_DONE:
 enum { BreakerOutcomeLaunched = 0, BreakerOutcomeUacDeclined = 1,

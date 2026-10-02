@@ -139,6 +139,10 @@ bool MiniEQ_BreakerRestartLoopActive() {
     return s_restartLoopNow.load(std::memory_order_acquire);
 }
 
+DWORD MiniEQ_CurrentAudiodgPid() {
+    return FindAudiodgPid();
+}
+
 // Deliberate user re-attach: the only way out of the SAFE/DETACHED latch.
 void MiniEQ_BreakerUserResume() {
     if (s_breakerLatched.exchange(false, std::memory_order_acq_rel)) {
