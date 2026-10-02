@@ -1,1 +1,1 @@
-This repo is a proff that the low ram usage and clean ui Equalizer can exist. 
+This repo is a proof that the low ram usage and clean ui Equalizer can exist. 
