@@ -144,6 +144,11 @@ void MiniEQ_BreakerSampleAudiodg();
 // may run or re-arm, so MiniEQ can never feed the crash loop it detected.
 bool MiniEQ_BreakerLatched();
 void MiniEQ_BreakerUserResume();
+// True while audiodg.exe is crash-looping (3+ PID changes in 10 min, fed
+// passively by the 500 ms sampler). The path supervisor in the main window
+// refuses to run recovery cycles while this holds: automatic reloads during
+// a storm would only feed the loop the breaker exists to starve.
+bool MiniEQ_BreakerRestartLoopActive();
 #define WM_APP_BREAKER_DONE (WM_APP + 103)
 // wParam outcomes for WM_APP_BREAKER_DONE:
 enum { BreakerOutcomeLaunched = 0, BreakerOutcomeUacDeclined = 1,

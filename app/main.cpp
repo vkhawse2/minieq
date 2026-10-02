@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.5"
+#define MINIEQ_APP_VERSION L"0.2.6"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
@@ -722,10 +722,16 @@ static void UpdateDiagStatus() {
             state = DIAG_ERROR;
             StringCchCopyW(text, ARRAYSIZE(text),
                 L"\u25CF Audio is playing but NOT going through MiniEQ");
-            StringCchCopyW(hint, ARRAYSIZE(hint),
-                L"Try replaying the audio. If it stays red, open the Audio Path "
-                L"Checklist and press Re-attach (Recovery section) \u2014 one click, "
-                L"no settings to hunt for.");
+            if (g_autoRecStep != 0 || g_verifyUntil != 0) {
+                StringCchCopyW(hint, ARRAYSIZE(hint),
+                    L"MiniEQ noticed and is repairing the path by itself \u2014 "
+                    L"give it a few seconds. No clicks needed.");
+            } else {
+                StringCchCopyW(hint, ARRAYSIZE(hint),
+                    L"Try replaying the audio. If it stays red, open the Audio Path "
+                    L"Checklist and press Re-attach (Recovery section) \u2014 one click, "
+                    L"no settings to hunt for.");
+            }
         } else {
             state = DIAG_WAITING;
             StringCchCopyW(text, ARRAYSIZE(text),
@@ -916,6 +922,86 @@ static void CancelRecoveryForBreaker(HWND hwnd) {
             L"auto-recovery cancelled -- circuit breaker is latched");
     }
     UpdateBanner();
+}
+
+// Path supervisor (0.2.6): the "nobody pressed anything" trigger for the
+// recovery chain above. Attach-verify only arms after a manual attach and
+// auto-recovery only after a device-change storm, so an install-attach (or
+// a boot) that leaves the engine with a stale graph sat forever until the
+// user opened the checklist and pressed Reload path. Now the 500 ms tick
+// watches for one sustained symptom -- audio playing on an attached
+// endpoint while the APO heartbeat is absent/stale (DIAG_ERROR, already
+// ~4 s debounced by the state machine) -- and starts the same bounded
+// chain: silent reloads, then one warned forced re-attach, then honest
+// stand-down. Budget: 2 cycles per failure episode, 5 per session,
+// >=60 s between cycles, all of it off while the breaker is latched. A
+// manual attach or a device switch resets the budget.
+static ULONGLONG    g_superDeadSince = 0;      // first tick of this dead streak
+static ULONGLONG    g_superLastCycle = 0;      // last cycle start (rate limit)
+static int          g_superEpisodeCycles = 0;  // cycles in the current failure episode
+static int          g_superSessionCycles = 0;  // cycles since launch
+static std::wstring g_superEndpoint;           // endpoint the counters belong to
+
+static void ResetPathSupervisor() {
+    g_superDeadSince = 0;
+    g_superLastCycle = 0;
+    g_superEpisodeCycles = 0;
+    g_superSessionCycles = 0;
+}
+
+static void UpdatePathSupervisor(HWND hwnd) {
+    if (g_endpointId != g_superEndpoint) {
+        g_superEndpoint = g_endpointId;
+        ResetPathSupervisor();
+    }
+    if (MiniEQ_BreakerLatched()) {
+        return; // SAFE/DETACHED: automation stays off until the user re-attaches
+    }
+    if (MiniEQ_BreakerRestartLoopActive()) {
+        // Engine is dying in a crash loop: reload attempts would only feed
+        // it. Stand down and let the breaker do its job.
+        g_superDeadSince = 0;
+        return;
+    }
+    if (!g_attached || g_endpointId.empty()) {
+        g_superDeadSince = 0;
+        return;
+    }
+    if (g_diagState == DIAG_LIVE) {
+        // Healthy again (by our hand or the engine's): the next failure is
+        // a new episode with a fresh per-episode budget.
+        g_superDeadSince = 0;
+        g_superEpisodeCycles = 0;
+        return;
+    }
+    if (g_diagState != DIAG_ERROR) {
+        g_superDeadSince = 0;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_superDeadSince == 0) {
+        g_superDeadSince = now;
+        return;
+    }
+    if (now - g_superDeadSince < 10000) {
+        return; // ~10 s sustained, plus the state machine's own debounce
+    }
+    if (g_autoRecStep != 0 || g_verifyUntil != 0) {
+        return; // a recovery chain is already running
+    }
+    if (g_superEpisodeCycles >= 2 || g_superSessionCycles >= 5) {
+        return; // spent: further repair is the user's call, not a loop
+    }
+    if (g_superLastCycle != 0 && now - g_superLastCycle < 60000) {
+        return;
+    }
+    ++g_superEpisodeCycles;
+    ++g_superSessionCycles;
+    g_superLastCycle = now;
+    MiniEQ_AppLogCat(L"ENGINE",
+        L"path supervisor: audio is playing but the APO isn't in the path; "
+        L"starting automatic recovery (no clicks needed)");
+    StartAutoRecovery(hwnd);
 }
 
 static void SelectDevice(int index) {
@@ -1393,6 +1479,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == IDT_DIAG) {
             UpdateDiagStatus();
             UpdateAttachVerify(); // post-attach heartbeat watch, if armed
+            UpdatePathSupervisor(hwnd); // 0.2.6: no-clicks trigger for the recovery chain
             // Circuit breaker: feed the passive crash-loop detector on
             // every tick (audiodg lives only ~3 s in a crash loop, so the
             // old 5 s sampling aliased whole restarts away), but poll --
@@ -1548,6 +1635,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // A deliberate attach/detach is the one user action that
                 // clears the circuit-breaker latch.
                 MiniEQ_BreakerUserResume();
+                ResetPathSupervisor(); // deliberate attach earns a fresh repair budget
                 RelaunchElevatedAttach(!g_attached, /*force=*/false);
             }
         } else if (id == IDC_POWER) {
@@ -1574,6 +1662,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (!g_endpointId.empty() && !g_attached) {
                     MiniEQ_AppLog(L"UI: attach banner accepted for new default device");
                     MiniEQ_BreakerUserResume(); // deliberate attach clears the latch
+                    ResetPathSupervisor();
                     if (DoElevatedAttach(true, /*force=*/false)) {
                         ChainReloadForBanner();
                     }

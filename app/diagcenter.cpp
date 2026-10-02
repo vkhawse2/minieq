@@ -77,6 +77,7 @@ static DWORD FindAudiodgPid() {
 // window's timer (UI thread) and the diagnostics worker thread, so the
 // little history ring is guarded by a lock.
 static SRWLOCK    s_loopLock = SRWLOCK_INIT;
+static std::atomic<bool> s_restartLoopNow{false}; // last loop verdict (read by the app's path supervisor)
 static DWORD      s_loopLastPid = 0;
 static ULONGLONG  s_loopChangeTicks[4] = {};
 static int        s_loopChangeCount = 0;
@@ -100,6 +101,7 @@ static bool NoteAudiodgPid(DWORD pid) {
         }
     }
     const bool loop = (recent >= 3);
+    s_restartLoopNow.store(loop, std::memory_order_release);
     ReleaseSRWLockExclusive(&s_loopLock);
     return loop;
 }
@@ -131,6 +133,10 @@ void MiniEQ_BreakerNoteUserAction() {
 
 bool MiniEQ_BreakerLatched() {
     return s_breakerLatched.load(std::memory_order_acquire);
+}
+
+bool MiniEQ_BreakerRestartLoopActive() {
+    return s_restartLoopNow.load(std::memory_order_acquire);
 }
 
 // Deliberate user re-attach: the only way out of the SAFE/DETACHED latch.
