@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.7"
+#define MINIEQ_APP_VERSION L"0.2.8"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends

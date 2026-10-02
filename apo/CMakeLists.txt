@@ -32,7 +32,7 @@ target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32 setupapi)
 # engine's graph-construction window. Diagnosis uses the status-channel
 # handshake (initCalls/processCalls) instead. Flip to 1 only for a
 # throwaway diagnosis build.
-target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=0)
+target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=1)  # THROWAWAY DIAGNOSTIC BUILD (diag/apo-trace branch only)
 
 # Build id for the status-channel stamp (see root CMakeLists).
 target_compile_definitions(MiniEQ_APO PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")
