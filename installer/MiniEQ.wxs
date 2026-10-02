@@ -23,7 +23,7 @@
   <Product Id="*"
            Name="MiniEQ"
            Language="1033"
-           Version="0.2.3"
+           Version="0.2.4"
            Manufacturer="vkhawse2"
            UpgradeCode="A220824C-9C18-477E-92BB-1E0210B316DB">
 

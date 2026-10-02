@@ -134,7 +134,9 @@ void MiniEQ_BreakerPoll(HWND owner);
 // current audiodg PID without evaluating or firing the response (Poll
 // keeps the ~5 s response cadence). Feeding every tick stops a crash
 // loop's ~3 s engine lifetimes from aliasing through the old 5 s feed,
-// which is why the breaker used to miss storms entirely.
+// which is why the breaker used to miss storms entirely. Also maintains
+// the audiodg lifetime watch: each restart is written to the app log with
+// the previous instance's lifetime.
 void MiniEQ_BreakerSampleAudiodg();
 // SAFE/DETACHED latch: set the moment the breaker trips and cleared only by
 // a deliberate user re-attach (MiniEQ_BreakerUserResume). While latched, no

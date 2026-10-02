@@ -204,11 +204,54 @@ static DWORD WINAPI BreakerSweepThread(LPVOID param) {
     return 0;
 }
 
+// Human lifetime for one audiodg instance: "3.2 s", "4m 07s", "2h 04m".
+static void FormatEngineLifetime(ULONGLONG ms, wchar_t* buf, size_t cch) {
+    const double secs = ms / 1000.0;
+    if (secs < 60.0) {
+        StringCchPrintfW(buf, cch, L"%.1f s", secs);
+    } else if (secs < 3600.0) {
+        const unsigned long total = static_cast<unsigned long>(secs);
+        StringCchPrintfW(buf, cch, L"%lum %02lus", total / 60, total % 60);
+    } else {
+        const unsigned long total = static_cast<unsigned long>(secs);
+        StringCchPrintfW(buf, cch, L"%luh %02lum", total / 3600,
+                         (total % 3600) / 60);
+    }
+}
+
+// audiodg lifetime watch (0.2.4): every engine PID change is written to the
+// app log with how long the previous instance lived, so a crash storm reads
+// as a run of 2-3 s lifetimes and a healthy engine as one long-lived pid.
+// Runs on the UI thread only (IDT_DIAG sampling), hence plain statics.
+static DWORD     s_watchPid = 0;
+static ULONGLONG s_watchPidSince = 0;
+
 // Feed-only detector sampling (see header): called on every 500 ms status
 // tick so a crash loop's short-lived engines are actually observed. The
 // trip/response decision stays in MiniEQ_BreakerPoll on its slower cadence.
 void MiniEQ_BreakerSampleAudiodg() {
-    (void)NoteAudiodgPid(FindAudiodgPid());
+    const DWORD pid = FindAudiodgPid();
+    (void)NoteAudiodgPid(pid);
+    const ULONGLONG now = GetTickCount64();
+    if (pid == s_watchPid) {
+        return;
+    }
+    if (s_watchPid != 0) {
+        wchar_t lived[32] = {};
+        FormatEngineLifetime(now - s_watchPidSince, lived, ARRAYSIZE(lived));
+        if (pid == 0) {
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"audiodg.exe exited (pid %lu lived %s)", s_watchPid, lived);
+        } else {
+            MiniEQ_AppLogCat(L"ENGINE",
+                L"audiodg.exe restarted: pid %lu -> %lu (previous lived %s)",
+                s_watchPid, pid, lived);
+        }
+    } else if (pid != 0) {
+        MiniEQ_AppLogCat(L"ENGINE", L"audiodg.exe pid %lu (watching)", pid);
+    }
+    s_watchPid = pid;
+    s_watchPidSince = now;
 }
 
 // Poll entry, called from the main window's status timer about every 5 s.
