@@ -130,6 +130,12 @@ DiagBundle MiniEQ_RunDiagnosisLocked(const std::wstring& endpointId);
 // breaker non-blockingly; the outcome arrives as WM_APP_BREAKER_DONE.
 void MiniEQ_BreakerNoteUserAction();
 void MiniEQ_BreakerPoll(HWND owner);
+// Feed-only detector sampling for the 500 ms status tick: records the
+// current audiodg PID without evaluating or firing the response (Poll
+// keeps the ~5 s response cadence). Feeding every tick stops a crash
+// loop's ~3 s engine lifetimes from aliasing through the old 5 s feed,
+// which is why the breaker used to miss storms entirely.
+void MiniEQ_BreakerSampleAudiodg();
 // SAFE/DETACHED latch: set the moment the breaker trips and cleared only by
 // a deliberate user re-attach (MiniEQ_BreakerUserResume). While latched, no
 // automatic recovery -- attach verification, silent reloads, engine watch --

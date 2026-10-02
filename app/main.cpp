@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.2"
+#define MINIEQ_APP_VERSION L"0.2.3"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
@@ -107,6 +107,7 @@ static const float kPresets10[4][MINIEQ_MAX_BANDS] = {
 static HINSTANCE            g_hInst;
 static HWND                 g_hwnd;
 static HWND                 g_deviceName;
+static HFONT                g_nameFont = nullptr; // header font; freed in WM_DESTROY
 static HWND                 g_combo, g_refresh, g_attach, g_status;
 static HWND                 g_band[MINIEQ_MAX_BANDS], g_bandVal[MINIEQ_MAX_BANDS];
 static HWND                 g_bandName[MINIEQ_MAX_BANDS];
@@ -1120,15 +1121,15 @@ static void BuildControls(HWND hwnd) {
 
     // Prominent current-device header: the device name is the first thing the
     // user sees when the app opens.
-    HFONT nameFont = CreateFontW(-22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    g_nameFont = CreateFontW(-22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                  CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                  DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_deviceName = CreateWindowW(L"STATIC", L"No output device",
-                                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS,
                                  12, 10, 456, 30, hwnd, (HMENU)IDC_DEVICENAME,
                                  g_hInst, nullptr);
-    SendMessageW(g_deviceName, WM_SETFONT, (WPARAM)nameFont, TRUE);
+    SendMessageW(g_deviceName, WM_SETFONT, (WPARAM)g_nameFont, TRUE);
 
     CreateWindowW(L"STATIC", L"Device:", WS_CHILD | WS_VISIBLE,
                   12, 52, 52, 18, hwnd, nullptr, g_hInst, nullptr);
@@ -1392,9 +1393,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == IDT_DIAG) {
             UpdateDiagStatus();
             UpdateAttachVerify(); // post-attach heartbeat watch, if armed
-            // Circuit breaker: poll the passive crash-loop detector about
-            // every 5 s. It fires non-blockingly and only on a genuine
-            // restart loop; the outcome arrives as WM_APP_BREAKER_DONE.
+            // Circuit breaker: feed the passive crash-loop detector on
+            // every tick (audiodg lives only ~3 s in a crash loop, so the
+            // old 5 s sampling aliased whole restarts away), but poll --
+            // evaluate and, on a genuine restart loop, fire -- only about
+            // every 5 s. It fires non-blockingly; the outcome arrives as
+            // WM_APP_BREAKER_DONE.
+            MiniEQ_BreakerSampleAudiodg();
             static int breakerTick = 0;
             if ((++breakerTick % 10) == 0) {
                 MiniEQ_BreakerPoll(hwnd);
@@ -1776,6 +1781,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_bannerWarnBrush != nullptr) {
             DeleteObject(g_bannerWarnBrush);
             g_bannerWarnBrush = nullptr;
+        }
+        if (g_nameFont != nullptr) {
+            DeleteObject(g_nameFont);
+            g_nameFont = nullptr;
         }
         PostQuitMessage(0);
         return 0;

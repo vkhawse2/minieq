@@ -204,6 +204,13 @@ static DWORD WINAPI BreakerSweepThread(LPVOID param) {
     return 0;
 }
 
+// Feed-only detector sampling (see header): called on every 500 ms status
+// tick so a crash loop's short-lived engines are actually observed. The
+// trip/response decision stays in MiniEQ_BreakerPoll on its slower cadence.
+void MiniEQ_BreakerSampleAudiodg() {
+    (void)NoteAudiodgPid(FindAudiodgPid());
+}
+
 // Poll entry, called from the main window's status timer about every 5 s.
 // Feeds the passive detector with the current engine PID; fires the breaker
 // (non-blocking) only when a genuine restart loop is confirmed.

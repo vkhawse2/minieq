@@ -149,6 +149,11 @@ private:
                                     IAudioMediaType** ppOut);
     // R2: release the chained child APO, if any. Idempotent.
     void ReleaseChild();
+    // R2 (0.2.3): create the chained child APO lazily at the first
+    // LockForProcess instead of inside Initialize -- keeps foreign
+    // CoCreateInstance/Initialize calls off the engine's graph-construction
+    // thread. One attempt per instance; failure simply means "no child".
+    void EnsureChildApo();
 
     // Worker thread helpers (non-RT): (re)create the channel mappings if the
     // initial creation in LockForProcess failed, service XFeed requests.
@@ -229,14 +234,21 @@ private:
 
     // R2: chained child APO -- the incumbent this APO displaced from the
     // endpoint's SFX slot (e.g. a vendor effect), stashed at attach time by
-    // MiniEQ_AttachToEndpoint under HKLM\SOFTWARE\MiniEQ\ChildAPO. Created
-    // in Initialize; every call is delegated (negotiate -> lock -> process
+    // MiniEQ_AttachToEndpoint under HKLM\SOFTWARE\MiniEQ\ChildAPO. Since
+    // 0.2.3 it is created lazily at the first LockForProcess (EnsureChildApo),
+    // not in Initialize; every call is delegated (negotiate -> lock -> process
     // -> unlock) and any failure drops the child for the stream instead of
     // failing the user's audio.
     IAudioProcessingObject* m_childAPO = nullptr;
     IAudioProcessingObjectRT* m_childRT = nullptr;
     IAudioProcessingObjectConfiguration* m_childConfig = nullptr;
     bool           m_childDroppedForStream = false;
+    // 0.2.3 deferred child init: Initialize keeps the endpoint property
+    // store alive (AddRef'd) so EnsureChildApo can initialize the child
+    // with the endpoint context at the first LockForProcess. Released by
+    // ReleaseChild; m_childTried makes the attempt once-only.
+    IPropertyStore* m_pInitEndpointProps = nullptr;
+    bool            m_childTried = false;
 
     HANDLE         m_hWorkerThread = nullptr; // background worker (non-RT)
     HANDLE         m_hWorkerStop = nullptr;   // manual-reset stop event

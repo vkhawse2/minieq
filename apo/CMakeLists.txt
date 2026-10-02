@@ -27,7 +27,12 @@ target_include_directories(MiniEQ_APO PRIVATE
 target_link_libraries(MiniEQ_APO PRIVATE ole32 uuid advapi32 setupapi)
 
 # Diagnostic trace of the APO load path (see trace.h). Compiled out when 0.
-target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=1)
+# 0.2.3: production ships with tracing OFF -- the traced build performs a
+# file open/write on nearly every COM call, including inside the audio
+# engine's graph-construction window. Diagnosis uses the status-channel
+# handshake (initCalls/processCalls) instead. Flip to 1 only for a
+# throwaway diagnosis build.
+target_compile_definitions(MiniEQ_APO PRIVATE MINIEQ_APO_TRACE=0)
 
 # Build id for the status-channel stamp (see root CMakeLists).
 target_compile_definitions(MiniEQ_APO PRIVATE "MINIEQ_BUILD_ID=\"${MINIEQ_BUILD_ID}\"")

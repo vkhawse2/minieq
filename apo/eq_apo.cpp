@@ -245,61 +245,31 @@ try {
     // Never fail the user's audio stream over endpoint identification: if we
     // cannot resolve the endpoint, the APO still loads and processes audio
     // (with flat EQ) -- only the UI's live channel stays unavailable.
+    //
+    // 0.2.3: the endpoint id is derived from the GUID alone. A render
+    // endpoint's IMMDevice id is "{0.0.0.00000000}.{guid}" with the GUID in
+    // lowercase -- exactly the string the UI hashes to find us -- so the
+    // old all-endpoints enumeration sweep (a device-enumerator
+    // CoCreateInstance plus a property-store open per active endpoint) no
+    // longer runs on the engine's graph-construction thread. That thread is
+    // where audiodg faults on this machine; Initialize now does no COM work
+    // beyond reading our own endpoint's property store.
     if (epGuid[0] != L'\0') {
-        // Find the IMMDevice carrying that GUID. (The old code assumed "our
-        // endpoint is the last device in the collection" -- wrong on any machine
-        // with more than one audio endpoint: the mapping name would be built
-        // from the wrong device and the UI's settings would never arrive.)
-        IMMDeviceEnumerator* pEnum = nullptr;
-        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
-                              __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
-        if (FAILED(hr) || pEnum == nullptr) {
-            MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: MMDeviceEnumerator failed hr=0x%08X; no channels",
-                         FAILED(hr) ? hr : (HRESULT)E_UNEXPECTED);
-        } else {
-            IMMDeviceCollection* pColl = nullptr;
-            hr = pEnum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pColl);
-            pEnum->Release();
-            if (FAILED(hr) || pColl == nullptr) {
-                MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: EnumAudioEndpoints failed hr=0x%08X; no channels",
-                             FAILED(hr) ? hr : (HRESULT)E_UNEXPECTED);
-            } else {
-                UINT32 count = 0;
-                pColl->GetCount(&count);
-                for (UINT32 i = 0; i < count; ++i) {
-                    IMMDevice* pDev = nullptr;
-                    if (FAILED(pColl->Item(i, &pDev)) || pDev == nullptr) {
-                        continue;
-                    }
-                    bool match = false;
-                    IPropertyStore* pStore = nullptr;
-                    if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pStore)) && pStore != nullptr) {
-                        PROPVARIANT v2;
-                        PropVariantInit(&v2);
-                        if (SUCCEEDED(pStore->GetValue(kPkeyAudioEndpointGuid, &v2)) &&
-                            v2.vt == VT_LPWSTR && v2.pwszVal != nullptr &&
-                            _wcsicmp(v2.pwszVal, epGuid) == 0) {
-                            match = true;
-                        }
-                        PropVariantClear(&v2);
-                        pStore->Release();
-                    }
-                    if (match) {
-                        LPWSTR id = nullptr;
-                        if (SUCCEEDED(pDev->GetId(&id)) && id != nullptr) {
-                            m_endpointId = id;
-                            CoTaskMemFree(id);
-                        }
-                        pDev->Release();
-                        break;
-                    }
-                    pDev->Release();
-                }
-                pColl->Release();
-            }
-        }
+        wchar_t lowered[64] = {};
+        wcsncpy_s(lowered, ARRAYSIZE(lowered), epGuid, _TRUNCATE);
+        _wcslwr_s(lowered, ARRAYSIZE(lowered));
+        m_endpointId = L"{0.0.0.00000000}.";
+        m_endpointId += lowered;
     } else {
         MiniEQ_Trace(L"MiniEQ_APO: Initialize WARNING: empty endpoint GUID; no channels");
+    }
+
+    // Keep the endpoint property store alive for the deferred child-APO
+    // creation in EnsureChildApo (first LockForProcess). Released by
+    // ReleaseChild.
+    if (head->pAPOEndpointProperties != nullptr) {
+        m_pInitEndpointProps = head->pAPOEndpointProperties;
+        m_pInitEndpointProps->AddRef();
     }
 
     if (!m_endpointId.empty()) {
@@ -313,76 +283,11 @@ try {
     // holds SeCreateGlobalPrivilege; the UI (user session) only opens it.
     MiniEQ_GlobalStateName(m_globalName, ARRAYSIZE(m_globalName));
 
-    // R2: chain the APO we displaced from this endpoint's SFX slot (stashed
-    // by MiniEQ_AttachToEndpoint). The child is a plain in-proc COM object
-    // (not aggregated); it gets the same init data the engine gave us. Every
-    // failure here just means "no child" -- never fail the init over it.
-    if (!m_endpointId.empty()) {
-        wchar_t childClsid[64] = {};
-        if (MiniEQ_ReadChildApoClsid(m_endpointId.c_str(), childClsid,
-                                    ARRAYSIZE(childClsid)) == S_OK &&
-            childClsid[0] != L'\0') {
-            wchar_t ourClsid[64] = {};
-            const bool isSelf =
-                StringFromGUID2(CLSID_MiniEQAPO, ourClsid,
-                                ARRAYSIZE(ourClsid)) != 0 &&
-                _wcsicmp(childClsid, ourClsid) == 0;
-            if (!isSelf) {
-                CLSID clsid = {};
-                if (SUCCEEDED(CLSIDFromString(childClsid, &clsid))) {
-                    IUnknown* pUnk = nullptr;
-                    HRESULT hrC = CoCreateInstance(clsid, nullptr,
-                                                 CLSCTX_INPROC_SERVER,
-                                                 IID_IUnknown, (void**)&pUnk);
-                    if (SUCCEEDED(hrC) && pUnk != nullptr) {
-                        IAudioProcessingObject* pApo = nullptr;
-                        IAudioProcessingObjectRT* pRT = nullptr;
-                        IAudioProcessingObjectConfiguration* pCfg = nullptr;
-                        hrC = pUnk->QueryInterface(
-                            __uuidof(IAudioProcessingObject), (void**)&pApo);
-                        if (SUCCEEDED(hrC)) {
-                            hrC = pUnk->QueryInterface(
-                                __uuidof(IAudioProcessingObjectRT),
-                                (void**)&pRT);
-                        }
-                        if (SUCCEEDED(hrC)) {
-                            hrC = pUnk->QueryInterface(
-                                __uuidof(IAudioProcessingObjectConfiguration),
-                                (void**)&pCfg);
-                        }
-                        if (SUCCEEDED(hrC) && pApo != nullptr &&
-                            pRT != nullptr && pCfg != nullptr) {
-                            hrC = pApo->Initialize(cbDataSize, pbyData);
-                            if (SUCCEEDED(hrC)) {
-                                m_childAPO = pApo;
-                                m_childRT = pRT;
-                                m_childConfig = pCfg;
-                                MiniEQ_Trace(L"MiniEQ_APO: child APO chained: %s",
-                                             childClsid);
-                            } else {
-                                MiniEQ_Trace(L"MiniEQ_APO: child Initialize failed hr=0x%08X; no child",
-                                             hrC);
-                            }
-                        } else {
-                            MiniEQ_Trace(L"MiniEQ_APO: child QI failed hr=0x%08X; no child",
-                                         hrC);
-                        }
-                        if (m_childAPO == nullptr) {
-                            if (pCfg != nullptr) pCfg->Release();
-                            if (pRT != nullptr) pRT->Release();
-                            if (pApo != nullptr) pApo->Release();
-                        }
-                        pUnk->Release();
-                    } else {
-                        MiniEQ_Trace(L"MiniEQ_APO: child CoCreateInstance failed hr=0x%08X; no child",
-                                     hrC);
-                    }
-                } else {
-                    MiniEQ_Trace(L"MiniEQ_APO: stashed child CLSID unparsable; no child");
-                }
-            }
-        }
-    }
+    // R2: child APO chaining is DEFERRED to EnsureChildApo (first
+    // LockForProcess). Creating a foreign APO -- CoCreateInstance plus its
+    // own Initialize -- inside our Initialize runs foreign code on the
+    // engine's graph-construction thread; Initialize stays minimal instead:
+    // resolve the endpoint, open the status channel, stamp initCalls.
 
     MiniEQ_Trace(L"MiniEQ_APO: Initialize -> S_OK device=\"%s\" mapping=\"%s\"",
                  m_endpointId.empty() ? L"<NO MATCH>" : m_endpointId.c_str(),
@@ -770,6 +675,101 @@ STDMETHODIMP CEqApo::Reset() {
     return S_OK;
 }
 
+// R2 (0.2.3): create the chained child APO lazily, at the first
+// LockForProcess, from the stash MiniEQ_AttachToEndpoint left when it
+// displaced the incumbent. Moved out of Initialize so no foreign
+// CoCreateInstance/Initialize runs while the engine is still building the
+// graph. Fail-open: any failure just means "no child", exactly like the
+// old in-Initialize path. Runs on the engine's setup thread (never RT),
+// once per instance (m_childTried); if the engine never locks us, the
+// child is simply never created.
+void CEqApo::EnsureChildApo() {
+    if (m_childTried) {
+        return;
+    }
+    m_childTried = true;
+    if (m_endpointId.empty() || m_pInitEndpointProps == nullptr) {
+        return;
+    }
+    wchar_t childClsid[64] = {};
+    if (MiniEQ_ReadChildApoClsid(m_endpointId.c_str(), childClsid,
+                                 ARRAYSIZE(childClsid)) != S_OK ||
+        childClsid[0] == L'\0') {
+        return; // nothing displaced on this endpoint; the common case
+    }
+    wchar_t ourClsid[64] = {};
+    const bool isSelf =
+        StringFromGUID2(CLSID_MiniEQAPO, ourClsid, ARRAYSIZE(ourClsid)) != 0 &&
+        _wcsicmp(childClsid, ourClsid) == 0;
+    if (isSelf) {
+        return;
+    }
+    CLSID clsid = {};
+    if (FAILED(CLSIDFromString(childClsid, &clsid))) {
+        MiniEQ_Trace(L"MiniEQ_APO: stashed child CLSID unparsable; no child");
+        return;
+    }
+    IUnknown* pUnk = nullptr;
+    HRESULT hrC = CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IUnknown, (void**)&pUnk);
+    if (FAILED(hrC) || pUnk == nullptr) {
+        MiniEQ_Trace(L"MiniEQ_APO: child CoCreateInstance failed hr=0x%08X; no child",
+                     FAILED(hrC) ? hrC : (HRESULT)E_UNEXPECTED);
+        if (pUnk != nullptr) {
+            pUnk->Release();
+        }
+        return;
+    }
+    IAudioProcessingObject* pApo = nullptr;
+    IAudioProcessingObjectRT* pRT = nullptr;
+    IAudioProcessingObjectConfiguration* pCfg = nullptr;
+    hrC = pUnk->QueryInterface(__uuidof(IAudioProcessingObject), (void**)&pApo);
+    if (SUCCEEDED(hrC)) {
+        hrC = pUnk->QueryInterface(__uuidof(IAudioProcessingObjectRT),
+                                   (void**)&pRT);
+    }
+    if (SUCCEEDED(hrC)) {
+        hrC = pUnk->QueryInterface(
+            __uuidof(IAudioProcessingObjectConfiguration), (void**)&pCfg);
+    }
+    bool chained = false;
+    if (SUCCEEDED(hrC) && pApo != nullptr && pRT != nullptr && pCfg != nullptr) {
+        // Rebuild the minimum init block: APOInitBaseStruct (cbSize first)
+        // plus the endpoint property store Initialize kept alive. The
+        // buffer is 80 bytes (the size the Win11 engine passes) and
+        // zero-filled, so later-version fields read as null.
+        struct ChildInitHead {
+            APOInitBaseStruct base;
+            IPropertyStore* pAPOEndpointProperties;
+        };
+        BYTE initBuf[80] = {};
+        auto* cih = reinterpret_cast<ChildInitHead*>(initBuf);
+        cih->pAPOEndpointProperties = m_pInitEndpointProps;
+        *reinterpret_cast<UINT32*>(initBuf) =
+            static_cast<UINT32>(sizeof(initBuf));
+        hrC = pApo->Initialize(static_cast<UINT32>(sizeof(initBuf)), initBuf);
+        if (SUCCEEDED(hrC)) {
+            m_childAPO = pApo;
+            m_childRT = pRT;
+            m_childConfig = pCfg;
+            chained = true;
+            MiniEQ_Trace(L"MiniEQ_APO: child APO chained (deferred): %s",
+                         childClsid);
+        } else {
+            MiniEQ_Trace(L"MiniEQ_APO: child Initialize failed hr=0x%08X; no child",
+                         hrC);
+        }
+    } else {
+        MiniEQ_Trace(L"MiniEQ_APO: child QI failed hr=0x%08X; no child", hrC);
+    }
+    if (!chained) {
+        if (pCfg != nullptr) pCfg->Release();
+        if (pRT != nullptr) pRT->Release();
+        if (pApo != nullptr) pApo->Release();
+    }
+    pUnk->Release();
+}
+
 // R2: release the chained child APO, if any. Idempotent.
 void CEqApo::ReleaseChild() {
     if (m_childConfig != nullptr) {
@@ -783,6 +783,10 @@ void CEqApo::ReleaseChild() {
     if (m_childAPO != nullptr) {
         m_childAPO->Release();
         m_childAPO = nullptr;
+    }
+    if (m_pInitEndpointProps != nullptr) {
+        m_pInitEndpointProps->Release();
+        m_pInitEndpointProps = nullptr;
     }
     m_childDroppedForStream = false;
 }
@@ -848,6 +852,10 @@ try {
     m_sampleRate = wfx->nSamplesPerSec;
     MiniEQ_Trace(L"MiniEQ_APO: LockForProcess ch=%lu rate=%.0f",
                  channels, (double)rate);
+
+    // 0.2.3: first lock is where the deferred child chaining happens (see
+    // EnsureChildApo) -- Initialize no longer creates foreign APOs.
+    EnsureChildApo();
 
     // R2: lock the chained child with the same (negotiated) descriptors. A
     // child that cannot lock is dropped for this stream -- our own lock
