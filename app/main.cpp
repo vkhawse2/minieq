@@ -72,7 +72,7 @@ enum {
 // App version: bump for every handed-over build. Shown in the main window
 // title; the MSI filename/version and the CI artifact name are bumped to
 // match (installer/MiniEQ.wxs, .github/workflows/build.yml).
-#define MINIEQ_APP_VERSION L"0.2.4"
+#define MINIEQ_APP_VERSION L"0.2.5"
 
 #define IDT_DIAG 1 // 500 ms EQ-path status poll
 #define IDT_DEVSETTLE 2 // WM_DEVICECHANGE coalescing: rebuild once the storm ends
@@ -1807,22 +1807,37 @@ static int RunBulkEndpointHelper(bool attach) {
         return 0;
     }
     const std::vector<AudioEndpoint> devices = MiniEQ_ListRenderEndpoints();
-    int ok = 0, failed = 0;
+    int ok = 0, failed = 0, reenumerated = 0;
     for (const AudioEndpoint& ep : devices) {
         const HRESULT r = attach ? MiniEQ_AttachToEndpointEx(ep.id.c_str(),
                                                              /*force=*/true)
                                  : MiniEQ_DetachFromEndpoint(ep.id.c_str());
         if (SUCCEEDED(r)) {
             ++ok;
+            if (!attach) {
+                // 0.2.5: a slot write alone leaves the engine holding its
+                // cached effect list, which -- once the DLL is deleted --
+                // points at a component that no longer exists, and every
+                // stream start fails (the uninstall-silence bug). Restart
+                // the device node so the engine re-reads FxProperties now,
+                // exactly like the interactive detach and the breaker sweep.
+                if (SUCCEEDED(MiniEQ_ReenumerateEndpointDevice(ep.id.c_str()))) {
+                    ++reenumerated;
+                }
+            }
         } else {
             ++failed;
         }
     }
     CoUninitialize();
     MiniEQ_EnsureLogDir();
-    MiniEQ_AppLogCat(L"SETUP", L"%s: %d ok, %d failed (%d endpoints present)",
-                     attach ? L"attach-all" : L"detach-all",
-                     ok, failed, (int)devices.size());
+    if (attach) {
+        MiniEQ_AppLogCat(L"SETUP", L"attach-all: %d ok, %d failed (%d endpoints present)",
+                         ok, failed, (int)devices.size());
+    } else {
+        MiniEQ_AppLogCat(L"SETUP", L"detach-all: %d ok, %d failed, %d re-enumerated (%d endpoints present)",
+                         ok, failed, reenumerated, (int)devices.size());
+    }
     return 0;
 }
 

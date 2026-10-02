@@ -45,15 +45,15 @@ jobs:
           $wixBin = Join-Path ([System.Environment]::GetEnvironmentVariable("WIX", "Machine")) "bin"
           & "$wixBin\candle.exe" -arch x64 "-dBinDir=build\stage" installer\MiniEQ.wxs -out build\MiniEQ.wixobj
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & "$wixBin\light.exe" build\MiniEQ.wixobj -out build\stage\MiniEQ-0.2.4-x64.msi
+          & "$wixBin\light.exe" build\MiniEQ.wixobj -out build\stage\MiniEQ-0.2.5-x64.msi
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: minieq-windows-x64-0.2.4${{ inputs.efx_slot && '-efx-test' || '' }}
+          name: minieq-windows-x64-0.2.5${{ inputs.efx_slot && '-efx-test' || '' }}
           path: |
             build\stage\MiniEQ.exe
             build\stage\MiniEQ_APO.dll
-            build\stage\MiniEQ-0.2.4-x64.msi
+            build\stage\MiniEQ-0.2.5-x64.msi
           if-no-files-found: error
