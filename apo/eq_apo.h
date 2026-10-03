@@ -232,6 +232,15 @@ private:
     int64_t        m_lastGlobalSeq = 0;       // last adopted global version
     bool           m_globalEnabled = true;    // RT-side cache; default enabled
 
+    // Windows audio-enhancements toggle (IAudioSystemEffects3): the state
+    // Windows' own UI sets via SetAudioSystemEffectState(GUID_MiniEQEffect).
+    // ORed into the bypass decision in APOProcess alongside the per-device
+    // bypass and the global on/off flag. Defaults ON so a fresh attach
+    // processes audio; the engine re-asserts the persisted checkbox state
+    // through SetAudioSystemEffectState whenever it rebuilds the graph.
+    // Written on the engine's settings/UI thread, read on the RT thread.
+    std::atomic<bool> m_windowsEffectEnabled{true};
+
     // R2: chained child APO -- the incumbent this APO displaced from the
     // endpoint's SFX slot (e.g. a vendor effect), stashed at attach time by
     // MiniEQ_AttachToEndpoint under HKLM\SOFTWARE\MiniEQ\ChildAPO. Since
