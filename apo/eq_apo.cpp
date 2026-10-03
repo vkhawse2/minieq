@@ -140,8 +140,14 @@ CEqApo::~CEqApo() {
 }
 
 //------------------------------------------------------------------------------
-// IAudioSystemEffects(2/3). Our own UI drives everything, so there is nothing
-// to enumerate -- an empty list is a valid answer; refusing is not.
+// IAudioSystemEffects(2/3). We advertise a single "MiniEQ" system effect so
+// Windows' own audio-enhancements UI (mmsys.cpl -> device Properties ->
+// Enhancements, and the Windows 11 Settings audio-enhancements surface)
+// lists MiniEQ as a toggleable enhancement. The toggle arrives via
+// SetAudioSystemEffectState and is honored in APOProcess -- so the effect
+// works even when our own UI isn't running. (The APO must already sit in
+// the endpoint's FxProperties slot; the enhancements UI only enumerates
+// effects from APOs in the chain.)
 //------------------------------------------------------------------------------
 
 STDMETHODIMP CEqApo::GetEffectsList(GUID** ppEffectsIds, UINT* pcEffects,
@@ -150,8 +156,15 @@ STDMETHODIMP CEqApo::GetEffectsList(GUID** ppEffectsIds, UINT* pcEffects,
     if (ppEffectsIds == nullptr || pcEffects == nullptr) {
         return E_POINTER;
     }
-    *ppEffectsIds = nullptr;
-    *pcEffects = 0;
+    // hEvent is optional (NULL is fine): our list is static, it never
+    // changes, so there is nothing to signal.
+    GUID* ids = static_cast<GUID*>(CoTaskMemAlloc(sizeof(GUID)));
+    if (ids == nullptr) {
+        return E_OUTOFMEMORY;
+    }
+    ids[0] = GUID_MiniEQEffect;
+    *ppEffectsIds = ids;
+    *pcEffects = 1;
     return S_OK;
 }
 
@@ -162,13 +175,34 @@ STDMETHODIMP CEqApo::GetControllableSystemEffectsList(AUDIO_SYSTEMEFFECT** ppEff
     if (ppEffects == nullptr || pcEffects == nullptr) {
         return E_POINTER;
     }
-    *ppEffects = nullptr;
-    *pcEffects = 0;
+    AUDIO_SYSTEMEFFECT* fx = static_cast<AUDIO_SYSTEMEFFECT*>(
+        CoTaskMemAlloc(sizeof(AUDIO_SYSTEMEFFECT)));
+    if (fx == nullptr) {
+        return E_OUTOFMEMORY;
+    }
+    fx[0].id = GUID_MiniEQEffect;
+    fx[0].canSetState = TRUE; // user-toggleable from the enhancements UI
+    fx[0].state = m_windowsEffectEnabled.load(std::memory_order_relaxed)
+                      ? AUDIO_SYSTEMEFFECT_STATE_ON
+                      : AUDIO_SYSTEMEFFECT_STATE_OFF;
+    *ppEffects = fx;
+    *pcEffects = 1;
     return S_OK;
 }
 
-STDMETHODIMP CEqApo::SetAudioSystemEffectState(GUID /*effectId*/,
-                                               AUDIO_SYSTEMEFFECT_STATE /*state*/) {
+STDMETHODIMP CEqApo::SetAudioSystemEffectState(GUID effectId,
+                                               AUDIO_SYSTEMEFFECT_STATE state) {
+    if (!IsEqualGUID(effectId, GUID_MiniEQEffect)) {
+        return E_INVALIDARG; // not our effect; we advertise exactly one
+    }
+    // Runs on the engine's settings/UI thread, never the RT thread: a plain
+    // atomic store is enough. APOProcess ORs this into the bypass decision,
+    // so the Windows toggle takes effect on the next audio block with the
+    // same click-free crossfade as every other bypass path.
+    const bool on = (state == AUDIO_SYSTEMEFFECT_STATE_ON);
+    m_windowsEffectEnabled.store(on, std::memory_order_relaxed);
+    MiniEQ_Trace(L"MiniEQ_APO: SetAudioSystemEffectState MiniEQ -> %s",
+                 on ? L"ON" : L"OFF");
     return S_OK;
 }
 
@@ -1495,7 +1529,11 @@ try {
                 }
             }
         }
-        const bool bypass = (m_localCopy.bypass != 0) || !m_globalEnabled;
+        // Bypass = per-device bypass OR global MiniEQ off OR the Windows
+        // audio-enhancements toggle (IAudioSystemEffects3) for our effect.
+        // All three ride the same click-free crossfade in EqDsp::Process.
+        const bool bypass = (m_localCopy.bypass != 0) || !m_globalEnabled ||
+            !m_windowsEffectEnabled.load(std::memory_order_relaxed);
         m_dsp.Process(frames, validFrames, bypass);
     }
 

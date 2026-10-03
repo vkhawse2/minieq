@@ -12,3 +12,11 @@ DEFINE_GUID(CLSID_MiniEQAPO,
 // Passed as the activation param when the UI opens IAudioSystemEffectsPropertyStore.
 DEFINE_GUID(GUID_MiniEQPropStoreCtx,
     0x767fda4c, 0x9d15, 0x430f, 0xb1, 0x42, 0xfa, 0xf8, 0xf5, 0x09, 0xa7, 0x93);
+
+// {97C10020-1218-40F0-9730-F4E4F50428E4} -- the "MiniEQ" system effect.
+// Advertised via IAudioSystemEffects::GetEffectsList and
+// IAudioSystemEffects2::GetControllableSystemEffectsList so Windows' own
+// audio-enhancements UI lists MiniEQ as a toggleable enhancement; toggled
+// via IAudioSystemEffects3::SetAudioSystemEffectState.
+DEFINE_GUID(GUID_MiniEQEffect,
+    0x97c10020, 0x1218, 0x40f0, 0x97, 0x30, 0xf4, 0xe4, 0xf5, 0x04, 0x28, 0xe4);
